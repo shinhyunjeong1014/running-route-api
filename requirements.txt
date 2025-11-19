@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+osmnx
+networkx
+numpy
+shapely
+python-dotenv
