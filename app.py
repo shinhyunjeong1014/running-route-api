@@ -20,16 +20,6 @@ load_dotenv()
 KAKAO_JS_KEY = os.getenv("KAKAO_JS_KEY", "").strip()
 
 app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
-
-
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request):
-    if not KAKAO_JS_KEY:
-        print("[WARN] KAKAO_JS_KEY 가 .env 에 설정되지 않았습니다.")
-    return templates.TemplateResponse("index.html", {"request": request, "kakao_js_key": KAKAO_JS_KEY})
-
 
 @app.get("/api/recommend-route")
 def recommend_route(
@@ -91,15 +81,8 @@ def recommend_route(
             }
         }
 
-        # ▼▼ 자동 저장
-        save_dir = Path(__file__).parent / "json"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"route_{ts}_{km:.1f}km.json"
-        with open(save_dir / fname, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-
         return JSONResponse(payload)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"서버 오류: {e}")
+
