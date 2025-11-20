@@ -1,7 +1,5 @@
 from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import os, random
 import osmnx as ox
@@ -85,4 +83,5 @@ def recommend_route(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"서버 오류: {e}")
+
 
