@@ -6,13 +6,14 @@ logger = logging.getLogger("turn_algo")
 
 # 각도/거리 기준(튜닝 가능)
 ANGLE_UTURN = 150           # U턴으로 볼 최소 각도
-ANGLE_TURN = 35             # 좌/우회전으로 볼 최소 각도 (기존 30 → 35)
-MIN_DIST_TURN = 60.0        # 직전 턴 이후 최소 거리 (기존 30 → 60)
-MIN_DIST_SIMPLIFY = 15.0    # polyline 단순화를 위한 최소 거리 (기존 12 → 15)
-MIN_STRAIGHT_SEG = 40.0     # 직진 안내를 줄 최소 구간 길이 (기존 20 → 40)
+ANGLE_TURN = 35             # 좌/우회전으로 볼 최소 각도
+MIN_DIST_TURN = 60.0        # 직전 턴 이후 최소 거리
+MIN_DIST_SIMPLIFY = 15.0    # polyline 단순화를 위한 최소 거리
+MIN_STRAIGHT_SEG = 40.0     # 직진 안내를 줄 최소 구간 길이
 
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """두 위경도 사이의 거리 (m)."""
     R = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
