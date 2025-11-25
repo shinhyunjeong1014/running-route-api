@@ -68,7 +68,12 @@ def recommend_route(
         if coords and (coords[0]["lat"] != coords[-1]["lat"] or coords[0]["lng"] != coords[-1]["lng"]):
             coords = coords + [coords[0]]
 
-        turns, summary = build_turn_by_turn(coords, km_requested=km, total_length_m=length_m)
+        # 6) 턴·요약 정보 생성
+        turns, summary = build_turn_by_turn(
+            coords,
+            km_requested=km,
+            total_length_m=length_m
+        )
 
         payload = {
             "start": {"lat": lat, "lng": lng},
@@ -86,5 +91,3 @@ def recommend_route(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"서버 오류: {e}")
-
-
