@@ -471,13 +471,13 @@ def polyline_to_turns(polyline: List[Dict[str, float]],
 
     def _find_prev_valid(i: int):
         j = i - 1
-        while j >= 0 and cumulative[i] - cumulative[j] < 0.5:
+        while j >= 0 and cumulative[i] - cumulative[j] < 1.0:
             j -= 1
-        return j
+        return j if j >= 0 else None
 
     def _find_next_valid(i: int):
         j = i + 1
-        while j < len(polyline) and cumulative[j] - cumulative[i] < 0.5:
+        while j < len(polyline) and cumulative[j] - cumulative[i] < 1.0:
             j += 1
         return j if j < len(polyline) else None
 
