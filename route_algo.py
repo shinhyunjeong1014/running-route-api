@@ -2,7 +2,7 @@
 import random
 import networkx as nx
 import osmnx as ox
-from typing import List
+from typing import Dict, List
 from itertools import islice
 import math
 from statistics import mean
@@ -400,3 +400,118 @@ def make_loop_route(G, s_node: int, target_km: float):
     # 그래도 실패하면 닫힌 루프라도
     loop = ensure_closed_loop(G, loop, s_node) or loop
     return loop, path_length(G, loop)
+
+
+# --------------------------------------------------------
+# 7) 턴 분석/거리/안내문 생성
+# --------------------------------------------------------
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """단순 해버사인 거리(m)."""
+    R = 6371000.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = math.sin(d_lat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def _bearing_from_coords(a: Dict[str, float], b: Dict[str, float]) -> float:
+    return _bearing(a["lat"], a["lng"], b["lat"], b["lng"])
+
+
+def _signed_turn_angle(a: Dict[str, float], b: Dict[str, float], c: Dict[str, float]) -> float:
+    th1 = _bearing_from_coords(a, b)
+    th2 = _bearing_from_coords(b, c)
+    return ((th2 - th1 + 540) % 360) - 180  # [-180, 180], +: left, -: right
+
+
+def _cumulative_distances(polyline: List[Dict[str, float]]) -> List[float]:
+    dists = [0.0]
+    for p, q in zip(polyline[:-1], polyline[1:]):
+        dists.append(dists[-1] + haversine_m(p["lat"], p["lng"], q["lat"], q["lng"]))
+    return dists
+
+
+def _format_instruction(distance_m: float, turn_type: str) -> str:
+    dist_rounded = int(round(distance_m / 10.0) * 10)
+    if turn_type == "left":
+        return f"{dist_rounded}m 앞 좌회전"
+    if turn_type == "right":
+        return f"{dist_rounded}m 앞 우회전"
+    if turn_type == "straight":
+        return f"{dist_rounded}m 직진"
+    if turn_type == "uturn":
+        return f"{dist_rounded}m 앞 U턴"
+    if turn_type == "arrive":
+        return "목적지에 도착했습니다"
+    return ""
+
+
+def polyline_to_turns(polyline: List[Dict[str, float]],
+                      straight_thresh: float = 15.0,
+                      turn_thresh: float = 30.0,
+                      uturn_thresh: float = 150.0) -> List[Dict[str, float]]:
+    """
+    polyline을 이용해 턴 포인트, 남은 거리, 안내문을 생성.
+
+    - straight_thresh: 이보다 작은 각도 변화는 무시.
+    - turn_thresh: 좌/우로 분류되는 최소 각도 변화.
+    - uturn_thresh: U턴으로 간주하는 각도.
+    """
+    if not polyline or len(polyline) < 2:
+        return []
+
+    cumulative = _cumulative_distances(polyline)
+    turns = []
+    last_turn_idx = 0
+
+    for i in range(1, len(polyline) - 1):
+        angle = _signed_turn_angle(polyline[i - 1], polyline[i], polyline[i + 1])
+        angle_abs = abs(angle)
+        if angle_abs < straight_thresh:
+            continue
+
+        if angle_abs >= uturn_thresh:
+            t_type = "uturn"
+        elif angle_abs >= turn_thresh:
+            t_type = "left" if angle > 0 else "right"
+        else:
+            t_type = "straight"
+
+        dist_to_turn = cumulative[i] - cumulative[last_turn_idx]
+        turns.append({
+            "lat": polyline[i]["lat"],
+            "lng": polyline[i]["lng"],
+            "type": t_type,
+            "distance": round(dist_to_turn, 1),
+            "instruction": _format_instruction(dist_to_turn, t_type),
+        })
+        last_turn_idx = i
+
+    # 도착 안내 (마지막 점)
+    final_dist = cumulative[-1] - cumulative[last_turn_idx]
+    turns.append({
+        "lat": polyline[-1]["lat"],
+        "lng": polyline[-1]["lng"],
+        "type": "arrive",
+        "distance": round(final_dist, 1),
+        "instruction": _format_instruction(final_dist, "arrive"),
+    })
+
+    return turns
+
+
+def build_turn_by_turn(polyline: List[Dict[str, float]],
+                       km_requested: float,
+                       pace_min_per_km: float = 8.0,
+                       total_length_m: float = None):
+    """턴 목록과 요약 메타를 생성."""
+    turns = polyline_to_turns(polyline)
+    length_m = total_length_m if total_length_m is not None else (_cumulative_distances(polyline)[-1] if polyline else 0.0)
+    summary = {
+        "length_m": round(length_m, 1),
+        "km_requested": km_requested,
+        "estimated_time_min": round((length_m / 1000.0) * pace_min_per_km, 1),
+        "turn_count": len([t for t in turns if t.get("type") != "arrive"]),
+    }
+    return turns, summary

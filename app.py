@@ -9,6 +9,7 @@ from pathlib import Path
 
 from route_algo import (
     build_walk_graph,
+    build_turn_by_turn,
     make_loop_route,
     nodes_to_latlngs,
     path_length,
@@ -67,16 +68,18 @@ def recommend_route(
         if coords and (coords[0]["lat"] != coords[-1]["lat"] or coords[0]["lng"] != coords[-1]["lng"]):
             coords = coords + [coords[0]]
 
+        turns, summary = build_turn_by_turn(coords, km_requested=km, total_length_m=length_m)
+
         payload = {
             "start": {"lat": lat, "lng": lng},
-            "km_requested": km,
-            "length_m": round(length_m, 1),
             "polyline": coords,
+            "turns": turns,
+            "summary": summary,
             "meta": {
                 "fallback": fallback_used,
                 "tolerance_m": 30.0,
-                "length_constraint_m": 400.0
-            }
+                "length_constraint_m": 400.0,
+            },
         }
 
         return JSONResponse(payload)
