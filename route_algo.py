@@ -17,7 +17,7 @@ VALHALLA_URL = os.getenv("VALHALLA_URL", "http://localhost:8002/route")
 
 
 # -------------------------------------------------
-# 기본 유틸 (turn_algo 등에서도 재사용 가능)
+# 기본 유틸
 # -------------------------------------------------
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """두 좌표 사이 거리 (m, Haversine)."""
@@ -229,8 +229,26 @@ def _loop_quality(polyline: List[Dict[str, float]], target_m: float) -> Tuple[fl
             uturn_count += 1
 
     # 점수: 거리오차 + 왕복/유턴 페널티
-    score = err + backtrack_ratio * target_m * 2.5 + uturn_count * 120.0
+    score = err + backtrack_ratio * target_m * 3.0 + uturn_count * 150.0
     return err, backtrack_ratio, uturn_count, score
+
+
+def _roundness(via_points: List[Dict[str, float]], center: Dict[str, float]) -> float:
+    """
+    via 포인트들이 얼마나 '원형'에 가까운지 측정.
+    (max_r - min_r) / 평균반경  값. 0에 가까울수록 동심원에 가까움.
+    """
+    if not via_points:
+        return 1.0
+
+    radii = [
+        haversine_m(center["lat"], center["lng"], p["lat"], p["lng"])
+        for p in via_points
+    ]
+    avg_r = sum(radii) / len(radii)
+    if avg_r <= 1e-6:
+        return 1.0
+    return (max(radii) - min(radii)) / avg_r
 
 
 # -------------------------------------------------
@@ -322,62 +340,67 @@ def _build_triangle_loop_c_plus(
 
 
 # -------------------------------------------------
-# 새 Area-Loop 러닝 루프
+# 옵션 A: 라운드형 Area-Loop
 # -------------------------------------------------
 def _build_area_loop(
     lat: float,
     lng: float,
     km: float,
-    max_outer_attempts: int = 12,
+    max_outer_attempts: int = 10,
     inner_attempts: int = 8,
 ):
     """
-    시작점 주변 Area에서 여러 via point를 뽑아
-    Start -> P1 -> P2 -> ... -> Pn -> Start 형태의 루프를 생성.
+    옵션 A: 둥근(라운드형) 러닝 루프 생성.
 
-    - via point 는 현재는 지오메트리 기반 샘플링이지만,
-      추후 '도로 노드 기반 샘플링'으로 확장 가능.
+    - via point를 거의 같은 반경에서 균등 각도로 배치해서
+      최대한 '원형'에 가깝게 만든다.
+    - backtrack, 유턴, 비원형(radiial 편차) 루프를 강하게 제거.
     """
     start = {"lat": lat, "lng": lng}
     target_m = km * 1000.0
 
-    # 원둘레 2πr ≈ target_m 를 기반으로 이상적인 반지름 계산
-    ideal_r = target_m / (2.0 * math.pi)
+    # 2πr ≈ target_m → 이상적인 반지름
+    ideal_r = max(200.0, target_m / (2.0 * math.pi))
 
-    best = None  # (coords, total_len, err, br, uc, score, tag)
+    best = None  # (coords, total_len, err, br, uc, roundness, score, tag)
 
     for outer in range(max_outer_attempts):
-        # outer loop마다 base_radius 를 조금씩 바꿔가며 탐색
-        radius_factor_outer = 0.9 + 0.2 * random.random()  # 0.9 ~ 1.1
-        base_radius = ideal_r * radius_factor_outer
-        base_radius = max(200.0, min(base_radius, 2000.0))
+        # 옵션 A: 이상 반지름의 1.05~1.35 배에서 선택 (조금 크게)
+        r_factor_outer = 1.05 + 0.30 * random.random()
+        base_radius = ideal_r * r_factor_outer
+        base_radius = max(250.0, min(base_radius, 2000.0))
 
         for inner in range(inner_attempts):
-            # 요청 거리(km)에 따라 via 개수 조정
+            # 거리별 via 개수
             if km <= 2.0:
-                via_choices = [3, 4]
+                num_via = 4
             elif km <= 4.0:
-                via_choices = [4, 5]
+                num_via = random.choice([4, 5])
             else:
-                via_choices = [5, 6]
-            num_via = random.choice(via_choices)
+                num_via = random.choice([5, 6])
 
-            # via point 샘플링 (각도 기준 정렬)
-            raw_points: List[Tuple[float, Dict[str, float]]] = []
-            attempts = 0
-            while len(raw_points) < num_via and attempts < num_via * 4:
-                angle = random.uniform(0.0, 360.0)
-                r_factor = random.uniform(0.7, 1.3)
+            # 각도 균등 분배 + 약간의 지터 (라운드형 유지)
+            angle_step = 360.0 / num_via
+            base_angle = random.uniform(0.0, 360.0)
+
+            via_points: List[Dict[str, float]] = []
+            for i in range(num_via):
+                angle = base_angle + i * angle_step
+                jitter = random.uniform(-18.0, 18.0)  # 섹터 내 작은 변화
+                angle_j = angle + jitter
+
+                # 반경은 base_radius에서 ±10% 이내로만 변화 → 원형 유지
+                r_factor = random.uniform(0.9, 1.1)
                 r = base_radius * r_factor
-                p = _move_point(lat, lng, angle, r)
-                raw_points.append((angle, p))
-                attempts += 1
 
-            if len(raw_points) < 3:
+                p = _move_point(lat, lng, angle_j, r)
+                via_points.append(p)
+
+            # 라운드형 점수 (옵션 A 핵심): radial 편차가 너무 크면 버림
+            rnd = _roundness(via_points, start)
+            if rnd > 0.35:
+                # 너무 찌그러진 다각형(팔이 쭉 뻗은 모양)은 패스
                 continue
-
-            raw_points.sort(key=lambda x: x[0])
-            via_points = [p for _, p in raw_points]
 
             # Start -> via1 -> ... -> viaN -> Start
             try:
@@ -401,21 +424,28 @@ def _build_area_loop(
                 logger.info(f"[AreaLoop] Valhalla 세그먼트 실패 outer={outer}, inner={inner}: {e}")
                 continue
 
-            err, br, uc, score = _loop_quality(loop_coords, target_m)
+            err, br, uc, score_base = _loop_quality(loop_coords, target_m)
             total_len = _cumulative_distances(loop_coords)[-1]
 
+            # roundness도 점수에 포함 (작을수록 좋다)
+            score = score_base + rnd * target_m * 2.0
+
             logger.info(
-                f"[AreaLoop] outer={outer}, inner={inner}, via={num_via}, base_r={base_radius:.0f}m, "
-                f"len={total_len:.1f}m, err={err:.1f}m, br={br:.2f}, uturn={uc}, score={score:.1f}"
+                f"[AreaLoop] outer={outer}, inner={inner}, via={num_via}, "
+                f"base_r={base_radius:.0f}m, len={total_len:.1f}m, "
+                f"err={err:.1f}m, br={br:.2f}, uturn={uc}, "
+                f"round={rnd:.2f}, score={score:.1f}"
             )
 
-            # 너무 안 좋은 루프는 버림
-            if br > 0.4:
-                continue
+            # 너무 짧거나 백트래킹 심한 후보는 바로 제거
             if total_len < target_m * 0.6:
                 continue
+            if br > 0.35:
+                continue
+            if uc > 4:
+                continue
 
-            # 베스트 갱신 로직 (MAX_ERR 만족 여부를 고려)
+            # 베스트 갱신 로직
             if best is None:
                 best = (
                     loop_coords,
@@ -423,36 +453,51 @@ def _build_area_loop(
                     err,
                     br,
                     uc,
+                    rnd,
                     score,
                     f"VH_AreaLoop via={num_via} r={base_radius:.0f}m",
                 )
             else:
-                best_err = best[2]
-                best_score = best[5]
-                if (err <= MAX_ERR and best_err > MAX_ERR and score <= best_score) or \
-                   (err <= MAX_ERR and best_err <= MAX_ERR and score < best_score) or \
-                   (err > MAX_ERR and best_err > MAX_ERR and score < best_score):
+                _, _, best_err, best_br, best_uc, best_rnd, best_score, _ = best
+
+                # 1) MAX_ERR 이내 루프를 우선
+                if err <= MAX_ERR and best_err > MAX_ERR:
+                    better = True
+                elif err <= MAX_ERR and best_err <= MAX_ERR:
+                    # 둘 다 MAX_ERR 이내면 score + roundness + br, uc를 종합
+                    better = score < best_score
+                else:
+                    # 둘 다 MAX_ERR 밖이면 score만 비교
+                    better = score < best_score
+
+                if better:
                     best = (
                         loop_coords,
                         total_len,
                         err,
                         br,
                         uc,
+                        rnd,
                         score,
                         f"VH_AreaLoop via={num_via} r={base_radius:.0f}m",
                     )
 
-            # 오차/품질 기준 만족 시 조기 반환
-            if err <= MAX_ERR and br <= 0.25 and uc <= 3:
+            # 조기 종료 조건 (러닝앱 기준 + 라운드형 품질)
+            if (
+                err <= MAX_ERR
+                and br <= 0.25
+                and uc <= 3
+                and rnd <= 0.25
+            ):
                 return loop_coords, total_len, f"VH_AreaLoop_OK via={num_via} r={base_radius:.0f}m"
 
-    # MAX_ERR 이내는 못 찾았지만, 그중 최선 루프 반환
+    # MAX_ERR 이내 못 찾았어도, 그중 최선 루프 반환
     if best is not None:
-        coords, total_len, err, br, uc, score, tag = best
+        coords, total_len, err, br, uc, rnd, score, tag = best
         logger.warning(
             f"[AreaLoop] MAX_ERR 내 루프를 찾지 못해 최선 루프 반환: "
             f"len={total_len:.1f}m, target={target_m:.1f}m, err={err:.1f}m, "
-            f"br={br:.2f}, uturn={uc}, score={score:.1f}"
+            f"br={br:.2f}, uturn={uc}, round={rnd:.2f}, score={score:.1f}"
         )
         return coords, total_len, tag
 
@@ -465,7 +510,7 @@ def _build_area_loop(
 def generate_route(lat: float, lng: float, km: float):
     """
     FastAPI(app.py)에서 호출하는 메인 함수.
-    1순위: Area-loop
+    1순위: 옵션 A 라운드형 Area-loop
     실패 시: Triangle C-PLUS 폴백
     """
     try:
