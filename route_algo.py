@@ -122,26 +122,24 @@ def _route_segment(start: Dict[str, float], end: Dict[str, float]) -> Tuple[List
     Valhalla에 start -> end 경로를 요청하고,
     (polyline 좌표 리스트, 경로 길이[m])를 반환.
     """
-    payload = (
-        {
-            "locations": [
-                {"lat": start["lat"], "lon": start["lng"]},
-                {"lat": end["lat"], "lon": end["lng"]},
-            ],
-            "costing": "pedestrian",
-            "costing_options": {
-                "pedestrian": {
-                    # 러닝에 적합하도록 차도/비포장은 약간 페널티
-                    "use_hills": 0.3,
-                    "use_tracks": 0.1,
-                }
-            },
-            "directions_options": {
-                "units": "kilometers",
-                "narrative": False,
-            },
-        }
-    )
+    payload = {
+        "locations": [
+            {"lat": start["lat"], "lon": start["lng"]},
+            {"lat": end["lat"], "lon": end["lng"]},
+        ],
+        "costing": "pedestrian",
+        "costing_options": {
+            "pedestrian": {
+                # 러닝에 적합하도록 차도/비포장은 약간 페널티
+                "use_hills": 0.3,
+                "use_tracks": 0.1,
+            }
+        },
+        "directions_options": {
+            "units": "kilometers",
+            "narrative": False,
+        },
+    }
 
     try:
         resp = requests.post(VALHALLA_URL, json=payload, timeout=5)
@@ -183,7 +181,7 @@ def _route_segment(start: Dict[str, float], end: Dict[str, float]) -> Tuple[List
 
 
 # -------------------------------------------------
-# 루프 품질 평가 (C-PLUS)
+# 루프 품질 평가 (C-PLUS / Star 공통)
 # -------------------------------------------------
 def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
     """a -> b 방위각 (deg)."""
@@ -238,17 +236,17 @@ def _loop_quality(polyline: List[Dict[str, float]], target_m: float) -> Tuple[fl
         if diff > 150.0:
             uturn_count += 1
 
-    # 점수 계산: 거리오차 + 왕복/유턴에 대한 페널티
+    # 점수 계산: 거리오차 + 왕복/유턴에 대한 페널티 (조금 더 강하게)
     score = (
         err
-        + backtrack_ratio * target_m * 2.0
-        + uturn_count * 80.0
+        + backtrack_ratio * target_m * 3.0   # 왕복 비율 페널티 강화
+        + uturn_count * 120.0                # U턴 페널티 강화
     )
     return err, backtrack_ratio, uturn_count, score
 
 
 # -------------------------------------------------
-# C-PLUS: 네트워크 친화적인 삼각 루프 생성
+# (기존) C-PLUS 삼각 루프 – 폴백용
 # -------------------------------------------------
 def _build_triangle_loop_c_plus(
     lat: float,
@@ -258,8 +256,8 @@ def _build_triangle_loop_c_plus(
     inner_attempts: int = 4,
 ) -> Tuple[List[Dict[str, float]], float, str]:
     """
-    Valhalla를 사용해 '시작점-포인트A-포인트B-시작점' 형태의 삼각 러닝 루프를 생성한다.
-    네트워크 품질을 고려해 backtracking이 적고, 거리 오차가 작은 루프를 우선 선택한다.
+    기존 C-PLUS 삼각 루프 알고리즘.
+    Star-loop가 실패했을 때 폴백 용도로만 사용한다.
     """
     start = {"lat": lat, "lng": lng}
     target_m = km * 1000.0
@@ -273,7 +271,6 @@ def _build_triangle_loop_c_plus(
         base_bearing = random.uniform(0.0, 360.0)
 
         for inner in range(inner_attempts):
-            # 각 시도마다 radius/방위각 약간씩 조정
             radius_factor = 0.8 + 0.4 * random.random()
             radius = base_radius * radius_factor
 
@@ -306,15 +303,11 @@ def _build_triangle_loop_c_plus(
                 f"uturn={uturn_count}, score={score:.1f}"
             )
 
-            # 기본적으로 backtrack_ratio가 너무 큰 루프는 버림
             if backtrack_ratio > 0.45:
                 continue
-
-            # 거리도 너무 안 맞으면 버림 (완전 실패 루프 필터)
             if err > target_m * 0.75:
                 continue
 
-            # 현재까지 최고 루프보다 score가 낮으면 갱신
             if best is None or score < best[5]:
                 best = (
                     loop_coords,
@@ -326,7 +319,6 @@ def _build_triangle_loop_c_plus(
                     f"VH_Triangle_C_PLUS r={radius:.0f}m",
                 )
 
-            # 오차도 충분히 작고(backtrack/uturn도 양호)면 바로 반환
             if err <= TARGET_RANGE_M and backtrack_ratio <= 0.25 and uturn_count <= 3:
                 return (
                     loop_coords,
@@ -347,13 +339,143 @@ def _build_triangle_loop_c_plus(
 
 
 # -------------------------------------------------
+# (새) Star-loop 네트워크 기반 러닝 루프 생성
+# -------------------------------------------------
+def _build_star_loop_network(
+    lat: float,
+    lng: float,
+    km: float,
+    max_outer_attempts: int = 8,
+    inner_attempts: int = 6,
+) -> Tuple[List[Dict[str, float]], float, str]:
+    """
+    시작점 기준으로 4~5개의 방사형 포인트를 만들고,
+    Start -> P1 -> ... -> Pn -> Start 형태의 러닝 루프를 생성한다.
+
+    - 도로 네트워크를 따라가는 Valhalla 경로를 사용
+    - 거리 오차, backtrack 비율, U턴 개수로 품질 평가
+    - 점수가 가장 좋은 루프를 선택
+    """
+    start = {"lat": lat, "lng": lng}
+    target_m = km * 1000.0
+
+    # 대략적인 반지름 추정 (대략 원둘레 2πr ~ target_m를 가정)
+    # 실제 도로는 직선이 아니므로 조금 보정
+    base_radius = target_m / (2.8 * math.pi) * 2.0  # 약간 크게
+    base_radius = max(350.0, min(base_radius, 1500.0))
+
+    best = None  # (polyline, total_len, err, br, uc, score, tag)
+
+    for outer in range(max_outer_attempts):
+        # 4개 또는 5개 포인트를 사용 (사각형/오각형 형태)
+        num_rays = random.choice([4, 5])
+        angle_step = 360.0 / num_rays
+        base_angle = random.uniform(0.0, 360.0)
+
+        for inner in range(inner_attempts):
+            via_points: List[Dict[str, float]] = []
+
+            # 각 ray마다 약간씩 다른 반지름/각도를 부여
+            for i in range(num_rays):
+                angle = base_angle + i * angle_step + random.uniform(-20.0, 20.0)
+                radius_factor = 0.8 + 0.5 * random.random()  # 0.8 ~ 1.3
+                radius = base_radius * radius_factor
+                via_points.append(_move_point(lat, lng, angle, radius))
+
+            # Valhalla로 Start -> P1 -> ... -> Pn -> Start 경로 생성
+            try:
+                loop_coords: List[Dict[str, float]] = []
+                total_len = 0.0
+
+                current = start
+                first = True
+                for vp in via_points:
+                    seg, seg_len = _route_segment(current, vp)
+                    if first:
+                        loop_coords.extend(seg)
+                        first = False
+                    else:
+                        loop_coords.extend(seg[1:])
+                    total_len += seg_len
+                    current = vp
+
+                # 마지막: Start로 복귀
+                seg, seg_len = _route_segment(current, start)
+                loop_coords.extend(seg[1:])
+                total_len += seg_len
+
+            except Exception as e:
+                logger.info(f"[StarLoop] Valhalla 세그먼트 실패 outer={outer}, inner={inner}: {e}")
+                continue
+
+            err, backtrack_ratio, uturn_count, score = _loop_quality(loop_coords, target_m)
+            cum = _cumulative_distances(loop_coords)
+            total_len = cum[-1]
+
+            logger.info(
+                f"[StarLoop] outer={outer}, inner={inner}, rays={num_rays}, "
+                f"base_r={base_radius:.0f}m, len={total_len:.1f}m, "
+                f"err={err:.1f}m, br={backtrack_ratio:.2f}, "
+                f"uturn={uturn_count}, score={score:.1f}"
+            )
+
+            # 품질 필터: 왕복/거리오차가 너무 큰 루프는 탈락
+            if backtrack_ratio > 0.30:
+                continue
+            if err > target_m * 0.5:
+                continue
+            if total_len < target_m * 0.6:
+                continue
+
+            # 최고 루프 갱신
+            if best is None or score < best[5]:
+                best = (
+                    loop_coords,
+                    total_len,
+                    err,
+                    backtrack_ratio,
+                    uturn_count,
+                    score,
+                    f"VH_StarLoop rays={num_rays} r={base_radius:.0f}m",
+                )
+
+            # 충분히 좋은 루프면 바로 반환
+            if err <= TARGET_RANGE_M and backtrack_ratio <= 0.20 and uturn_count <= 4:
+                return (
+                    loop_coords,
+                    total_len,
+                    f"VH_StarLoop_OK rays={num_rays} r={base_radius:.0f}m",
+                )
+
+    if best is not None:
+        coords, total_len, err, br, uc, score, tag = best
+        logger.warning(
+            f"[StarLoop] 정확히 맞추지 못했지만 최선의 루프 반환: "
+            f"len={total_len:.1f}m, target={target_m:.1f}m, err={err:.1f}m, "
+            f"br={br:.2f}, uturn={uc}, score={score:.1f}"
+        )
+        return coords, total_len, tag
+
+    raise RuntimeError("Valhalla 기반 Star-loop 러닝 루프를 생성하지 못했습니다.")
+
+
+# -------------------------------------------------
 # 외부 인터페이스
 # -------------------------------------------------
 def generate_route(lat: float, lng: float, km: float):
     """
     FastAPI(app.py)에서 호출하는 외부 인터페이스.
+    우선 Star-loop 알고리즘을 사용하고, 실패 시 삼각형 C-PLUS로 폴백한다.
     (polyline_coords, length_m, algorithm_used) 형태로 반환.
     """
+    # 1차: Star-loop
+    try:
+        coords, length_m, algo_tag = _build_star_loop_network(lat, lng, km)
+        return coords, length_m, algo_tag
+    except Exception as e:
+        logger.warning(f"[generate_route] Star-loop 실패, Triangle C-PLUS 폴백: {e}")
+
+    # 2차: Triangle C-PLUS 폴백
     coords, length_m, algo_tag = _build_triangle_loop_c_plus(lat, lng, km)
     return coords, length_m, algo_tag
 
