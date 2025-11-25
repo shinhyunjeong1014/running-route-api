@@ -1,433 +1,272 @@
-# route_algo.py
-import random
-import networkx as nx
-import osmnx as ox
 import math
-import logging
+import random
+from typing import List, Dict, Tuple
 
-logging.basicConfig(level=logging.INFO)
-TARGET_RANGE_M = 250  # 목표 거리 ± 250m 허용
+import requests
 
-###############################################
-# 기본 유틸리티
-###############################################
-def haversine_m(lat1, lon1, lat2, lon2):
-    """두 좌표 사이의 거리를 미터(m) 단위로 계산합니다 (Haversine 공식)."""
+
+VALHALLA_URL = "http://localhost:8002/route"
+
+
+# ============================
+# 유틸 함수들
+# ============================
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000.0
     d_lat = math.radians(lat2 - lat1)
     d_lon = math.radians(lon2 - lon1)
-    a = (math.sin(d_lat/2)**2 +
-         math.cos(math.radians(lat1)) *
-         math.cos(math.radians(lat2)) *
-         math.sin(d_lon/2)**2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(d_lon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
 
-def _cumulative_distances(polyline):
-    """경로(polyline)를 따라 누적 거리를 계산합니다."""
-    d = [0.0]
+def cumulative_distance(polyline: List[Dict[str, float]]) -> float:
+    if not polyline or len(polyline) < 2:
+        return 0.0
+    total = 0.0
     for p, q in zip(polyline[:-1], polyline[1:]):
-        d.append(d[-1] + haversine_m(p["lat"], p["lng"], q["lat"], q["lng"]))
-    return d
+        total += haversine_m(p["lat"], p["lng"], q["lat"], q["lng"])
+    return total
 
 
-def nodes_to_latlngs(G, nodes):
-    """OSMnx 노드 ID 리스트를 {lat, lng} 좌표 리스트로 변환합니다."""
-    return [{"lat": G.nodes[n]["y"], "lng": G.nodes[n]["x"]} for n in nodes]
-
-
-def _path_length(G, path):
-    """NetworkX 경로 리스트의 총 길이를 계산합니다."""
-    length = 0
-    for i in range(len(path) - 1):
-        u, v = path[i], path[i+1]
-        edge_data = G.get_edge_data(u, v)
-        if edge_data:
-            length += edge_data[0].get('length', 0)
-    return length
-
-
-def _polyline_length(polyline):
-    """Polyline 좌표 리스트의 총 길이를 계산합니다."""
-    length = 0
-    for i in range(len(polyline) - 1):
-        length += haversine_m(
-            polyline[i]["lat"], polyline[i]["lng"],
-            polyline[i+1]["lat"], polyline[i+1]["lng"]
-        )
-    return length
-
-
-def deduplicate_polyline(polyline):
-    """연속된 중복 좌표를 제거합니다."""
-    if not polyline:
+def decode_polyline6(encoded: str) -> List[Tuple[float, float]]:
+    """
+    Valhalla shape 디코딩 (precision=6)
+    """
+    if not encoded:
         return []
-    result = [polyline[0]]
-    for p in polyline[1:]:
-        if p["lat"] != result[-1]["lat"] or p["lng"] != result[-1]["lng"]:
-            result.append(p)
-    return result
+
+    coordinates = []
+    index = 0
+    lat = 0
+    lng = 0
+    factor = 10 ** 6
+
+    length = len(encoded)
+
+    while index < length:
+        # latitude
+        result = 0
+        shift = 0
+        while True:
+            if index >= length:
+                break
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        delta_lat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += delta_lat
+
+        # longitude
+        result = 0
+        shift = 0
+        while True:
+            if index >= length:
+                break
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        delta_lng = ~(result >> 1) if (result & 1) else (result >> 1)
+        lng += delta_lng
+
+        coordinates.append((lat / factor, lng / factor))
+
+    return coordinates
 
 
-###############################################
-# Fallback 경로 생성 알고리즘
-###############################################
-def generate_circle_loop(center_lat, center_lng, target_m):
-    """원형 루프 생성 (Fallback A)"""
-    radius_m = target_m / (2 * math.pi)  # 원주 = 2πr
-    num_points = max(16, int(target_m / 100))  # 100m당 1개 포인트
-    
-    polyline = []
-    for i in range(num_points + 1):
-        angle = (i / num_points) * 2 * math.pi
-        # 위도/경도 1도당 대략적인 미터 변환 (위도 37도 기준)
-        lat_offset = (radius_m * math.cos(angle)) / 111320
-        lng_offset = (radius_m * math.sin(angle)) / (111320 * math.cos(math.radians(center_lat)))
-        
-        polyline.append({
-            "lat": center_lat + lat_offset,
-            "lng": center_lng + lng_offset
-        })
-    
-    return polyline
-
-
-def generate_square_loop(center_lat, center_lng, target_m):
-    """사각형 루프 생성 (Fallback B)"""
-    side_length_m = target_m / 4  # 정사각형 한 변 길이
-    
-    # 위도/경도 변환 (위도 37도 기준)
-    lat_offset = side_length_m / 2 / 111320
-    lng_offset = side_length_m / 2 / (111320 * math.cos(math.radians(center_lat)))
-    
-    # 사각형 꼭짓점 생성 (시계방향)
-    corners = [
-        {"lat": center_lat + lat_offset, "lng": center_lng - lng_offset},  # 북서
-        {"lat": center_lat + lat_offset, "lng": center_lng + lng_offset},  # 북동
-        {"lat": center_lat - lat_offset, "lng": center_lng + lng_offset},  # 남동
-        {"lat": center_lat - lat_offset, "lng": center_lng - lng_offset},  # 남서
-        {"lat": center_lat + lat_offset, "lng": center_lng - lng_offset},  # 시작점으로 복귀
-    ]
-    
-    # 각 변을 여러 포인트로 세분화 (부드러운 경로 생성)
-    polyline = []
-    points_per_side = max(8, int(side_length_m / 50))
-    
-    for i in range(len(corners) - 1):
-        start, end = corners[i], corners[i + 1]
-        for j in range(points_per_side):
-            t = j / points_per_side
-            polyline.append({
-                "lat": start["lat"] + (end["lat"] - start["lat"]) * t,
-                "lng": start["lng"] + (end["lng"] - start["lng"]) * t
-            })
-    
-    polyline.append(corners[0])  # 시작점으로 완전히 복귀
-    return polyline
-
-
-def generate_triangle_loop(center_lat, center_lng, target_m):
-    """삼각형 루프 생성 (Fallback C)"""
-    side_length_m = target_m / 3
-    height_m = side_length_m * math.sqrt(3) / 2
-    
-    lat_offset = height_m / 2 / 111320
-    lng_offset = side_length_m / 2 / (111320 * math.cos(math.radians(center_lat)))
-    
-    # 삼각형 꼭짓점 (정삼각형)
-    corners = [
-        {"lat": center_lat + lat_offset, "lng": center_lng},  # 북
-        {"lat": center_lat - lat_offset/2, "lng": center_lng + lng_offset},  # 남동
-        {"lat": center_lat - lat_offset/2, "lng": center_lng - lng_offset},  # 남서
-        {"lat": center_lat + lat_offset, "lng": center_lng},  # 시작점 복귀
-    ]
-    
-    # 각 변 세분화
-    polyline = []
-    points_per_side = max(8, int(side_length_m / 50))
-    
-    for i in range(len(corners) - 1):
-        start, end = corners[i], corners[i + 1]
-        for j in range(points_per_side):
-            t = j / points_per_side
-            polyline.append({
-                "lat": start["lat"] + (end["lat"] - start["lat"]) * t,
-                "lng": start["lng"] + (end["lng"] - start["lng"]) * t
-            })
-    
-    polyline.append(corners[0])
-    return polyline
-
-
-###############################################
-# OSM 그래프 생성 (Fallback 포함)
-###############################################
-def build_walk_graph(lat, lng, km):
+def dest_point(lat: float, lng: float, bearing_deg: float, distance_m: float) -> Tuple[float, float]:
     """
-    보행 네트워크 그래프 생성.
-    실패 시 None 반환 (Fallback 경로 생성으로 넘어감)
+    시작 좌표에서 특정 방향/거리만큼 떨어진 위경도 계산 (단순 구면 모델)
     """
-    base_dist = km * 1000 * 1.5
-    search_dists = [base_dist, base_dist * 1.5, base_dist * 2.0, 5000]
+    R = 6371000.0
+    brng = math.radians(bearing_deg)
 
-    for dist in search_dists:
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lng)
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(distance_m / R)
+        + math.cos(lat1) * math.sin(distance_m / R) * math.cos(brng)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(brng) * math.sin(distance_m / R) * math.cos(lat1),
+        math.cos(distance_m / R) - math.sin(lat1) * math.sin(lat2),
+    )
+
+    return math.degrees(lat2), math.degrees(lon2)
+
+
+# ============================
+# Valhalla 호출
+# ============================
+
+def call_valhalla_route(
+    start_lat: float,
+    start_lng: float,
+    end_lat: float,
+    end_lng: float,
+    costing: str = "pedestrian",
+    timeout: float = 5.0,
+) -> List[Dict[str, float]]:
+    """
+    Valhalla /route API를 호출해 도보 경로 polyline을 반환.
+    실패 시 예외 발생.
+    """
+    payload = {
+        "locations": [
+            {"lat": start_lat, "lon": start_lng},
+            {"lat": end_lat, "lon": end_lng},
+        ],
+        "costing": costing,
+        "directions_options": {"units": "meters"},
+    }
+
+    resp = requests.post(VALHALLA_URL, json=payload, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Valhalla HTTP {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    trip = data.get("trip")
+    if not trip:
+        raise RuntimeError("Valhalla 응답에 trip 데이터가 없습니다.")
+
+    legs = trip.get("legs", [])
+    if not legs:
+        raise RuntimeError("Valhalla 응답에 legs가 없습니다.")
+
+    shape = legs[0].get("shape")
+    if not shape:
+        raise RuntimeError("Valhalla 응답에 shape가 없습니다.")
+
+    coords = decode_polyline6(shape)
+    polyline = [{"lat": lat, "lng": lng} for lat, lng in coords]
+    return polyline
+
+
+# ============================
+# 루프 품질 평가
+# ============================
+
+def loop_score(polyline: List[Dict[str, float]]) -> float:
+    """
+    루프 품질을 대략 평가하는 점수.
+    - 길이가 너무 짧거나
+    - 거의 직선 왕복에 가까우면 낮은 점수.
+    """
+    if not polyline or len(polyline) < 4:
+        return 0.0
+
+    length = cumulative_distance(polyline)
+    if length < 300:  # 300m 미만은 너무 짧음
+        return 0.0
+
+    # 루프의 "퍼짐" 정도 평가 (bounding box)
+    lats = [p["lat"] for p in polyline]
+    lngs = [p["lng"] for p in polyline]
+    min_lat, max_lat = min(lats), max(lats)
+    min_lng, max_lng = min(lngs), max(lngs)
+
+    diag = haversine_m(min_lat, min_lng, max_lat, max_lng,)
+
+    # 길이가 긴데도 bbox 대각선이 너무 짧으면 직선에 가까운 경향
+    straightness = diag / max(length, 1.0)  # 0 ~ 1 사이쯤
+    # straightness가 너무 크거나 너무 작으면 점수 낮게
+    # (적당한 루프는 length 대비 bbox diag가 중간 정도)
+    penalty = abs(straightness - 0.35)  # 0.35 정도를 이상적인 값으로 둠
+
+    # 중복 점 비율 (왕복 여부 대략 판단)
+    unique_points = {(round(p["lat"], 6), round(p["lng"], 6)) for p in polyline}
+    unique_ratio = len(unique_points) / len(polyline)
+
+    base = length  # 기본은 길이가 긴 루프가 유리
+    base *= max(unique_ratio, 0.5)  # 중복이 많으면 페널티
+    base *= max(0.1, 1.0 - penalty)  # 직선형이면 페널티
+
+    return base
+
+
+# ============================
+# 루프 생성 (Valhalla 기반)
+# ============================
+
+def generate_loop_route(
+    start_lat: float,
+    start_lng: float,
+    km: float,
+    bearings: List[float] = None,
+) -> Tuple[List[Dict[str, float]], float, Dict]:
+    """
+    Valhalla를 이용해 start를 기준으로 루프를 생성한다.
+    - start -> mid -> start 형태로 여러 후보를 만들고
+    - 목표 거리(km)에 가까우면서 loop_score가 높은 것을 선택
+    """
+    if bearings is None:
+        # 다양한 방향으로 샘플 (0~360도)
+        bearings = [0, 45, 90, 135, 180, 225, 270, 315]
+
+    target_m = km * 1000.0
+    radius_m = target_m * 0.5  # 중간 지점까지 대략 거리
+
+    candidates = []
+
+    for b in bearings:
+        mid_lat, mid_lng = dest_point(start_lat, start_lng, b, radius_m)
+
         try:
-            logging.info(f"OSMnx 그래프 생성 시도: 반경 {dist:.0f}m")
-            G = ox.graph_from_point(
-                (lat, lng),
-                dist=dist,
-                network_type="walk",
-                simplify=True,
-                retain_all=False,
-                timeout=10
-            )
-            
-            if len(G.nodes) < 30:
-                logging.warning(f"노드 수 부족: {len(G.nodes)}개 (최소 30개 필요)")
+            # start -> mid
+            out_poly = call_valhalla_route(start_lat, start_lng, mid_lat, mid_lng)
+            # mid -> start
+            back_poly = call_valhalla_route(mid_lat, mid_lng, start_lat, start_lng)
+
+            if len(out_poly) < 2 or len(back_poly) < 2:
                 continue
-            
-            G = ox.add_edge_speeds(G)
-            G = ox.add_travel_times(G)
-            logging.info(f"그래프 생성 성공: 노드 {len(G.nodes)}개, 반경 {dist:.0f}m")
-            return G
-            
-        except Exception as e:
-            logging.debug(f"그래프 생성 실패 (반경 {dist:.0f}m): {e}")
+
+            # 루프 결합 (중간 지점 중복 제거)
+            loop_poly = out_poly + back_poly[1:]
+
+            length_m = cumulative_distance(loop_poly)
+            score = loop_score(loop_poly)
+
+            # 너무 짧거나 너무 긴 루프는 제외 (느슨한 필터)
+            if length_m < 0.5 * target_m:
+                continue
+
+            candidates.append((loop_poly, length_m, score, b))
+
+        except Exception:
+            # 해당 방향으로는 경로를 만들 수 없는 경우 무시
             continue
-    
-    logging.warning("OSM 보행 네트워크 생성 실패 - Fallback 경로 생성으로 전환")
-    return None
 
+    if not candidates:
+        raise RuntimeError("Valhalla 기반 루프 후보를 생성하지 못했습니다.")
 
-###############################################
-# 경로 길이 보정
-###############################################
-def _adjust_route_length(G, path, target_m):
-    """경로 길이를 목표 범위에 맞게 보정합니다."""
-    current_length = _path_length(G, path)
-    target_min = target_m - TARGET_RANGE_M
-    target_max = target_m + TARGET_RANGE_M
-    
-    if target_min <= current_length <= target_max:
-        return path, current_length
-    
-    diff_m = target_m - current_length
-    
-    # 길이 부족 시 패딩 추가
-    if diff_m > TARGET_RANGE_M:
-        logging.info(f"경로 부족: {current_length:.0f}m. {diff_m:.0f}m 보정 필요")
-        end_node = path[-1]
-        cutoff_m = min(diff_m * 1.5, target_m * 0.5)
-        
-        try:
-            sub_dist_map = nx.single_source_dijkstra_path_length(G, end_node, cutoff=cutoff_m)
-            cand_nodes = list(sub_dist_map.keys())
-            
-            if len(cand_nodes) > 1:
-                mid_node = random.choice(cand_nodes[1:])
-                p_out = nx.shortest_path(G, end_node, mid_node, weight="length")
-                p_back = nx.shortest_path(G, mid_node, end_node, weight="length")
-                added_path = p_out + p_back[1:]
-                new_path = path[:-1] + added_path
-                new_length = _path_length(G, new_path)
-                logging.info(f"패딩 추가: {new_length:.0f}m")
-                return new_path, new_length
-        except Exception as e:
-            logging.warning(f"경로 보정 실패: {e}")
-    
-    return path, current_length
+    # 1차로 score 기준 정렬 (루프 품질)
+    # 2차로 목표 거리와의 차이 기준 정렬
+    candidates.sort(
+        key=lambda item: (-item[2], abs(item[1] - target_m))
+    )
 
+    best_poly, best_len, best_score, best_bearing = candidates[0]
 
-###############################################
-# OSM 기반 루프 생성
-###############################################
-def make_osm_loop_route(G, start_lat, start_lng, km):
-    """OSM 네트워크 기반 루프 경로 생성 (기존 v4 로직)"""
-    target_m = km * 1000
-    start = ox.nearest_nodes(G, start_lng, start_lat)
-    target_min = target_m - TARGET_RANGE_M
-    target_max = target_m + TARGET_RANGE_M
+    meta = {
+        "engine": "valhalla_loop_v1",
+        "valhalla_url": VALHALLA_URL,
+        "target_m": target_m,
+        "length_m": round(best_len, 1),
+        "bearing_selected": best_bearing,
+        "candidate_count": len(candidates),
+    }
 
-    def try_route(loop_path, method_name):
-        if not loop_path or len(loop_path) < 3:
-            return None
-        
-        initial_length = _path_length(G, loop_path)
-        
-        if initial_length < target_min or initial_length > target_max:
-            loop_path, final_length = _adjust_route_length(G, loop_path, target_m)
-        else:
-            final_length = initial_length
-        
-        if target_min <= final_length <= target_max:
-            polyline = nodes_to_latlngs(G, loop_path)
-            polyline = deduplicate_polyline(polyline)
-            logging.info(f"경로 성공: {method_name}, 길이 {final_length:.0f}m")
-            return polyline, final_length, method_name
-        
-        return None
-
-    # 1. 삼각 루프
-    try:
-        logging.info("삼각 루프 시도")
-        cutoff = target_m * 0.7
-        dist_map = nx.single_source_dijkstra_path_length(G, start, cutoff=cutoff, weight="length")
-        cand = [n for n, d in dist_map.items() if target_m * 0.25 <= d <= target_m * 0.66]
-        
-        if len(cand) >= 2:
-            A, B = random.sample(cand, 2)
-            p1 = nx.shortest_path(G, start, A, weight="length")
-            p2 = nx.shortest_path(G, A, B, weight="length")
-            p3 = nx.shortest_path(G, B, start, weight="length")
-            loop_path = p1 + p2[1:] + p3[1:]
-            result = try_route(loop_path, "OSM_Triangle")
-            if result:
-                return result
-    except Exception as e:
-        logging.debug(f"삼각 루프 실패: {e}")
-
-    # 2. 사각 루프
-    try:
-        logging.info("사각 루프 시도")
-        if 'cand' in locals() and len(cand) >= 3:
-            A, B, C = random.sample(cand, 3)
-            p1 = nx.shortest_path(G, start, A, weight="length")
-            p2 = nx.shortest_path(G, A, B, weight="length")
-            p3 = nx.shortest_path(G, B, C, weight="length")
-            p4 = nx.shortest_path(G, C, start, weight="length")
-            loop_path = p1 + p2[1:] + p3[1:] + p4[1:]
-            result = try_route(loop_path, "OSM_Square")
-            if result:
-                return result
-    except Exception as e:
-        logging.debug(f"사각 루프 실패: {e}")
-
-    # 3. 왕복 루프
-    try:
-        logging.info("왕복 루프 시도")
-        half_target = target_m / 2
-        cutoff = half_target * 1.5
-        dist_map = nx.single_source_dijkstra_path_length(G, start, cutoff=cutoff, weight="length")
-        valid_mid = [n for n, d in dist_map.items() if half_target * 0.8 <= d <= half_target * 1.2]
-        
-        if valid_mid:
-            mid = max(valid_mid, key=lambda n: dist_map[n])
-            p1 = nx.shortest_path(G, start, mid, weight="length")
-            p2 = nx.shortest_path(G, mid, start, weight="length")
-            loop_path = p1 + p2[1:]
-            result = try_route(loop_path, "OSM_OutAndBack")
-            if result:
-                return result
-    except Exception as e:
-        logging.debug(f"왕복 루프 실패: {e}")
-
-    # 4. 랜덤 워크
-    try:
-        logging.info("랜덤 워크 루프 시도")
-        steps = 10 + int(km * 5)
-        cur = start
-        path_nodes = [cur]
-        visited = {cur}
-        
-        for i in range(steps):
-            neigh = list(G.neighbors(cur))
-            unvisited = [n for n in neigh if n not in visited or (n == start and i > steps * 0.7)]
-            
-            if not unvisited:
-                p_back = nx.shortest_path(G, cur, start, weight="length")
-                path_nodes.extend(p_back[1:])
-                break
-            
-            cur = random.choice(unvisited) if random.random() < 0.8 and unvisited else random.choice(neigh)
-            
-            if cur == start and i > steps * 0.7:
-                path_nodes.append(cur)
-                break
-            
-            path_nodes.append(cur)
-            visited.add(cur)
-        
-        if path_nodes[-1] != start:
-            p_back = nx.shortest_path(G, path_nodes[-1], start, weight="length")
-            path_nodes.extend(p_back[1:])
-        
-        result = try_route(path_nodes, "OSM_RandomWalk")
-        if result:
-            return result
-    except Exception as e:
-        logging.warning(f"랜덤 워크 실패: {e}")
-
-    return None
-
-
-###############################################
-# 메인 경로 생성 함수
-###############################################
-def generate_route(lat, lng, km):
-    """
-    경로 생성 메인 함수 - 절대 실패하지 않음
-    OSM 네트워크 사용 불가 시 자동으로 Fallback 경로 생성
-    """
-    target_m = km * 1000
-    target_min = target_m - TARGET_RANGE_M
-    target_max = target_m + TARGET_RANGE_M
-    
-    # 1. OSM 네트워크 시도
-    G = build_walk_graph(lat, lng, km)
-    
-    if G is not None:
-        try:
-            result = make_osm_loop_route(G, lat, lng, km)
-            if result:
-                return result
-        except Exception as e:
-            logging.warning(f"OSM 루프 생성 실패: {e}")
-    
-    # 2. Fallback 경로 생성 (절대 실패하지 않음)
-    logging.info("Fallback 경로 생성 모드 진입")
-    
-    fallback_methods = [
-        ("Circle", generate_circle_loop),
-        ("Square", generate_square_loop),
-        ("Triangle", generate_triangle_loop),
-    ]
-    
-    for method_name, generator_func in fallback_methods:
-        try:
-            logging.info(f"Fallback_{method_name} 루프 생성 시도")
-            polyline = generator_func(lat, lng, target_m)
-            polyline = deduplicate_polyline(polyline)
-            length_m = _polyline_length(polyline)
-            
-            # 길이 보정 (간단한 스케일링)
-            if length_m < target_min or length_m > target_max:
-                scale_factor = target_m / length_m
-                logging.info(f"Fallback 경로 스케일링: {scale_factor:.2f}x")
-                
-                # 원점 기준으로 스케일링
-                center = {"lat": lat, "lng": lng}
-                scaled_polyline = []
-                for p in polyline:
-                    dlat = (p["lat"] - center["lat"]) * scale_factor
-                    dlng = (p["lng"] - center["lng"]) * scale_factor
-                    scaled_polyline.append({
-                        "lat": center["lat"] + dlat,
-                        "lng": center["lng"] + dlng
-                    })
-                polyline = scaled_polyline
-                length_m = _polyline_length(polyline)
-            
-            if target_min <= length_m <= target_max:
-                logging.info(f"Fallback_{method_name} 성공: {length_m:.0f}m")
-                return polyline, length_m, f"Fallback_{method_name}"
-                
-        except Exception as e:
-            logging.warning(f"Fallback_{method_name} 실패: {e}")
-            continue
-    
-    # 3. 최후의 Fallback (원형 루프 강제 생성)
-    logging.warning("모든 방법 실패 - 강제 원형 루프 생성")
-    polyline = generate_circle_loop(lat, lng, target_m)
-    polyline = deduplicate_polyline(polyline)
-    length_m = _polyline_length(polyline)
-    return polyline, length_m, "Fallback_Circle_Emergency"
+    return best_poly, best_len, meta
