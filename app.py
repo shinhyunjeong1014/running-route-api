@@ -1,52 +1,44 @@
-# app.py
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
-import sys
 
-try:
-    from route_algo import generate_route
-    from turn_algo import build_turn_by_turn
-except ImportError:
-    print("Error: Failed to import route_algo or turn_algo. Ensure all files are in the same directory.")
-    sys.exit(1)
+from route_algo import generate_loop_route
+from turn_algo import build_turn_by_turn
 
-app = FastAPI(
-    title="FastLoopRoute API v5",
-    description="러닝 앱을 위한 안정적인 루프 경로 추천 서비스 - Fallback 강화 버전"
-)
+app = FastAPI()
+
 
 @app.get("/api/recommend-route")
 def recommend_route(
-    lat: float = Query(..., description="시작 위도 (예: 37.5665)"),
-    lng: float = Query(..., description="시작 경도 (예: 126.9780)"),
-    km: float = Query(2.0, ge=1.0, le=10.0, description="목표 거리 (km, 1.0~10.0)")
+    lat: float = Query(..., description="시작 위도"),
+    lng: float = Query(..., description="시작 경도"),
+    km: float = Query(..., gt=0.3, le=10.0, description="목표 루프 거리(km)"),
 ):
     """
-    시작 좌표와 목표 거리를 기반으로 루프 형태의 경로를 추천합니다.
-    OSM 네트워크 부족 시에도 자동으로 Fallback 경로를 생성합니다.
+    Valhalla 기반 러닝 루프 + turn-by-turn 안내 API
     """
     try:
-        # 1. 경로 생성 (route_algo.py) - 절대 실패하지 않음
-        polyline, length_m, algorithm_used = generate_route(lat, lng, km)
-        
-        # 2. Turn-by-turn 및 요약 생성 (turn_algo.py)
-        turns, summary = build_turn_by_turn(polyline, km_requested=km, total_length_m=length_m)
+        polyline, length_m, meta = generate_loop_route(lat, lng, km)
 
-        return JSONResponse({
+        if not polyline or length_m <= 0:
+            raise RuntimeError("경로 생성 실패")
+
+        turns, summary = build_turn_by_turn(
+            polyline,
+            km_requested=km,
+            total_length_m=length_m,
+        )
+
+        payload = {
             "start": {"lat": lat, "lng": lng},
             "polyline": polyline,
             "turns": turns,
             "summary": summary,
-            "meta": {
-                "generation": f"FastLoopRoute v5 ({algorithm_used})",
-                "tolerance_m": 250,
-                "algorithm_used": algorithm_used
-            }
-        }, status_code=200)
+            "meta": meta,
+        }
+        return JSONResponse(payload)
 
     except Exception as e:
-        # 모든 예외를 캐치하여 서버 오류로 반환 (경로 생성은 항상 성공해야 함)
-        return JSONResponse({
-            "error": str(e), 
-            "message": "예상치 못한 오류가 발생했습니다. 다시 시도해주세요."
-        }, status_code=500)
+        raise HTTPException(
+            status_code=500,
+            detail=f"경로 생성 중 오류가 발생했습니다: {e}",
+        )
