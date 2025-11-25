@@ -328,7 +328,8 @@ def adjust_length_to_tolerance(G, path, target_m, tol_m=400.0):
 def make_loop_route(G, s_node: int, target_km: float):
     TARGET_TOL_M = 400.0
     target_m = target_km * 1000.0
-    good = _pick_mid_candidates(G, s_node, target_m, top_k=220)
+    good = _pick_mid_candidates(G, s_node, target_m, top_k:=
+220)
 
     def finalize(loop):
         # 1) 대략 보정(±400m 진입)
@@ -420,9 +421,14 @@ def _bearing_from_coords(a: Dict[str, float], b: Dict[str, float]) -> float:
 
 
 def _signed_turn_angle(a: Dict[str, float], b: Dict[str, float], c: Dict[str, float]) -> float:
+    """
+    세 점 a-b-c에서 b에서의 회전 각도(부호 있는 각도)를 계산.
+    + : 좌회전, - : 우회전
+    """
     th1 = _bearing_from_coords(a, b)
     th2 = _bearing_from_coords(b, c)
-    return ((th2 - th1 + 540) % 360) - 180  # [-180, 180], +: left, -: right
+    # [-180, 180] 범위로 정규화
+    return ((th2 - th1 + 540) % 360) - 180
 
 
 def _cumulative_distances(polyline: List[Dict[str, float]]) -> List[float]:
@@ -447,30 +453,65 @@ def _format_instruction(distance_m: float, turn_type: str) -> str:
     return ""
 
 
-def polyline_to_turns(polyline: List[Dict[str, float]],
-                      straight_thresh: float = 15.0,
-                      turn_thresh: float = 30.0,
-                      uturn_thresh: float = 150.0) -> List[Dict[str, float]]:
+def polyline_to_turns(
+    polyline: List[Dict[str, float]],
+    straight_thresh: float = 8.0,   # 완만한 커브도 잡기 위해 완화
+    turn_thresh: float = 20.0,      # 실제 좌/우회전 분류 기준
+    uturn_thresh: float = 150.0,    # U턴 기준 각도
+    min_step_m: float = 15.0        # 각도 계산용 최소 기준 거리
+) -> List[Dict[str, float]]:
     """
     polyline을 이용해 턴 포인트, 남은 거리, 안내문을 생성.
 
     - straight_thresh: 이보다 작은 각도 변화는 무시.
     - turn_thresh: 좌/우로 분류되는 최소 각도 변화.
     - uturn_thresh: U턴으로 간주하는 각도.
+    - min_step_m: 이전/다음 포인트를 잡을 때 최소 떨어져야 하는 거리.
     """
     if not polyline or len(polyline) < 2:
         return []
 
+    n = len(polyline)
+    if n < 3:
+        # 턴은 없고, 도착지만 안내
+        final_dist = 0.0
+        return [{
+            "lat": polyline[-1]["lat"],
+            "lng": polyline[-1]["lng"],
+            "type": "arrive",
+            "distance": round(final_dist, 1),
+            "instruction": _format_instruction(final_dist, "arrive"),
+        }]
+
     cumulative = _cumulative_distances(polyline)
-    turns = []
+    turns: List[Dict[str, float]] = []
+
+    # 마지막 턴 인덱스 (polyline상의 인덱스)
     last_turn_idx = 0
 
-    for i in range(1, len(polyline) - 1):
-        angle = _signed_turn_angle(polyline[i - 1], polyline[i], polyline[i + 1])
+    for i in range(1, n - 1):
+        # 이전 기준점 j 찾기 (i보다 앞, min_step_m 이상 떨어진 지점)
+        j = i - 1
+        while j > 0 and (cumulative[i] - cumulative[j]) < min_step_m:
+            j -= 1
+
+        # 다음 기준점 k 찾기 (i보다 뒤, min_step_m 이상 떨어진 지점)
+        k = i + 1
+        while k < n - 1 and (cumulative[k] - cumulative[i]) < min_step_m:
+            k += 1
+
+        if j == i or k == i:
+            # 거리 기준을 만족하는 이전/다음 점을 찾지 못한 경우
+            continue
+
+        angle = _signed_turn_angle(polyline[j], polyline[i], polyline[k])
         angle_abs = abs(angle)
+
+        # 거의 직진이면 무시
         if angle_abs < straight_thresh:
             continue
 
+        # 각도 크기에 따라 타입 분류
         if angle_abs >= uturn_thresh:
             t_type = "uturn"
         elif angle_abs >= turn_thresh:
@@ -478,13 +519,17 @@ def polyline_to_turns(polyline: List[Dict[str, float]],
         else:
             t_type = "straight"
 
-        dist_to_turn = cumulative[i] - cumulative[last_turn_idx]
+        # 직전에 잡은 턴과 너무 가까우면 스킵 (노이즈 방지)
+        dist_from_last_turn = cumulative[i] - cumulative[last_turn_idx]
+        if dist_from_last_turn < (min_step_m * 0.7):
+            continue
+
         turns.append({
             "lat": polyline[i]["lat"],
             "lng": polyline[i]["lng"],
             "type": t_type,
-            "distance": round(dist_to_turn, 1),
-            "instruction": _format_instruction(dist_to_turn, t_type),
+            "distance": round(dist_from_last_turn, 1),
+            "instruction": _format_instruction(dist_from_last_turn, t_type),
         })
         last_turn_idx = i
 
@@ -501,13 +546,17 @@ def polyline_to_turns(polyline: List[Dict[str, float]],
     return turns
 
 
-def build_turn_by_turn(polyline: List[Dict[str, float]],
-                       km_requested: float,
-                       pace_min_per_km: float = 8.0,
-                       total_length_m: float = None):
+def build_turn_by_turn(
+    polyline: List[Dict[str, float]],
+    km_requested: float,
+    pace_min_per_km: float = 8.0,
+    total_length_m: float = None
+):
     """턴 목록과 요약 메타를 생성."""
     turns = polyline_to_turns(polyline)
-    length_m = total_length_m if total_length_m is not None else (_cumulative_distances(polyline)[-1] if polyline else 0.0)
+    length_m = total_length_m if total_length_m is not None else (
+        _cumulative_distances(polyline)[-1] if polyline else 0.0
+    )
     summary = {
         "length_m": round(length_m, 1),
         "km_requested": km_requested,
