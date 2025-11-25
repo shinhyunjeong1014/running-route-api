@@ -452,9 +452,9 @@ def _format_instruction(distance_m: float, turn_type: str) -> str:
 
 
 def polyline_to_turns(polyline: List[Dict[str, float]],
-                      straight_thresh: float = 9.0,
-                      turn_thresh: float = 20.0,
-                      uturn_thresh: float = 150.0) -> List[Dict[str, float]]:
+                      straight_thresh: float = 8.0,
+                      turn_thresh: float = 18.0,
+                      uturn_thresh: float = 145.0) -> List[Dict[str, float]]:
     """
     polyline을 이용해 턴 포인트, 남은 거리, 안내문을 생성.
 
@@ -469,13 +469,25 @@ def polyline_to_turns(polyline: List[Dict[str, float]],
     turns = []
     last_turn_idx = 0
 
+    def _find_prev_valid(i: int):
+        j = i - 1
+        while j >= 0 and cumulative[i] - cumulative[j] < 0.5:
+            j -= 1
+        return j
+
+    def _find_next_valid(i: int):
+        j = i + 1
+        while j < len(polyline) and cumulative[j] - cumulative[i] < 0.5:
+            j += 1
+        return j if j < len(polyline) else None
+
     for i in range(1, len(polyline) - 1):
-        prev_len = cumulative[i] - cumulative[i - 1]
-        next_len = cumulative[i + 1] - cumulative[i]
-        if prev_len < 0.5 or next_len < 0.5:
+        prev_idx = _find_prev_valid(i)
+        next_idx = _find_next_valid(i)
+        if prev_idx is None or next_idx is None:
             continue
 
-        angle = _signed_turn_angle(polyline[i - 1], polyline[i], polyline[i + 1])
+        angle = _signed_turn_angle(polyline[prev_idx], polyline[i], polyline[next_idx])
         if angle is None:
             continue
 
