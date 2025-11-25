@@ -159,32 +159,33 @@ def generate_area_loop(lat: float, lng: float, km: float):
     target_m = km * 1000.0
     MAX_ERR = 99.0
 
-    # 검색 범위 (너무 넓게 돌리면 기괴한 루프 확률↑)
-    MAX_OUTER = 10
-    MAX_INNER = 8
+    # 검색 범위 줄이기 (필요하면 10/8로 되돌릴 수 있음)
+    MAX_OUTER = 8
+    MAX_INNER = 6
 
-    # 기본 반경 설정 (대략적인 1바퀴 둘레 기준)
     base_r = max(280.0, min(420.0, target_m / 7.0))
 
     best_score = float("inf")
     best_route: List[Tuple[float, float]] = []
     best_meta: Dict = {}
 
-    # 에러 상관없이 전체 중 최선 후보 (폴백용)
     best_any_score = float("inf")
     best_any_route: List[Tuple[float, float]] = []
     best_any_meta: Dict = {}
 
-    for outer in range(MAX_OUTER):
-        R = base_r + outer * 22.0  # 점점 큰 원으로
-        for inner in range(MAX_INNER):
-            via_cnt = 3 + (inner % 3)  # 3~5개 방사형 포인트
+    # ---- Fast Search: 하나라도 만족하면 즉시 종료 ----
+    found_good = False
 
+    for outer in range(MAX_OUTER):
+        R = base_r + outer * 22.0
+
+        for inner in range(MAX_INNER):
+            via_cnt = 3 + (inner % 3)
             angle_step = 360.0 / via_cnt
+
             rad_points: List[Tuple[float, float]] = []
             for i in range(via_cnt):
                 ang = math.radians(i * angle_step)
-
                 rad_lat = lat + (R / 111111.0) * math.cos(ang)
                 rad_lng = lng + (R / (111111.0 * math.cos(math.radians(lat)))) * math.sin(ang)
                 rad_points.append((rad_lat, rad_lng))
@@ -192,27 +193,22 @@ def generate_area_loop(lat: float, lng: float, km: float):
             full: List[Tuple[float, float]] = [(lat, lng)]
             fail_cnt = 0
 
-            # 중심 → 방사형 포인트 순차 방문
             for i in range(via_cnt):
                 seg = valhalla_route(full[-1], rad_points[i])
                 if not seg:
                     fail_cnt += 1
                     continue
-                # 중복 포인트 제거
                 full.extend(seg[1:])
 
-            # 마지막: 다시 출발점으로 복귀
             back_seg = valhalla_route(full[-1], (lat, lng))
             if back_seg:
                 full.extend(back_seg[1:])
             else:
                 fail_cnt += 1
 
-            # 유효하지 않은 루트는 스킵
             if len(full) < 4:
                 continue
 
-            # 전체 길이 계산
             length_m = 0.0
             for i in range(1, len(full)):
                 length_m += haversine_m(
@@ -222,102 +218,55 @@ def generate_area_loop(lat: float, lng: float, km: float):
 
             err = abs(length_m - target_m)
 
-            # 너무 짧거나 너무 긴 루프는 "기괴" 가능성이 높으므로 과감히 버림
-            # (0.6~1.6배 범위 안쪽만 정상 후보로 취급)
+            # 너무 기괴한 경우 continue
             if not (0.6 * target_m <= length_m <= 1.6 * target_m):
-                logger.info(
-                    "[AreaLoop] skip abnormal length outer=%d, inner=%d, len=%.1fm, target=%.1fm",
-                    outer, inner, length_m, target_m,
-                )
-                # 그래도 fallback 후보에는 넣어볼 수 있음
-                roundness_rough = _estimate_roundness(length_m, R)
-                score_any = compute_loop_score(length_m, target_m, fail_cnt, roundness_rough)
-                if score_any < best_any_score:
-                    best_any_score = score_any
-                    best_any_route = full[:]
-                    best_any_meta = {
-                        "outer": outer,
-                        "inner": inner,
-                        "base_r": R,
-                        "via": via_cnt,
-                        "len": length_m,
-                        "err": err,
-                        "fail": fail_cnt,
-                        "uturn": fail_cnt,  # 하위 호환용
-                        "round": roundness_rough,
-                        "score": score_any,
-                        "abnormal_length": True,
-                    }
                 continue
 
-            # 원형도 추정
             roundness = _estimate_roundness(length_m, R)
             score = compute_loop_score(length_m, target_m, fail_cnt, roundness)
 
-            meta = {
-                "outer": outer,
-                "inner": inner,
-                "base_r": R,
-                "via": via_cnt,
-                "len": length_m,
-                "err": err,
-                "fail": fail_cnt,
-                "uturn": fail_cnt,  # 기존 키 이름 유지
-                "round": roundness,
-                "score": score,
-                "abnormal_length": False,
-            }
+            # 목표거리 근처 루프 FIRST-HIT
+            if err <= MAX_ERR:
+                return full, {
+                    "outer": outer,
+                    "inner": inner,
+                    "base_r": R,
+                    "via": via_cnt,
+                    "len": length_m,
+                    "err": err,
+                    "fail": fail_cnt,
+                    "round": roundness,
+                    "score": score,
+                    "success": True,
+                    "used_fallback": False,
+                }
 
-            # 1) 목표거리 ±MAX_ERR 이내 후보 중에서 점수 최소
-            if err <= MAX_ERR and score < best_score:
-                best_score = score
-                best_route = full[:]
-                best_meta = meta
-                logger.info(f"[AreaLoop] MATCH outer={outer}, inner={inner}, {meta}")
-            else:
-                logger.info(
-                    "[AreaLoop] outer=%d, inner=%d, len=%.1fm, err=%.1fm, "
-                    "fail=%d, round=%.2f, score=%.1f",
-                    outer, inner, length_m, err, fail_cnt, roundness, score
-                )
-
-            # 2) 에러 상관없이 전체 중 최선 후보 (폴백용)
+            # fallback
             if score < best_any_score:
                 best_any_score = score
                 best_any_route = full[:]
-                best_any_meta = meta
+                best_any_meta = {
+                    "outer": outer,
+                    "inner": inner,
+                    "base_r": R,
+                    "via": via_cnt,
+                    "len": length_m,
+                    "err": err,
+                    "fail": fail_cnt,
+                    "round": roundness,
+                    "score": score,
+                }
 
-    # -----------------------------
-    # 최종 선택 및 안전 실패 처리
-    # -----------------------------
-    # 1) MAX_ERR 이내 최선 루프
-    if best_route:
-        best_meta["success"] = True
-        best_meta["used_fallback"] = False
-        return best_route, best_meta
+        # ---- Fast-break: fallback이 충분히 괜찮은 수준이면 종료 ----
+        if best_any_score < 250:
+            break
 
-    # 2) 에러 범위는 벗어나지만 그나마 괜찮은 루프 (폴백)
-    #    너무 멀거나/짧은 경우는 어차피 위에서 필터링 했으므로
+    # fallback 루트 반환
     if best_any_route:
-        # 그래도 target 대비 0.5~1.8배는 넘지 않게 2차 필터
-        length = best_any_meta.get("len", 0.0)
-        if 0.5 * target_m <= length <= 1.8 * target_m:
-            logger.warning(
-                "[AreaLoop] MAX_ERR 내 루프를 찾지 못해 최선 루프 반환: "
-                "len=%.1fm, target=%.1fm, err=%.1fm, score=%.1f",
-                best_any_meta.get("len", 0.0),
-                target_m,
-                best_any_meta.get("err", 0.0),
-                best_any_meta.get("score", 0.0),
-            )
-            best_any_meta["success"] = False
-            best_any_meta["used_fallback"] = True
-            return best_any_route, best_any_meta
+        best_any_meta["success"] = False
+        best_any_meta["used_fallback"] = True
+        return best_any_route, best_any_meta
 
-    # 3) Valhalla가 전부 실패한 극단적인 경우:
-    #    여기서는 "경로 생성 실패"라고 명확히 알리기 위해
-    #    시작점만 반환하고 success=False로 표시
-    logger.error("[AreaLoop] Valhalla 실패로 유효한 루프를 만들지 못했습니다.")
     return [(lat, lng)], {
         "len": 0.0,
         "err": target_m,
@@ -325,3 +274,4 @@ def generate_area_loop(lat: float, lng: float, km: float):
         "used_fallback": False,
         "message": "Valhalla 경로 생성 실패",
     }
+
