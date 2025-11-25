@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse
 from route_algo import generate_loop_route
 from turn_algo import build_turn_by_turn
 
-app = FastAPI()
+app = FastAPI(title="Running Route API with Valhalla")
 
 
 @app.get("/api/recommend-route")
@@ -30,10 +30,10 @@ def recommend_route(
 
         payload = {
             "start": {"lat": lat, "lng": lng},
-            "polyline": polyline,
-            "turns": turns,
-            "summary": summary,
-            "meta": meta,
+            "polyline": polyline,          # [ {lat, lng}, ... ]
+            "turns": turns,                # turn-by-turn 안내 리스트
+            "summary": summary,            # 총 거리, 예상 시간, turn 개수
+            "meta": meta,                  # 엔진/후보정보/디버그
         }
         return JSONResponse(payload)
 
