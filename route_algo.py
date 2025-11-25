@@ -9,18 +9,18 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 목표 거리 허용 오차 (m) – 예: 2km 요청 시 ±250m
-TARGET_RANGE_M = 250.0
+# 러닝앱 x.xkm 표시에 맞추기 위한 최대 허용 거리 오차 (미터)
+MAX_ERR = 99.0
 
 # Valhalla 라우팅 엔드포인트
 VALHALLA_URL = os.getenv("VALHALLA_URL", "http://localhost:8002/route")
 
 
 # -------------------------------------------------
-# 기본 유틸 (turn_algo 에서도 사용)
+# 기본 유틸 (turn_algo 등에서도 재사용 가능)
 # -------------------------------------------------
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """두 좌표 사이의 거리를 미터(m) 단위로 계산 (Haversine)."""
+    """두 좌표 사이 거리 (m, Haversine)."""
     R = 6371000.0
     d_lat = math.radians(lat2 - lat1)
     d_lon = math.radians(lon2 - lon1)
@@ -35,20 +35,16 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _cumulative_distances(polyline: List[Dict[str, float]]) -> List[float]:
-    """Polyline 각 포인트까지의 누적 거리 리스트를 계산."""
+    """Polyline 각 포인트까지 누적 거리 리스트."""
     dists = [0.0]
     for p, q in zip(polyline[:-1], polyline[1:]):
         dists.append(dists[-1] + haversine_m(p["lat"], p["lng"], q["lat"], q["lng"]))
     return dists
 
 
-# -------------------------------------------------
-# 지구 위에서 특정 방향/거리만큼 이동
-# -------------------------------------------------
 def _move_point(lat: float, lng: float, bearing_deg: float, distance_m: float) -> Dict[str, float]:
     """
-    시작점(lat, lng)에서 방위각(bearing_deg) 방향으로 distance_m 만큼 이동한 점을 구한다.
-    (구면삼각법; 러닝 코스 생성에는 충분한 정밀도)
+    시작점(lat, lng)에서 bearing_deg 방향으로 distance_m만큼 이동한 새 좌표를 계산.
     """
     R = 6371000.0
     bearing = math.radians(bearing_deg)
@@ -65,17 +61,14 @@ def _move_point(lat: float, lng: float, bearing_deg: float, distance_m: float) -
         math.cos(distance_m / R) - math.sin(lat1) * math.sin(lat2),
     )
 
-    return {
-        "lat": math.degrees(lat2),
-        "lng": (math.degrees(lon2) + 540) % 360 - 180,
-    }
+    return {"lat": math.degrees(lat2), "lng": (math.degrees(lon2) + 540) % 360 - 180}
 
 
 # -------------------------------------------------
 # Valhalla polyline6 디코더
 # -------------------------------------------------
 def _decode_polyline6(encoded: str) -> List[Dict[str, float]]:
-    """Valhalla에서 사용하는 polyline6 문자열을 (lat, lng) 리스트로 변환."""
+    """Valhalla polyline6 문자열을 (lat,lng) 리스트로 변환."""
     coords: List[Dict[str, float]] = []
     index = 0
     lat = 0
@@ -120,7 +113,7 @@ def _decode_polyline6(encoded: str) -> List[Dict[str, float]]:
 def _route_segment(start: Dict[str, float], end: Dict[str, float]) -> Tuple[List[Dict[str, float]], float]:
     """
     Valhalla에 start -> end 경로를 요청하고,
-    (polyline 좌표 리스트, 경로 길이[m])를 반환.
+    (polyline 좌표 리스트, 경로 길이[m]) 반환.
     """
     payload = {
         "locations": [
@@ -130,7 +123,6 @@ def _route_segment(start: Dict[str, float], end: Dict[str, float]) -> Tuple[List
         "costing": "pedestrian",
         "costing_options": {
             "pedestrian": {
-                # 러닝에 적합하도록 옵션 조정 가능
                 "use_hills": 0.3,
                 "use_tracks": 0.1,
             }
@@ -161,6 +153,7 @@ def _route_segment(start: Dict[str, float], end: Dict[str, float]) -> Tuple[List
         shape = leg.get("shape")
         if not shape:
             continue
+
         leg_coords = _decode_polyline6(shape)
         if not leg_coords:
             continue
@@ -168,7 +161,7 @@ def _route_segment(start: Dict[str, float], end: Dict[str, float]) -> Tuple[List
         if not coords:
             coords.extend(leg_coords)
         else:
-            coords.extend(leg_coords[1:])  # 앞점 중복 제거
+            coords.extend(leg_coords[1:])  # 앞 점 중복 제거
 
         summary = leg.get("summary", {})
         leg_len_km = float(summary.get("length", 0.0))
@@ -181,7 +174,7 @@ def _route_segment(start: Dict[str, float], end: Dict[str, float]) -> Tuple[List
 
 
 # -------------------------------------------------
-# 루프 품질 평가 (Area / Triangle 공통)
+# 루프 품질 평가
 # -------------------------------------------------
 def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
     """a -> b 방위각 (deg)."""
@@ -199,19 +192,18 @@ def _bearing(a: Dict[str, float], b: Dict[str, float]) -> float:
 
 def _loop_quality(polyline: List[Dict[str, float]], target_m: float) -> Tuple[float, float, int, float]:
     """
-    루프 품질을 평가한다.
-    반환: (길이오차, backtrack_ratio, uturn_count, score)
-    score는 작을수록 좋다.
+    루프 품질 평가.
+    반환: (길이오차, backtrack_ratio, uturn_count, score)  – score는 작을수록 좋음.
     """
     if len(polyline) < 4:
         return float("inf"), 1.0, 100, float("inf")
 
-    # 전체 길이 및 오차
+    # 거리/오차
     cum = _cumulative_distances(polyline)
     total_len = cum[-1]
     err = abs(total_len - target_m)
 
-    # 세그먼트 중복(왕복) 비율 계산
+    # 세그먼트 중복(왕복) 비율
     seg_counts = {}
     for p, q in zip(polyline[:-1], polyline[1:]):
         key = tuple(
@@ -236,17 +228,13 @@ def _loop_quality(polyline: List[Dict[str, float]], target_m: float) -> Tuple[fl
         if diff > 150.0:
             uturn_count += 1
 
-    # 점수 계산: 거리오차 + 왕복/유턴에 대한 페널티 (Area-loop용으로 조정)
-    score = (
-        err
-        + backtrack_ratio * target_m * 2.5
-        + uturn_count * 120.0
-    )
+    # 점수: 거리오차 + 왕복/유턴 페널티
+    score = err + backtrack_ratio * target_m * 2.5 + uturn_count * 120.0
     return err, backtrack_ratio, uturn_count, score
 
 
 # -------------------------------------------------
-# (기존) C-PLUS 삼각 루프 – 폴백용
+# 폴백용 C-PLUS 삼각 루프
 # -------------------------------------------------
 def _build_triangle_loop_c_plus(
     lat: float,
@@ -254,18 +242,16 @@ def _build_triangle_loop_c_plus(
     km: float,
     max_outer_attempts: int = 6,
     inner_attempts: int = 4,
-) -> Tuple[List[Dict[str, float]], float, str]:
+):
     """
-    기존 C-PLUS 삼각 루프 알고리즘.
-    Area-loop가 실패했을 때 폴백 용도로만 사용한다.
+    C-PLUS 삼각 루프. Area-loop 실패 시 폴백용으로만 사용.
     """
     start = {"lat": lat, "lng": lng}
     target_m = km * 1000.0
 
-    # 초기 반지름 추정
     base_radius = max(300.0, min(target_m * 0.6, target_m / (3.0 * 1.3)))
 
-    best = None  # (polyline, length_m, err, backtrack_ratio, uturn_count, score, tag)
+    best = None  # (coords, total_len, err, br, uc, score, tag)
 
     for outer in range(max_outer_attempts):
         base_bearing = random.uniform(0.0, 360.0)
@@ -294,42 +280,39 @@ def _build_triangle_loop_c_plus(
             loop_coords.extend(seg2[1:])
             loop_coords.extend(seg3[1:])
 
-            err, backtrack_ratio, uturn_count, score = _loop_quality(loop_coords, target_m)
+            err, br, uc, score = _loop_quality(loop_coords, target_m)
             total_len = _cumulative_distances(loop_coords)[-1]
 
             logger.info(
                 f"[TriLoop C+] outer={outer}, inner={inner}, radius={radius:.0f}m, "
-                f"len={total_len:.1f}m, err={err:.1f}m, br={backtrack_ratio:.2f}, "
-                f"uturn={uturn_count}, score={score:.1f}"
+                f"len={total_len:.1f}m, err={err:.1f}m, br={br:.2f}, "
+                f"uturn={uc}, score={score:.1f}"
             )
 
-            if backtrack_ratio > 0.45:
-                continue
-            if err > target_m * 0.75:
+            if br > 0.5:
                 continue
 
+            # 베스트 갱신
             if best is None or score < best[5]:
                 best = (
                     loop_coords,
                     total_len,
                     err,
-                    backtrack_ratio,
-                    uturn_count,
+                    br,
+                    uc,
                     score,
                     f"VH_Triangle_C_PLUS r={radius:.0f}m",
                 )
 
-            if err <= TARGET_RANGE_M and backtrack_ratio <= 0.25 and uturn_count <= 3:
-                return (
-                    loop_coords,
-                    total_len,
-                    f"VH_Triangle_C_PLUS_OK r={radius:.0f}m",
-                )
+            # 오차/품질 기준 만족하면 조기 종료
+            if err <= MAX_ERR and br <= 0.25 and uc <= 3:
+                return loop_coords, total_len, f"VH_Triangle_C_PLUS_OK r={radius:.0f}m"
 
+    # MAX_ERR 내 루프는 못 찾았지만, 그중 최선 반환
     if best is not None:
         coords, total_len, err, br, uc, score, tag = best
         logger.warning(
-            f"[TriLoop C+] 정확히 맞추지 못했지만 최선의 루프 반환: "
+            f"[TriLoop C+] MAX_ERR 내 루프를 찾지 못해 최선 루프 반환: "
             f"len={total_len:.1f}m, target={target_m:.1f}m, err={err:.1f}m, "
             f"br={br:.2f}, uturn={uc}, score={score:.1f}"
         )
@@ -339,117 +322,135 @@ def _build_triangle_loop_c_plus(
 
 
 # -------------------------------------------------
-# (새) Area-Loop 러닝 루프 생성
+# 새 Area-Loop 러닝 루프
 # -------------------------------------------------
 def _build_area_loop(
     lat: float,
     lng: float,
     km: float,
-    max_outer_attempts: int = 10,
-    inner_attempts: int = 6,
-) -> Tuple[List[Dict[str, float]], float, str]:
+    max_outer_attempts: int = 12,
+    inner_attempts: int = 8,
+):
     """
-    시작점 주변 일정 반경(Area) 안에서 여러 지점을 샘플링하고,
-    Start -> P1 -> P2 -> ... -> Pn -> Start 형태의 루프를 생성한다.
+    시작점 주변 Area에서 여러 via point를 뽑아
+    Start -> P1 -> P2 -> ... -> Pn -> Start 형태의 루프를 생성.
 
-    - 모든 via point 는 시작점 기준 일정 반경 안에 위치
-    - 거리 오차, backtrack 비율, U턴 개수로 품질 평가
-    - score 가 가장 좋은 루프를 선택
+    - via point 는 현재는 지오메트리 기반 샘플링이지만,
+      추후 '도로 노드 기반 샘플링'으로 확장 가능.
     """
     start = {"lat": lat, "lng": lng}
     target_m = km * 1000.0
 
-    # 원둘레 2πr ≈ target_m 를 기준으로 반지름 추정
-    approx_r = target_m / (2.0 * math.pi)
-    base_radius = max(250.0, min(approx_r * 1.2, 1200.0))
+    # 원둘레 2πr ≈ target_m 를 기반으로 이상적인 반지름 계산
+    ideal_r = target_m / (2.0 * math.pi)
 
-    best = None  # (polyline, total_len, err, br, uc, score, tag)
+    best = None  # (coords, total_len, err, br, uc, score, tag)
 
     for outer in range(max_outer_attempts):
+        # outer loop마다 base_radius 를 조금씩 바꿔가며 탐색
+        radius_factor_outer = 0.9 + 0.2 * random.random()  # 0.9 ~ 1.1
+        base_radius = ideal_r * radius_factor_outer
+        base_radius = max(200.0, min(base_radius, 2000.0))
+
         for inner in range(inner_attempts):
-            # 3~5개의 via point 를 Area 안에서 샘플링
-            num_via = random.choice([3, 4, 5])
+            # 요청 거리(km)에 따라 via 개수 조정
+            if km <= 2.0:
+                via_choices = [3, 4]
+            elif km <= 4.0:
+                via_choices = [4, 5]
+            else:
+                via_choices = [5, 6]
+            num_via = random.choice(via_choices)
 
-            raw_points = []
-            for _ in range(num_via):
+            # via point 샘플링 (각도 기준 정렬)
+            raw_points: List[Tuple[float, Dict[str, float]]] = []
+            attempts = 0
+            while len(raw_points) < num_via and attempts < num_via * 4:
                 angle = random.uniform(0.0, 360.0)
-                radius_factor = random.uniform(0.5, 1.1)  # 0.5R ~ 1.1R
-                radius = base_radius * radius_factor
-                raw_points.append((angle, _move_point(lat, lng, angle, radius)))
+                r_factor = random.uniform(0.7, 1.3)
+                r = base_radius * r_factor
+                p = _move_point(lat, lng, angle, r)
+                raw_points.append((angle, p))
+                attempts += 1
 
-            # 각도를 기준으로 정렬해서 "둘레를 따라 도는" 루프가 되도록 함
+            if len(raw_points) < 3:
+                continue
+
             raw_points.sort(key=lambda x: x[0])
             via_points = [p for _, p in raw_points]
 
+            # Start -> via1 -> ... -> viaN -> Start
             try:
                 loop_coords: List[Dict[str, float]] = []
-                total_len = 0.0
                 current = start
                 first = True
 
-                # Start -> P1 -> ... -> Pn
                 for vp in via_points:
-                    seg, seg_len = _route_segment(current, vp)
+                    seg, _seg_len = _route_segment(current, vp)
                     if first:
                         loop_coords.extend(seg)
                         first = False
                     else:
                         loop_coords.extend(seg[1:])
-                    total_len += seg_len
                     current = vp
 
-                # 마지막: Pn -> Start
-                seg, seg_len = _route_segment(current, start)
+                seg, _seg_len = _route_segment(current, start)
                 loop_coords.extend(seg[1:])
-                total_len += seg_len
 
             except Exception as e:
                 logger.info(f"[AreaLoop] Valhalla 세그먼트 실패 outer={outer}, inner={inner}: {e}")
                 continue
 
-            err, backtrack_ratio, uturn_count, score = _loop_quality(loop_coords, target_m)
-            cum = _cumulative_distances(loop_coords)
-            total_len = cum[-1]
+            err, br, uc, score = _loop_quality(loop_coords, target_m)
+            total_len = _cumulative_distances(loop_coords)[-1]
 
             logger.info(
-                f"[AreaLoop] outer={outer}, inner={inner}, via={num_via}, "
-                f"base_r={base_radius:.0f}m, len={total_len:.1f}m, "
-                f"err={err:.1f}m, br={backtrack_ratio:.2f}, "
-                f"uturn={uturn_count}, score={score:.1f}"
+                f"[AreaLoop] outer={outer}, inner={inner}, via={num_via}, base_r={base_radius:.0f}m, "
+                f"len={total_len:.1f}m, err={err:.1f}m, br={br:.2f}, uturn={uc}, score={score:.1f}"
             )
 
-            # 품질 필터: 왕복/거리오차가 너무 큰 루프는 탈락
-            if backtrack_ratio > 0.35:
+            # 너무 안 좋은 루프는 버림
+            if br > 0.4:
                 continue
-            if err > target_m * 0.6:
-                continue
-            if total_len < target_m * 0.7:
+            if total_len < target_m * 0.6:
                 continue
 
-            # 최고 루프 갱신
-            if best is None or score < best[5]:
+            # 베스트 갱신 로직 (MAX_ERR 만족 여부를 고려)
+            if best is None:
                 best = (
                     loop_coords,
                     total_len,
                     err,
-                    backtrack_ratio,
-                    uturn_count,
+                    br,
+                    uc,
                     score,
                     f"VH_AreaLoop via={num_via} r={base_radius:.0f}m",
                 )
+            else:
+                best_err = best[2]
+                best_score = best[5]
+                if (err <= MAX_ERR and best_err > MAX_ERR and score <= best_score) or \
+                   (err <= MAX_ERR and best_err <= MAX_ERR and score < best_score) or \
+                   (err > MAX_ERR and best_err > MAX_ERR and score < best_score):
+                    best = (
+                        loop_coords,
+                        total_len,
+                        err,
+                        br,
+                        uc,
+                        score,
+                        f"VH_AreaLoop via={num_via} r={base_radius:.0f}m",
+                    )
 
-            # 충분히 좋은 루프면 바로 반환
-            if err <= TARGET_RANGE_M and backtrack_ratio <= 0.20 and uturn_count <= 4:
-                return (
-                    loop_coords,
-                    total_len,
-                    f"VH_AreaLoop_OK via={num_via} r={base_radius:.0f}m",
-                )
+            # 오차/품질 기준 만족 시 조기 반환
+            if err <= MAX_ERR and br <= 0.25 and uc <= 3:
+                return loop_coords, total_len, f"VH_AreaLoop_OK via={num_via} r={base_radius:.0f}m"
 
+    # MAX_ERR 이내는 못 찾았지만, 그중 최선 루프 반환
     if best is not None:
         coords, total_len, err, br, uc, score, tag = best
         logger.warning(
-            f"[AreaLoop] 정확히 맞추지 못했지만 최선의 루프 반환: "
+            f"[AreaLoop] MAX_ERR 내 루프를 찾지 못해 최선 루프 반환: "
             f"len={total_len:.1f}m, target={target_m:.1f}m, err={err:.1f}m, "
             f"br={br:.2f}, uturn={uc}, score={score:.1f}"
         )
@@ -463,22 +464,20 @@ def _build_area_loop(
 # -------------------------------------------------
 def generate_route(lat: float, lng: float, km: float):
     """
-    FastAPI(app.py)에서 호출하는 외부 인터페이스.
-    우선 Area-loop 알고리즘을 사용하고, 실패 시 삼각형 C-PLUS로 폴백한다.
-    (polyline_coords, length_m, algorithm_used) 형태로 반환.
+    FastAPI(app.py)에서 호출하는 메인 함수.
+    1순위: Area-loop
+    실패 시: Triangle C-PLUS 폴백
     """
-    # 1차: Area-loop
     try:
         coords, length_m, algo_tag = _build_area_loop(lat, lng, km)
         return coords, length_m, algo_tag
     except Exception as e:
         logger.warning(f"[generate_route] Area-loop 실패, Triangle C-PLUS 폴백: {e}")
 
-    # 2차: Triangle C-PLUS 폴백
     coords, length_m, algo_tag = _build_triangle_loop_c_plus(lat, lng, km)
     return coords, length_m, algo_tag
 
 
-# 과거 코드 호환용 (generate_loop_route 를 임포트하는 코드 대비)
+# 과거 이름 호환용
 def generate_loop_route(lat: float, lng: float, km: float):
     return generate_route(lat, lng, km)
