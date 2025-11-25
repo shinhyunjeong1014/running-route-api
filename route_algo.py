@@ -1,21 +1,28 @@
+# route_algo.py
 import math
 import random
 import logging
+import os
 from typing import List, Dict, Tuple
-
 import requests
 
-logger = logging.getLogger(__name__)
+# ------------------------------
+# 기본 설정
+# ------------------------------
+logging.basicConfig(level=logging.INFO)
 
-# 로컬에서 띄워둔 Valhalla 서버 주소
-VALHALLA_URL = "http://localhost:8002/route"
+# 목표 거리 허용 오차 (예: 2km 요청 시 1.8~2.2km)
+TARGET_RANGE_M = 200.0
+
+# Valhalla 라우팅 엔드포인트
+VALHALLA_URL = os.getenv("VALHALLA_URL", "http://localhost:8002/route")
 
 
-# ======================
-# 기본 거리/좌표 유틸
-# ======================
+# ------------------------------
+# 유틸 함수들 (turn_algo에서도 사용)
+# ------------------------------
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """단순 해버사인 거리(m)."""
+    """두 좌표 사이의 거리를 미터 단위로 계산 (Haversine)."""
     R = 6371000.0
     d_lat = math.radians(lat2 - lat1)
     d_lon = math.radians(lon2 - lon1)
@@ -30,33 +37,51 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _cumulative_distances(polyline: List[Dict[str, float]]) -> List[float]:
-    """turn_algo에서 import해서 쓰는 누적 거리 유틸."""
+    """Polyline 각 포인트까지의 누적 거리 리스트를 계산."""
     dists = [0.0]
-    if not polyline or len(polyline) < 2:
-        return dists
     for p, q in zip(polyline[:-1], polyline[1:]):
         dists.append(dists[-1] + haversine_m(p["lat"], p["lng"], q["lat"], q["lng"]))
     return dists
 
 
-def cumulative_distance(polyline: List[Dict[str, float]]) -> float:
-    if not polyline or len(polyline) < 2:
-        return 0.0
-    return _cumulative_distances(polyline)[-1]
-
-
-def decode_polyline6(encoded: str) -> List[Tuple[float, float]]:
+# ------------------------------
+# 지구 위에서 특정 각도/거리만큼 이동
+# ------------------------------
+def _move_point(lat: float, lng: float, bearing_deg: float, distance_m: float) -> Dict[str, float]:
     """
-    Valhalla polyline 디코더 (precision=6).
+    시작점(lat, lng)에서 방위각(bearing_deg) 방향으로 distance_m 만큼 이동한 점을 구한다.
+    (단순 구면삼각법; 러닝 코스 생성에는 충분한 정밀도)
     """
-    if not encoded:
-        return []
+    R = 6371000.0
+    bearing = math.radians(bearing_deg)
 
-    coords: List[Tuple[float, float]] = []
+    lat1 = math.radians(lat)
+    lon1 = math.radians(lng)
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(distance_m / R)
+        + math.cos(lat1) * math.sin(distance_m / R) * math.cos(bearing)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(bearing) * math.sin(distance_m / R) * math.cos(lat1),
+        math.cos(distance_m / R) - math.sin(lat1) * math.sin(lat2),
+    )
+
+    return {
+        "lat": math.degrees(lat2),
+        "lng": (math.degrees(lon2) + 540) % 360 - 180,  # [-180, 180] 범위 보정
+    }
+
+
+# ------------------------------
+# polyline6 디코더 (Valhalla shape)
+# ------------------------------
+def _decode_polyline6(encoded: str) -> List[Dict[str, float]]:
+    """Valhalla에서 사용하는 polyline6 문자열을 (lat, lng) 리스트로 변환."""
+    coords: List[Dict[str, float]] = []
     index = 0
     lat = 0
     lng = 0
-    factor = 10 ** 6
     length = len(encoded)
 
     while index < length:
@@ -68,10 +93,10 @@ def decode_polyline6(encoded: str) -> List[Tuple[float, float]]:
             index += 1
             result |= (b & 0x1F) << shift
             shift += 5
-            if b < 0x20 or index >= length:
+            if b < 0x20:
                 break
-        delta_lat = ~(result >> 1) if (result & 1) else (result >> 1)
-        lat += delta_lat
+        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += dlat
 
         # longitude
         result = 0
@@ -81,269 +106,157 @@ def decode_polyline6(encoded: str) -> List[Tuple[float, float]]:
             index += 1
             result |= (b & 0x1F) << shift
             shift += 5
-            if b < 0x20 or index >= length:
+            if b < 0x20:
                 break
-        delta_lng = ~(result >> 1) if (result & 1) else (result >> 1)
-        lng += delta_lng
+        dlng = ~(result >> 1) if (result & 1) else (result >> 1)
+        lng += dlng
 
-        coords.append((lat / factor, lng / factor))
+        coords.append({"lat": lat / 1e6, "lng": lng / 1e6})
 
     return coords
 
 
-def dest_point(lat: float, lng: float, bearing_deg: float, distance_m: float) -> Tuple[float, float]:
-    """시작점에서 특정 방향/거리만큼 떨어진 위경도 계산."""
-    R = 6371000.0
-    brng = math.radians(bearing_deg)
-    lat1 = math.radians(lat)
-    lon1 = math.radians(lng)
-
-    lat2 = math.asin(
-        math.sin(lat1) * math.cos(distance_m / R)
-        + math.cos(lat1) * math.sin(distance_m / R) * math.cos(brng)
-    )
-    lon2 = lon1 + math.atan2(
-        math.sin(brng) * math.sin(distance_m / R) * math.cos(lat1),
-        math.cos(distance_m / R) - math.sin(lat1) * math.sin(lat2),
-    )
-
-    return math.degrees(lat2), math.degrees(lon2)
-
-
-# ======================
-# Valhalla 호출
-# ======================
-def call_valhalla_route(
-    start_lat: float,
-    start_lng: float,
-    end_lat: float,
-    end_lng: float,
-    costing: str = "pedestrian",
-    timeout: float = 5.0,
-) -> List[Dict[str, float]]:
+# ------------------------------
+# Valhalla 한 구간 라우팅
+# ------------------------------
+def _route_segment(start: Dict[str, float], end: Dict[str, float]) -> Tuple[List[Dict[str, float]], float]:
     """
-    Valhalla /route API를 호출해서 polyline을 받아온다.
-    실패하면 예외를 던진다.
+    Valhalla에 start -> end 경로를 요청하고,
+    (polyline 좌표 리스트, 경로 길이[m])를 반환.
     """
     payload = {
         "locations": [
-            {"lat": start_lat, "lon": start_lng},
-            {"lat": end_lat, "lon": end_lng},
+            {"lat": start["lat"], "lon": start["lng"]},
+            {"lat": end["lat"], "lon": end["lng"]},
         ],
-        "costing": costing,
-        "directions_options": {"units": "kilometers"},
+        "costing": "pedestrian",
+        "directions_options": {
+            "units": "kilometers",
+            "narrative": False,
+        },
     }
 
-    resp = requests.post(VALHALLA_URL, json=payload, timeout=timeout)
+    resp = requests.post(VALHALLA_URL, json=payload, timeout=4)
     if resp.status_code != 200:
-        raise RuntimeError(f"Valhalla HTTP {resp.status_code}: {resp.text}")
+        raise RuntimeError(f"Valhalla 오류: status={resp.status_code}, body={resp.text[:200]}")
 
     data = resp.json()
-    trip = data.get("trip")
-    if not trip:
-        raise RuntimeError("Valhalla 응답에 trip이 없습니다.")
+    if "trip" not in data or "legs" not in data["trip"]:
+        raise RuntimeError(f"Valhalla 응답 형식 오류: {data}")
 
-    legs = trip.get("legs") or []
-    if not legs:
-        raise RuntimeError("Valhalla 응답에 legs가 없습니다.")
+    coords: List[Dict[str, float]] = []
+    total_len_m = 0.0
 
-    shape = legs[0].get("shape")
-    if not shape:
-        raise RuntimeError("Valhalla 응답에 shape가 없습니다.")
+    for leg in data["trip"]["legs"]:
+        shape = leg.get("shape")
+        if not shape:
+            continue
+        leg_coords = _decode_polyline6(shape)
+        if not leg_coords:
+            continue
 
-    coords = decode_polyline6(shape)
-    return [{"lat": la, "lng": lo} for la, lo in coords]
+        if not coords:
+            coords.extend(leg_coords)
+        else:
+            coords.extend(leg_coords[1:])  # 앞 점 중복 제거
 
+        # summary.length 는 km 단위
+        summary = leg.get("summary", {})
+        leg_len_km = float(summary.get("length", 0.0))
+        total_len_m += leg_len_km * 1000.0
 
-# ======================
-# 루프 품질 평가
-# ======================
-def loop_score(polyline: List[Dict[str, float]]) -> float:
-    """
-    루프 품질 점수.
-    - 길이
-    - bbox 퍼짐
-    - 중복 포인트 비율 등으로 대략 평가
-    """
-    if not polyline or len(polyline) < 4:
-        return 0.0
+    if len(coords) < 2 or total_len_m <= 0:
+        raise RuntimeError("Valhalla 경로가 비어 있거나 길이 0")
 
-    length = cumulative_distance(polyline)
-    if length < 300:  # 300m 미만은 러닝 코스로 보기 어렵다.
-        return 0.0
-
-    lats = [p["lat"] for p in polyline]
-    lngs = [p["lng"] for p in polyline]
-    min_lat, max_lat = min(lats), max(lats)
-    min_lng, max_lng = min(lngs), max(lngs)
-
-    diag = haversine_m(min_lat, min_lng, max_lat, max_lng)
-    straightness = diag / max(length, 1.0)  # 0~1 사이 값
-
-    # 0.3~0.5 정도가 적당한 루프라고 가정하고 페널티 부여
-    penalty = abs(straightness - 0.4)
-
-    unique_points = {(round(p["lat"], 6), round(p["lng"], 6)) for p in polyline}
-    unique_ratio = len(unique_points) / len(polyline)
-
-    base = length
-    base *= max(unique_ratio, 0.4)       # 중복이 너무 많으면 페널티
-    base *= max(0.1, 1.0 - penalty)      # 너무 일자형/너무 꼬인 경로면 페널티
-
-    return base
+    return coords, total_len_m
 
 
-# ======================
-# 간단 fallback 루프
-# ======================
-def simple_out_and_back_loop(start_lat: float, start_lng: float, km: float):
-    """
-    모든 후보 생성이 실패했을 때를 위한 아주 단순한 fallback.
-    여러 방향으로 start -> mid -> start 왕복 경로 중 하나라도 되면 채택.
-    """
-    target_m = km * 1000.0
-    radius = max(300.0, min(target_m * 0.45, 1500.0))
-    bearings = [0, 60, 120, 180, 240, 300]
-
-    for base_b in bearings:
-        for jitter in [-15, 0, 15]:
-            b = (base_b + jitter) % 360
-            mid_lat, mid_lng = dest_point(start_lat, start_lng, b, radius)
-            try:
-                out_poly = call_valhalla_route(start_lat, start_lng, mid_lat, mid_lng)
-                back_poly = call_valhalla_route(mid_lat, mid_lng, start_lat, start_lng)
-                if len(out_poly) < 2 or len(back_poly) < 2:
-                    continue
-                loop_poly = out_poly + back_poly[1:]
-                length = cumulative_distance(loop_poly)
-                if length > 200:  # 최소 200m
-                    return loop_poly, length, {
-                        "engine": "valhalla_loop_fallback_simple",
-                        "bearing": b,
-                        "radius_m": round(radius, 1),
-                        "length_m": round(length, 1),
-                        "target_m": round(target_m, 1),
-                        "fallback": True,
-                        "schema_version": "1.0.0",
-                    }
-            except Exception as e:
-                logger.warning(f"simple fallback 실패(bearing={b}): {e}")
-                continue
-
-    raise RuntimeError("Valhalla 기반 간단 fallback 루프도 생성하지 못했습니다.")
-
-
-# ======================
-# 메인: 루프 생성
-# ======================
-def generate_loop_route(
-    start_lat: float,
-    start_lng: float,
+# ------------------------------
+# 삼각 러닝 루프 생성 (Valhalla 기반)
+# ------------------------------
+def _build_triangle_loop(
+    lat: float,
+    lng: float,
     km: float,
-    bearings: List[float] = None,
-):
+    max_attempts: int = 6,
+    inner_attempts: int = 5,
+) -> Tuple[List[Dict[str, float]], float, str]:
     """
-    Valhalla 기반 루프 생성.
-    - 여러 방향/반경으로 mid를 찍어서 start -> mid -> start 루프 생성
-    - 품질/거리 기준으로 best 선택
-    - 모든 후보 실패 시 simple_out_and_back_loop로 한 번 더 시도
+    Valhalla를 사용해 '시작점-포인트A-포인트B-시작점' 형태의 삼각 루프를 생성한다.
+    - 거리: target_m ± TARGET_RANGE_M 내에 들어오도록 radius를 조정.
     """
-    if bearings is None:
-        bearings = [0, 60, 120, 180, 240, 300]
-
+    start = {"lat": lat, "lng": lng}
     target_m = km * 1000.0
-    base_radius = target_m * 0.45
-    base_radius = max(400.0, min(base_radius, 2000.0))  # 400m~2km
 
-    candidates = []
-    first_success = None
-    total_attempts = 0
-    success_attempts = 0
+    # 네트워크 굴곡을 고려한 초기 반지름 추정값 (거리의 약 1/3 / 1.3)
+    base_radius = max(250.0, min(target_m * 0.6, target_m / (3.0 * 1.3)))
 
-    for b in bearings:
-        for scale in [0.7, 1.0, 1.3]:
-            radius_m = base_radius * scale
-            jitter = random.uniform(-20, 20)
-            bearing = (b + jitter) % 360
-            total_attempts += 1
+    best_route = None  # (coords, length_m, tag)
+    best_err = float("inf")
 
-            mid_lat, mid_lng = dest_point(start_lat, start_lng, bearing, radius_m)
+    for outer in range(max_attempts):
+        base_bearing = random.uniform(0.0, 360.0)
+        radius = base_radius
+
+        for inner in range(inner_attempts):
+            # 정삼각형 형태의 두 꼭짓점(A, B)을 생성 (시작점이 세 번째 꼭짓점 역할)
+            A = _move_point(lat, lng, base_bearing, radius)
+            B = _move_point(lat, lng, base_bearing + 120.0, radius)
 
             try:
-                out_poly = call_valhalla_route(start_lat, start_lng, mid_lat, mid_lng)
-                back_poly = call_valhalla_route(mid_lat, mid_lng, start_lat, start_lng)
-                if len(out_poly) < 2 or len(back_poly) < 2:
-                    continue
-
-                loop_poly = out_poly + back_poly[1:]
-                length_m = cumulative_distance(loop_poly)
-                success_attempts += 1
-
-                if first_success is None:
-                    first_success = (loop_poly, length_m, bearing, radius_m)
-
-                # 길이 필터 (매우 느슨하게)
-                if length_m < 0.3 * target_m or length_m > 2.5 * target_m:
-                    continue
-
-                score = loop_score(loop_poly)
-                if score <= 0:
-                    continue
-
-                candidates.append(
-                    {
-                        "polyline": loop_poly,
-                        "length_m": length_m,
-                        "score": score,
-                        "bearing": bearing,
-                        "radius_m": radius_m,
-                    }
-                )
+                seg1, len1 = _route_segment(start, A)
+                seg2, len2 = _route_segment(A, B)
+                seg3, len3 = _route_segment(B, start)
             except Exception as e:
-                logger.warning(f"Valhalla 경로 생성 실패(bearing={bearing}, r={radius_m}): {e}")
-                continue
+                logging.warning(f"Valhalla 세그먼트 라우팅 실패 (outer={outer}, inner={inner}): {e}")
+                break  # 바깥 bearing을 바꿔 다시 시도
 
-    if candidates:
-        candidates.sort(key=lambda c: (-c["score"], abs(c["length_m"] - target_m)))
-        best = candidates[0]
-        poly = best["polyline"]
-        length_m = best["length_m"]
-        meta = {
-            "engine": "valhalla_loop_v2",
-            "valhalla_url": VALHALLA_URL,
-            "target_m": round(target_m, 1),
-            "length_m": round(length_m, 1),
-            "bearing_selected": round(best["bearing"], 1),
-            "radius_m": round(best["radius_m"], 1),
-            "candidate_count": len(candidates),
-            "attempts_total": total_attempts,
-            "attempts_success": success_attempts,
-            "fallback": False,
-            "schema_version": "1.0.0",
-        }
-        return poly, length_m, meta
+            # 세그먼트 연결
+            loop_coords: List[Dict[str, float]] = []
+            loop_coords.extend(seg1)
+            loop_coords.extend(seg2[1:])
+            loop_coords.extend(seg3[1:])
 
-    # 후보는 없지만, 최소한 한 번이라도 out/back 루프는 성공한 경우 → 이것이라도 사용
-    if first_success is not None:
-        loop_poly, length_m, bearing, radius_m = first_success
-        meta = {
-            "engine": "valhalla_loop_first_success",
-            "valhalla_url": VALHALLA_URL,
-            "target_m": round(target_m, 1),
-            "length_m": round(length_m, 1),
-            "bearing_selected": round(bearing, 1),
-            "radius_m": round(radius_m, 1),
-            "candidate_count": 0,
-            "attempts_total": total_attempts,
-            "attempts_success": success_attempts,
-            "fallback": True,
-            "schema_version": "1.0.0",
-        }
-        return loop_poly, length_m, meta
+            total_len = len1 + len2 + len3
+            err = abs(total_len - target_m)
 
-    # 여기까지 왔으면 Valhalla 호출 자체가 거의 다 실패한 상황 → simple fallback 한 번 더 시도
-    logger.warning(
-        f"Valhalla 기반 루프 후보를 생성하지 못했습니다. "
-        f"(attempts_total={total_attempts}, attempts_success={success_attempts})"
-    )
-    return simple_out_and_back_loop(start_lat, start_lng, km)
+            logging.info(
+                f"삼각 루프 시도 outer={outer}, inner={inner}, radius={radius:.0f}m, "
+                f"length={total_len:.1f}m, target={target_m:.1f}m, err={err:.1f}m"
+            )
+
+            # 가장 좋은 후보 저장
+            if err < best_err:
+                best_err = err
+                best_route = (loop_coords, total_len, f"VH_Triangle r={radius:.0f}m")
+
+            # 허용오차 이내면 바로 반환
+            if err <= TARGET_RANGE_M:
+                return loop_coords, total_len, f"VH_Triangle_OK r={radius:.0f}m"
+
+            # 길이가 부족하면 반지름 확대, 너무 길면 축소
+            if total_len < target_m - TARGET_RANGE_M:
+                radius *= 1.15
+            elif total_len > target_m + TARGET_RANGE_M:
+                radius *= 0.85
+            else:
+                # TARGET_RANGE_M보다는 크지만, 조정 여지가 적은 경우
+                break
+
+    if best_route:
+        # 최선의 후보라도 반환 (러닝 앱 UX 관점에서 "대충이라도 루프" 제공)
+        return best_route
+
+    raise RuntimeError("Valhalla 기반 삼각 루프 생성 실패")
+
+
+# ------------------------------
+# 외부 인터페이스
+# ------------------------------
+def generate_route(lat: float, lng: float, km: float):
+    """
+    FastAPI(app.py)에서 호출하는 외부 인터페이스.
+    - 반환값: (polyline_coords, length_m, algorithm_used)
+    """
+    coords, length_m, tag = _build_triangle_loop(lat, lng, km)
+    return coords, length_m, tag
