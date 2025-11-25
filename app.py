@@ -2,28 +2,17 @@
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 import sys
-import os
-
-# 현재 경로에 route_algo.py와 turn_algo.py가 있다고 가정하고 임시로 경로 추가
-# from route_algo import generate_route
-# from turn_algo import build_turn_by_turn
-
-# FastAPI는 로컬에서 실행되므로, 실제 모듈 구조를 가정하고 경로 설정을 시도합니다.
-# 이 코드는 실행 환경에 따라 수정이 필요할 수 있습니다.
-# Canvas 환경에서는 동일 디렉토리로 간주하고 임포트합니다.
 
 try:
     from route_algo import generate_route
     from turn_algo import build_turn_by_turn
 except ImportError:
-    # 모듈을 찾지 못할 경우의 대안 (실제 환경에 맞게 수정 필요)
-    print("Warning: Failed to import route_algo or turn_algo. Ensure all files are in the same directory.")
+    print("Error: Failed to import route_algo or turn_algo. Ensure all files are in the same directory.")
     sys.exit(1)
 
-
 app = FastAPI(
-    title="FastLoopRoute API v4",
-    description="러닝 앱을 위한 안정적인 루프 경로 추천 서비스"
+    title="FastLoopRoute API v5",
+    description="러닝 앱을 위한 안정적인 루프 경로 추천 서비스 - Fallback 강화 버전"
 )
 
 @app.get("/api/recommend-route")
@@ -34,9 +23,10 @@ def recommend_route(
 ):
     """
     시작 좌표와 목표 거리를 기반으로 루프 형태의 경로를 추천합니다.
+    OSM 네트워크 부족 시에도 자동으로 Fallback 경로를 생성합니다.
     """
     try:
-        # 1. 경로 생성 (route_algo.py)
+        # 1. 경로 생성 (route_algo.py) - 절대 실패하지 않음
         polyline, length_m, algorithm_used = generate_route(lat, lng, km)
         
         # 2. Turn-by-turn 및 요약 생성 (turn_algo.py)
@@ -48,15 +38,15 @@ def recommend_route(
             "turns": turns,
             "summary": summary,
             "meta": {
-                "generation": f"FastLoopRoute v4 ({algorithm_used})",
-                "tolerance_m": 250, # 2km 기준 1.8km~2.3km
+                "generation": f"FastLoopRoute v5 ({algorithm_used})",
+                "tolerance_m": 250,
                 "algorithm_used": algorithm_used
             }
         }, status_code=200)
 
-    except RuntimeError as e:
-        # 경로 생성 알고리즘에서 의도적으로 발생시킨 에러
-        return JSONResponse({"error": str(e), "message": "경로 생성에 실패했습니다. 주변 네트워크 밀도가 너무 낮거나 요청 범위가 비현실적일 수 있습니다."}, status_code=404)
     except Exception as e:
-        # 기타 서버 에러
-        return JSONResponse({"error": str(e), "message": "서버 내부 오류가 발생했습니다."}, status_code=500)
+        # 모든 예외를 캐치하여 서버 오류로 반환 (경로 생성은 항상 성공해야 함)
+        return JSONResponse({
+            "error": str(e), 
+            "message": "예상치 못한 오류가 발생했습니다. 다시 시도해주세요."
+        }, status_code=500)
