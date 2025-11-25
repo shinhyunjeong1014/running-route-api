@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from route_algo import generate_area_loop
 from turn_algo import build_turn_by_turn
 
@@ -17,8 +18,8 @@ app.add_middleware(
 def recommend_route(lat: float, lng: float, km: float):
     """
     러닝 루프 + 턴바이턴 안내 생성 API.
-    - status = "ok"  : 정상 경로
-    - status = "error": 경로 생성 실패 (프론트에서 안내 필요)
+    - status = "ok"    : 정상 경로
+    - status = "error" : 경로 생성 실패 (프론트에서 안내 필요)
     """
     # 1) 러닝 루프 생성 (Valhalla 도보 경로 기반 Area-Loop)
     polyline, meta = generate_area_loop(lat, lng, km)
@@ -58,8 +59,8 @@ def recommend_route(lat: float, lng: float, km: float):
     length_ok = (0.6 * target_m <= length_m <= 1.6 * target_m)
 
     if not success_flag or not length_ok:
-        # 일단 polyline은 같이 내려주고, 프론트에서는 status 기반으로
-        # "실패"로 처리해도 되고, 디버깅용으로 지도를 띄워봐도 됨.
+        # polyline은 디버깅/지도 확인용으로 내려주고,
+        # 프론트에서는 status="error" 기반으로 사용자 안내.
         return {
             "status": "error",
             "message": "안전한 러닝 루프를 찾지 못했습니다. 출발 위치를 조금 바꾸거나 거리를 조정해보세요.",
