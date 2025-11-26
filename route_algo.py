@@ -14,12 +14,10 @@ logger.setLevel(logging.INFO)
 # -----------------------------
 
 VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
-# 개별 요청 타임아웃: 3초 -> 2.5초 단축
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
-# 재시도 횟수: 2회 -> 1회로 단축
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
 
-# 루프 생성 최대 Valhalla 호출 수 (전체 요청 시간 3~5초 제한)
+RUNNING_SPEED_KMH = 8.0  
 MAX_TOTAL_CALLS = 16 
 
 # -----------------------------
@@ -94,7 +92,7 @@ def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
     lat = 0
     lng = 0
     idx = 0
-    precision = 1e6 # Valhalla 기본 정밀도 (필수 요구사항)
+    precision = 1e6
 
     try:
         while idx < len(shape):
@@ -124,11 +122,10 @@ def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
             dlng = ~(result >> 1) if (result & 1) else (result >> 1)
             lng += dlng
 
-            # 정밀도 적용
             current_lat = lat / precision
             current_lng = lng / precision
 
-            # 좌표 범위 Sanity Check (필수 요구사항)
+            # 좌표 범위 Sanity Check 
             if not (-90.0 <= current_lat <= 90.0 and -180.0 <= current_lng <= 180.0):
                 logger.error(f"[Valhalla Decode] Sanity check failed: ({current_lat}, {current_lng})")
                 return []
@@ -237,10 +234,9 @@ def _score_loop(
     err = abs(length_m - target_m)
     roundness = _loop_roundness(points)
 
-    # score 계산 (roundness + length error 모두 반영)
     score = err + (1.0 - roundness) * 0.3 * target_m
 
-    # 엄격한 길이 검증 (필수 요구 사항: target_m ± 300m)
+    # 엄격한 길이 검증 (target_m ± 300m)
     length_ok = (abs(length_m - target_m) <= 300.0)
 
     meta = {
@@ -248,7 +244,7 @@ def _score_loop(
         "err": err,
         "roundness": roundness,
         "score": score,
-        "length_ok": length_ok, # 검증 결과를 메타에 포함
+        "length_ok": length_ok, 
     }
 
     return score, meta
@@ -308,7 +304,6 @@ def generate_area_loop(
                 continue
 
             # 2) via → 출발
-            # Valhalla 호출 수 제한을 위해 이 시점에서 다시 체크
             if valhalla_calls + 1 > MAX_TOTAL_CALLS: 
                 logger.warning(f"[Loop Gen] Max Valhalla calls limit ({MAX_TOTAL_CALLS}) reached.")
                 break 
@@ -319,20 +314,40 @@ def generate_area_loop(
             if not back_seg or len(back_seg) < 2:
                 continue
 
-            # 왕복 루프 polyline 구성 (접점 중복 및 계단식 반복 제거)
-            loop_pts: List[Tuple[float, float]] = out_seg + back_seg[1:]
+            # 왕복 루프 polyline 구성 (좌표 중첩 구간 제거)
+            loop_pts: List[Tuple[float, float]] = []
 
-            # 연속된 동일 좌표 제거 (좌표 반복/계단식 반복 방지 강화)
+            # 중복 구간 제거 로직 강화:
+            overlap_index = -1
+            max_overlap_check = min(len(out_seg), len(back_seg), 10) 
+            
+            for k in range(1, max_overlap_check + 1):
+                if out_seg[-k] == back_seg[k-1]:
+                    overlap_index = k
+                else:
+                    break
+            
+            if overlap_index > 0:
+                # 겹치는 부분이 있다면, back_seg의 겹치는 지점까지 자른다.
+                loop_pts = out_seg[:-overlap_index] + back_seg[overlap_index-1:] 
+            else:
+                loop_pts = out_seg + back_seg[1:]
+
+
+            # 연속된 동일 좌표 제거 (계단식 반복 방지)
             temp_pts = [loop_pts[0]]
             for p in loop_pts[1:]:
                 if p != temp_pts[-1]:
                     temp_pts.append(p)
             loop_pts = temp_pts
+            
+            # [루프 폐쇄 강화] 루프의 끝을 출발 지점과 강제로 일치시켜 완벽한 루프 보장
+            if loop_pts and loop_pts[0] != loop_pts[-1]:
+                loop_pts.append(loop_pts[0])
 
 
             score, local_meta = _score_loop(loop_pts, target_m)
             
-            # 길이 sanity-check 통과한 것만 최적 경로 후보로 사용
             if score < best_score and local_meta["length_ok"]: 
                 best_score = score
                 best_route = loop_pts
@@ -361,7 +376,6 @@ def generate_area_loop(
     # 3. 완전 실패 시: 가장 단순한 out-and-back 시도 (엄격 검증)
     # -----------------------------
     
-    # 북쪽 0도 방향으로 중간 반경 R_MEDIUM * 0.6 만큼 이동 시도
     R_fallback = R_MEDIUM * 0.6 
     simple_via = project_point(lat, lng, R_fallback, 0.0)
     
@@ -379,13 +393,17 @@ def generate_area_loop(
                 temp_pts.append(p)
         loop_pts = temp_pts
         
+        # [루프 폐쇄 강화] Fallback 루프의 끝을 출발 지점과 강제로 일치시켜 완벽한 루프 보장
+        if loop_pts and loop_pts[0] != loop_pts[-1]:
+            loop_pts.append(loop_pts[0])
+            
         _, meta = _score_loop(loop_pts, target_m)
         
         # 엄격한 길이 검증을 통과한 경우에만 Fallback 후보로 반환
         if meta["length_ok"]:
             meta.update(
                 {
-                    "success": False, # '최적 루프' 검색은 실패
+                    "success": False, 
                     "used_fallback": True,
                     "km_requested": km_requested,
                     "target_m": target_m,
@@ -396,7 +414,7 @@ def generate_area_loop(
             )
             return loop_pts, meta
 
-    # Valhalla 자체가 완전히 실패했거나, Fallback 경로가 부적합한 경우 (최종 실패)
+    # 최종 실패
     return [start], {
         "len": 0.0,
         "err": target_m,
