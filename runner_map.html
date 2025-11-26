@@ -15,14 +15,43 @@
         }
     </style>
     
-    <script type="text/javascript" 
-            src="//dapi.kakao.com/v2/maps/sdk.js?appkey=f3beaea643bdd2136019b366df1190cf&libraries=services,clusterer,drawing&autoload=false" 
-            data-onload="initMapLogic" defer></script> 
+    <script>
+        // --- 설정 ---
+        const API_HOST = "http://116.193.90.76:8000";
+        const API_PATH = "/api/recommend-route";
+        // -----------------
+
+        // 1. URL에서 파라미터를 빠르게 읽기
+        const urlParams = new URLSearchParams(window.location.search);
+        const CURRENT_LAT = parseFloat(urlParams.get('lat'));
+        const CURRENT_LNG = parseFloat(urlParams.get('lng'));
+        const CURRENT_KM = parseFloat(urlParams.get('km'));
+
+        const params = { 
+            lat: CURRENT_LAT, 
+            lng: CURRENT_LNG, 
+            km: CURRENT_KM 
+        };
+
+        // 2. 파라미터 유효성 검사 (지도 로드 전 필수 체크)
+        if (isNaN(CURRENT_LAT) || isNaN(CURRENT_LNG) || isNaN(CURRENT_KM)) {
+            // 지도 로드 전에 DOM 접근이 가능하도록 'window.onload' 이벤트에서 메시지를 설정합니다.
+            window.onload = function() {
+                document.getElementById('status_display').innerHTML = '❌ **오류:** URL에서 lat, lng, km 파라미터를 찾을 수 없거나 형식이 잘못되었습니다.';
+                document.getElementById('current_params').innerHTML = '파라미터: 유효하지 않음';
+                document.getElementById('map').innerHTML = '유효한 경로 파라미터를 입력해주세요.';
+            };
+            // 파라미터가 없으면 지도 SDK 로드 자체를 건너뜁니다.
+        } else {
+            // [수정 B: SDK 로드] 파라미터가 유효할 때만 SDK를 동적으로 로드합니다.
+            document.write('<script type="text/javascript" src="//dapi.kakao.com/v2/maps/sdk.js?appkey=f3beaea643bdd2136019b366df1190cf&libraries=services,clusterer,drawing&autoload=false" data-onload="initMapLogic" defer><\/script>');
+        }
+    </script>
 </head>
 <body>
 
 <div id="info">
-    <h2>러닝 경로 시각화v1</h2>
+    <h2>🏃‍♀️ 러닝 경로 시각화</h2>
     <p>API Endpoint: <code>http://116.193.90.76:8000/api/recommend-route</code></p>
     <p id="current_params">파라미터: 로딩 중...</p>
     <p id="status_display">상태: 로딩 중...</p>
@@ -32,33 +61,14 @@
 
 
 <script>
-    // --- 설정 ---
-    const API_HOST = "http://116.193.90.76:8000";
-    const API_PATH = "/api/recommend-route";
-    // -----------------
-
-    // [최종 수정] 지도 SDK 로드가 완료되면 이 함수가 Kakao API에 의해 안전하게 호출됩니다.
+    // [수정 C: initMapLogic 재구성] Kakao SDK 로드 완료 후 안전하게 호출됩니다.
     function initMapLogic() {
-        // 1. URL에서 파라미터 읽기
-        const urlParams = new URLSearchParams(window.location.search);
-        const lat = parseFloat(urlParams.get('lat'));
-        const lng = parseFloat(urlParams.get('lng'));
-        const km = parseFloat(urlParams.get('km'));
-
-        // 2. 유효성 검사 (함수 내부에서 실행되므로 안전합니다)
-        if (isNaN(lat) || isNaN(lng) || isNaN(km)) {
-            document.getElementById('status_display').innerHTML = '❌ **오류:** URL에서 lat, lng, km 파라미터를 찾을 수 없거나 형식이 잘못되었습니다.';
-            document.getElementById('current_params').innerHTML = '파라미터: 유효하지 않음';
-            document.getElementById('map').innerHTML = '유효한 경로 파라미터를 입력해주세요.';
-            return; 
-        }
         
-        const params = { lat, lng, km };
+        // DOM 요소에 파라미터 정보 출력
+        document.getElementById('current_params').innerHTML = `파라미터: Lat: ${CURRENT_LAT}, Lng: ${CURRENT_LNG}, KM: ${CURRENT_KM}`;
         
-        document.getElementById('current_params').innerHTML = `파라미터: Lat: ${lat}, Lng: ${lng}, KM: ${km}`;
-        
-        // 3. 지도 객체 생성 (kakao.maps가 로드되었음을 보장)
-        const centerCoords = new kakao.maps.LatLng(lat, lng); // <--- 이제 이 라인에서 오류가 발생하지 않습니다.
+        // 1. 지도 객체 생성 (전역 변수 CURRENT_LAT/LNG 사용)
+        const centerCoords = new kakao.maps.LatLng(CURRENT_LAT, CURRENT_LNG);
         
         const mapContainer = document.getElementById('map');
         const mapOption = {
@@ -76,7 +86,7 @@
             title: '출발/도착 지점'
         });
 
-        // 4. API 호출 함수
+        // 2. API 호출 함수
         function fetchRoute() {
             const query = new URLSearchParams(params).toString();
             const fullUrl = `${API_HOST}${API_PATH}?${query}`;
@@ -104,12 +114,12 @@
                     }
                 })
                 .catch(error => {
-                    statusDisplay.innerHTML = `상태: 🚨 경로 요청 중 오류 발생: ${error.message}. CORS/네트워크 문제일 수 있습니다.`;
+                    statusDisplay.innerHTML = `상태: 🚨 경로 요청 중 오류 발생: ${error.message}. CORS 문제일 수 있습니다.`;
                     console.error('Fetch Error:', error);
                 });
         }
 
-        // 5. 폴리라인 그리기 및 지도 경계 설정 함수
+        // 3. 폴리라인 그리기 및 지도 경계 설정 함수
         function drawPolyline(polylineData) {
             if (!polylineData || polylineData.length < 2) {
                 console.warn('Polyline data is too short or missing.');
@@ -137,12 +147,10 @@
             return bounds;
         }
 
-        // 지도 로드가 완료되면 경로를 가져옵니다.
-        // kakao.maps.event.addListener 대신 initMapLogic 함수 시작 시 바로 fetchRoute 실행
+        // 지도 로드 완료 후 바로 경로를 가져옵니다.
         fetchRoute();
     }
     
 </script>
 </body>
 </html>
-
