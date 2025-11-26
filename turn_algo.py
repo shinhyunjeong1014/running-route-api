@@ -131,7 +131,8 @@ def build_turn_by_turn(
     # 2) polyline 단순화
     simp = simplify_polyline(polyline, MIN_DIST_SIMPLIFY)
     if len(simp) < 2:
-        simp = polyline[:]
+        # 단순화 후 2점 미만이면, 원본에서 첫 두 점만 사용 (매우 짧은 경로 대비)
+        simp = polyline[:2] if len(polyline) >= 2 else polyline[:]
 
     turns: List[Dict] = []
 
@@ -150,9 +151,10 @@ def build_turn_by_turn(
             new_bearing = bearing_deg(*last_pt, *cur_pt)
             diff = angle_diff_deg(prev_bearing, new_bearing)
 
+            # 턴 감지 조건: 최소 각도 변화 + 직전 턴 이후 최소 거리
             if diff >= ANGLE_TURN and (cum_dist - last_turn_at) >= MIN_DIST_TURN:
                 turn_type = _classify_turn(prev_bearing, new_bearing)
-                if turn_type != "straight":
+                if turn_type != "straight": # 직진이 아닌, 의미 있는 턴만 기록
                     turns.append(
                         {
                             "type": turn_type,
@@ -173,23 +175,39 @@ def build_turn_by_turn(
         last_pt = cur_pt
 
     # 4) 너무 직선인 경우, 중간에 한 번 정도 '직진' 안내 추가
+    # 턴이 0개이고, 경로가 최소 길이 이상일 때
     if not turns and total_length_m >= MIN_STRAIGHT_SEG:
-        mid_idx = len(simp) // 2
-        mid_pt = simp[mid_idx]
-        turns.append(
-            {
-                "type": "straight",
-                "lat": mid_pt[0],
-                "lng": mid_pt[1],
-                "at_dist_m": round(total_length_m / 2.0, 1),
-                "instruction": f"{int(round(total_length_m))}m 코스를 따라 직진",
-            }
-        )
+        # simp가 2점 이상일 때만 유효
+        if len(simp) >= 2:
+            mid_idx = len(simp) // 2
+            mid_pt = simp[mid_idx]
+            turns.append(
+                {
+                    "type": "straight",
+                    "lat": mid_pt[0],
+                    "lng": mid_pt[1],
+                    "at_dist_m": round(total_length_m / 2.0, 1),
+                    "instruction": f"{int(round(total_length_m))}m 코스를 따라 직진",
+                }
+            )
+        else:
+             # 경로가 짧을 때 직진 안내
+            turns.append(
+                {
+                    "type": "straight",
+                    "lat": simp[0][0],
+                    "lng": simp[0][1],
+                    "at_dist_m": round(total_length_m, 1),
+                    "instruction": f"출발 지점에서 {int(round(total_length_m))}m 직진",
+                }
+            )
 
+
+    # 요약 정보 계산
     estimated_time_min = (total_length_m / 1000.0) / (RUNNING_SPEED_KMH / 60.0)
-    turn_count = len(
-        [t for t in turns if t["type"] in ("straight", "left", "right", "uturn")]
-    )
+    
+    # 턴 횟수는 "straight" 포함
+    turn_count = len(turns)
 
     summary = {
         "length_m": round(total_length_m, 1),
