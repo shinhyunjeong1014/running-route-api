@@ -83,7 +83,7 @@ def recommend_route(
         # 실패 조건: 최적 루프/유효 Fallback 경로 모두 실패
         default_error_message = "경로를 생성하지 못했거나 유효성 검사를 통과하지 못했습니다. 위치/거리를 조정해 보세요."
         
-        # summary와 length_m을 실패 기준으로 재설정
+        # summary를 실패 기준으로 재설정
         summary = {
             "length_m": 0.0,
             "km_requested": km,
@@ -95,7 +95,6 @@ def recommend_route(
             "status": "error",
             "message": meta.get("message", default_error_message),
             "start": start_point_dict,
-            # 실패 시에도 기존 JSON 형식에 맞춰 변환된 폴리라인 반환
             "polyline": formatted_polyline if polyline_tuples and len(polyline_tuples) > 1 else [start_point_dict], 
             "turns": [],
             "summary": summary,
