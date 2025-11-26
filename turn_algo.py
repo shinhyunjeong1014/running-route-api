@@ -16,7 +16,7 @@ RUNNING_SPEED_KMH = 8.0      # 요약용 러닝 속도
 
 
 # -----------------------------
-# 기초 유틸 (route_algo.py와 중복되나, 독립성 위해 유지)
+# 기초 유틸
 # -----------------------------
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -70,7 +70,6 @@ def simplify_polyline(points: List[Tuple[float, float]], min_dist: float) -> Lis
     acc_dist = 0.0
 
     for i in range(1, len(points)):
-        # 마지막 저장된 점(simplified[-1])에서 현재 점(points[i])까지의 거리
         d = haversine_m(*simplified[-1], *points[i])
         acc_dist += d
         if acc_dist >= min_dist:
@@ -116,7 +115,7 @@ def build_turn_by_turn(
     polyline: List[Tuple[float, float]],
     km_requested: float,
 ) -> Tuple[List[Dict], Dict]:
-    """polyline 기준 턴바이턴 안내 및 요약 생성. (total_length_m 인자 제거)"""
+    """polyline 기준 턴바이턴 안내 및 요약 생성."""
     if len(polyline) < 2:
         return [], {
             "length_m": 0.0,
@@ -202,8 +201,6 @@ def build_turn_by_turn(
     # 요약 정보 계산
     estimated_time_min = (total_length_m / 1000.0) / (RUNNING_SPEED_KMH / 60.0)
     
-    # 턴 횟수는 "straight"이 아닌 의미있는 턴만 세거나, 모든 안내를 포함할 수 있으나
-    # 여기서는 안내 항목 수로 count
     turn_count = len(turns) 
 
     summary = {
