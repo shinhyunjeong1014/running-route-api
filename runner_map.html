@@ -6,7 +6,7 @@
     <style>
         #map {
             width: 100%;
-            height: 90vh; /* 뷰포트 높이의 90%를 지도로 사용 */
+            height: 90vh;
         }
         #info {
             padding: 10px;
@@ -14,11 +14,13 @@
             font-size: 14px;
         }
     </style>
+    
+    <script type="text/javascript" src="//dapi.kakao.com/v2/maps/sdk.js?appkey=f3beaea643bdd2136019b366df1190cf&libraries=services,clusterer,drawing" async></script>
 </head>
 <body>
 
 <div id="info">
-    <h2>러닝 경로 시각화</h2>
+    <h2>🏃‍♀️ 러닝 경로 시각화</h2>
     <p>API Endpoint: <code>http://116.193.90.76:8000/api/recommend-route</code></p>
     <p id="current_params">파라미터: 로딩 중...</p>
     <p id="status_display">상태: 로딩 중...</p>
@@ -26,112 +28,131 @@
 
 <div id="map"></div>
 
-<script type="text/javascript" src="//dapi.kakao.com/v2/maps/sdk.js?appkey=f3beaea643bdd2136019b366df1190cf"></script>
+
 <script>
-    // --- 설정 ---
-    const API_HOST = "http://116.193.90.76:8000";
-    const API_PATH = "/api/recommend-route";
-    // -----------------
+    // [수정 A 적용] 전체 로직을 함수로 감싸서 'Illegal return statement' 오류를 해결합니다.
+    function initMapLogic() {
+        // --- 설정 ---
+        const API_HOST = "http://116.193.90.76:8000";
+        const API_PATH = "/api/recommend-route";
+        // -----------------
 
-    // 1. URL에서 파라미터 읽기
-    const urlParams = new URLSearchParams(window.location.search);
-    const lat = parseFloat(urlParams.get('lat'));
-    const lng = parseFloat(urlParams.get('lng'));
-    const km = parseFloat(urlParams.get('km'));
+        // 1. URL에서 파라미터 읽기
+        const urlParams = new URLSearchParams(window.location.search);
+        const lat = parseFloat(urlParams.get('lat'));
+        const lng = parseFloat(urlParams.get('lng'));
+        const km = parseFloat(urlParams.get('km'));
 
-    const params = { lat, lng, km };
-
-    // 파라미터 유효성 검사
-    if (isNaN(lat) || isNaN(lng) || isNaN(km)) {
-        document.getElementById('status_display').innerHTML = '❌ **오류:** URL에서 lat, lng, km 파라미터를 찾을 수 없거나 형식이 잘못되었습니다.';
-        document.getElementById('current_params').innerHTML = '파라미터: 유효하지 않음';
-        document.getElementById('map').innerHTML = '유효한 경로 파라미터를 입력해주세요.';
-        return;
-    }
-    
-    document.getElementById('current_params').innerHTML = `파라미터: Lat: ${lat}, Lng: ${lng}, KM: ${km}`;
-    
-    const centerCoords = new kakao.maps.LatLng(lat, lng);
-
-    // 2. 지도 초기 설정
-    const mapContainer = document.getElementById('map');
-    const mapOption = {
-        center: centerCoords, 
-        level: 4
-    };
-
-    const map = new kakao.maps.Map(mapContainer, mapOption);
-    const statusDisplay = document.getElementById('status_display');
-    
-    // 마커 생성 (출발점)
-    new kakao.maps.Marker({
-        map: map,
-        position: centerCoords,
-        title: '출발/도착 지점'
-    });
-
-    // 3. API 호출 함수
-    function fetchRoute() {
-        const query = new URLSearchParams(params).toString();
-        const fullUrl = `${API_HOST}${API_PATH}?${query}`;
+        // [수정 A] 유효성 검사 실패 시 함수를 종료 (return 문이 함수 내부에 위치)
+        if (isNaN(lat) || isNaN(lng) || isNaN(km)) {
+            document.getElementById('status_display').innerHTML = '❌ **오류:** URL에서 lat, lng, km 파라미터를 찾을 수 없거나 형식이 잘못되었습니다.';
+            document.getElementById('current_params').innerHTML = '파라미터: 유효하지 않음';
+            document.getElementById('map').innerHTML = '유효한 경로 파라미터를 입력해주세요.';
+            return; 
+        }
         
-        statusDisplay.innerHTML = '상태: 경로 데이터 요청 중...';
+        const params = { lat, lng, km };
+        
+        document.getElementById('current_params').innerHTML = `파라미터: Lat: ${lat}, Lng: ${lng}, KM: ${km}`;
+        
+        const centerCoords = new kakao.maps.LatLng(lat, lng);
 
-        fetch(fullUrl)
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'ok') {
-                    statusDisplay.innerHTML = `상태: ✅ 경로 로드 성공. (거리: ${data.summary.length_m}m, 예상 시간: ${data.summary.estimated_time_min}분)`;
-                    drawPolyline(data.polyline);
-                    
-                    // 폴리라인이 그려진 후 지도의 경계를 경로에 맞춥니다.
-                    const bounds = getBounds(data.polyline);
-                    map.setBounds(bounds);
-                    
-                } else {
-                    statusDisplay.innerHTML = `상태: ❌ 경로 생성 실패. (${data.message})`;
-                    console.error('API Error:', data.message);
-                }
-            })
-            .catch(error => {
-                statusDisplay.innerHTML = `상태: 🚨 네트워크 오류 또는 CORS 문제 발생: ${error.message}`;
-                console.error('Network Error:', error);
-            });
-    }
+        // 2. 지도 초기 설정
+        const mapContainer = document.getElementById('map');
+        const mapOption = {
+            center: centerCoords, 
+            level: 4
+        };
 
-    // 4. 폴리라인 그리기 및 지도 경계 설정 함수
-    function drawPolyline(polylineData) {
-        if (!polylineData || polylineData.length < 2) {
-            console.warn('Polyline data is too short or missing.');
-            return;
+        // kakao 객체가 로드되었는지 확인
+        if (typeof kakao === 'undefined' || typeof kakao.maps === 'undefined') {
+             document.getElementById('status_display').innerHTML = '❌ **오류:** 카카오 지도 SDK가 로드되지 않았습니다. API Key를 확인해주세요.';
+             return;
         }
 
-        // [{"lat": ..., "lng": ...}, ...] 형태를 LatLng 객체로 변환
-        const path = polylineData.map(point => new kakao.maps.LatLng(point.lat, point.lng));
 
-        const polyline = new kakao.maps.Polyline({
-            path: path,
-            strokeWeight: 5,           
-            strokeColor: '#00AA00',    
-            strokeOpacity: 0.8,        
-            strokeStyle: 'solid'       
+        const map = new kakao.maps.Map(mapContainer, mapOption);
+        const statusDisplay = document.getElementById('status_display');
+        
+        // 마커 생성 (출발점)
+        new kakao.maps.Marker({
+            map: map,
+            position: centerCoords,
+            title: '출발/도착 지점'
         });
 
-        polyline.setMap(map);
+        // 3. API 호출 함수
+        function fetchRoute() {
+            const query = new URLSearchParams(params).toString();
+            const fullUrl = `${API_HOST}${API_PATH}?${query}`;
+            
+            statusDisplay.innerHTML = '상태: 경로 데이터 요청 중...';
+
+            fetch(fullUrl)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.status === 'ok') {
+                        statusDisplay.innerHTML = `상태: ✅ 경로 로드 성공. (거리: ${data.summary.length_m}m, 예상 시간: ${data.summary.estimated_time_min}분)`;
+                        drawPolyline(data.polyline);
+                        
+                        const bounds = getBounds(data.polyline);
+                        map.setBounds(bounds);
+                        
+                    } else {
+                        statusDisplay.innerHTML = `상태: ❌ 경로 생성 실패. (${data.message})`;
+                        console.error('API Error:', data.message);
+                    }
+                })
+                .catch(error => {
+                    statusDisplay.innerHTML = `상태: 🚨 경로 요청 중 오류 발생: ${error.message}. CORS 문제일 수 있습니다.`;
+                    console.error('Fetch Error:', error);
+                });
+        }
+
+        // 4. 폴리라인 그리기 및 지도 경계 설정 함수
+        function drawPolyline(polylineData) {
+            if (!polylineData || polylineData.length < 2) {
+                console.warn('Polyline data is too short or missing.');
+                return;
+            }
+
+            const path = polylineData.map(point => new kakao.maps.LatLng(point.lat, point.lng));
+
+            const polyline = new kakao.maps.Polyline({
+                path: path,
+                strokeWeight: 5,           
+                strokeColor: '#00AA00',    
+                strokeOpacity: 0.8,        
+                strokeStyle: 'solid'       
+            });
+
+            polyline.setMap(map);
+        }
+        
+        function getBounds(polylineData) {
+            const bounds = new kakao.maps.LatLngBounds();
+            polylineData.forEach(point => {
+                bounds.extend(new kakao.maps.LatLng(point.lat, point.lng));
+            });
+            return bounds;
+        }
+
+        // 지도 로드가 완료되면 경로를 가져옵니다.
+        kakao.maps.event.addListener(map, 'tilesloaded', fetchRoute);
     }
     
-    function getBounds(polylineData) {
-        const bounds = new kakao.maps.LatLngBounds();
-        polylineData.forEach(point => {
-            bounds.extend(new kakao.maps.LatLng(point.lat, point.lng));
-        });
-        return bounds;
+    // 카카오 지도 라이브러리 로드 완료 후 initMapLogic 실행
+    if (document.readyState === 'loading') { // Loading hasn't finished yet
+        window.addEventListener('load', initMapLogic);
+    } else { // `DOMContentLoaded` has already fired
+        initMapLogic();
     }
-
-
-    // 맵 로드가 완료되면 경로를 가져옵니다.
-    kakao.maps.event.addListener(map, 'tilesloaded', fetchRoute);
-
+    
 </script>
 </body>
 </html>
