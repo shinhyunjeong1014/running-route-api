@@ -370,7 +370,7 @@ def generate_area_loop(
         return best_route, best_meta
 
     # -----------------------------
-    # 3. 완전 실패 시: 단순 왕복 시도 (Fallback 유지)
+    # 3. 완전 실패 시: 단순 왕복 시도 (Fallback 보강)
     # -----------------------------
     
     R_fallback = R_MEDIUM * 0.6 
@@ -381,7 +381,24 @@ def generate_area_loop(
 
     if out_seg and len(out_seg) >= 2:
         back_seg = list(reversed(out_seg))
-        loop_pts = out_seg + back_seg[1:]
+        
+        # [Fallback 특화] 경로 중첩 구간 제거 로직 적용
+        overlap_index = -1
+        max_overlap_check = min(len(out_seg), len(back_seg), 10) 
+        
+        for k in range(1, max_overlap_check + 1):
+            if out_seg[-k] == back_seg[k-1]:
+                overlap_index = k
+            else:
+                break
+        
+        if overlap_index > 0:
+            # 겹치는 부분이 있다면, back_seg의 겹치는 지점까지 자른다.
+            loop_pts = out_seg[:-overlap_index] + back_seg[overlap_index-1:] 
+        else:
+            # 안전장치로 기존 로직 적용 (via 지점만 중복 제거)
+            loop_pts = out_seg + back_seg[1:]
+
 
         # 연속된 동일 좌표 제거
         temp_pts = [loop_pts[0]]
