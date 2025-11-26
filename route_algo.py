@@ -18,7 +18,7 @@ VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
 
 RUNNING_SPEED_KMH = 8.0  
-# 삼각형 루프 방식 적용에 따라, 8방향 대신 4방향 x 3호출 = 최대 12회 + Fallback 1회
+# 삼각형 루프 방식 적용: 4방향 x 3호출 = 최대 12회 + Fallback 1회
 MAX_TOTAL_CALLS = 14 
 
 # -----------------------------
@@ -237,6 +237,7 @@ def _score_loop(
 
     score = err + (1.0 - roundness) * 0.3 * target_m
 
+    # 엄격한 길이 검증 (target_m ± 300m)
     length_ok = (abs(length_m - target_m) <= 300.0)
 
     meta = {
@@ -301,6 +302,7 @@ def generate_area_loop(
             
             # B: Via A에서 Seg_len 만큼 회전 (삼각형 구조를 만들기 위한 다음 Via 지점)
             seg_dist = max(50.0, SEGMENT_LEN) 
+            # 120도는 정삼각형을 위한 각도이며, 시작 방향(br)에 대한 상대 각도
             via_b = project_point(*via_a, seg_dist, (br + 120.0) % 360.0) 
             
             # 1) Seg A: 출발 → Via A
@@ -327,9 +329,12 @@ def generate_area_loop(
             # A 끝 (via_a), B 시작 (via_a) / B 끝 (via_b), C 시작 (via_b) 중복 제거
             loop_pts = seg_a + seg_b[1:] + seg_c[1:]
 
-            # [루프 폐쇄 강화] 루프의 끝을 출발 지점과 강제로 일치시켜 완벽한 루프 보장
-            if loop_pts and loop_pts[0] != loop_pts[-1]:
-                loop_pts.append(loop_pts[0])
+            # [핵심 수정] 루프의 끝을 API 입력 좌표(start)로 강제 일치시켜 완벽한 루프 보장
+            # 시작점과 끝점을 API 입력 좌표로 강제 보정
+            if loop_pts and loop_pts[0] != start:
+                loop_pts[0] = start
+            if loop_pts and loop_pts[-1] != start:
+                loop_pts[-1] = start
 
             # 연속된 동일 좌표 제거 (안전 장치)
             temp_pts = [loop_pts[0]]
@@ -365,7 +370,7 @@ def generate_area_loop(
         return best_route, best_meta
 
     # -----------------------------
-    # 3. 완전 실패 시: 단순 왕복 시도 (기존 Fallback 유지)
+    # 3. 완전 실패 시: 단순 왕복 시도 (Fallback 유지)
     # -----------------------------
     
     R_fallback = R_MEDIUM * 0.6 
@@ -385,9 +390,11 @@ def generate_area_loop(
                 temp_pts.append(p)
         loop_pts = temp_pts
         
-        # [루프 폐쇄 강화] Fallback 루프의 끝을 출발 지점과 강제로 일치시켜 완벽한 루프 보장
-        if loop_pts and loop_pts[0] != loop_pts[-1]:
-            loop_pts.append(loop_pts[0])
+        # [핵심 수정] Fallback 루프의 시작과 끝을 API 입력 좌표(start)로 강제 일치
+        if loop_pts and loop_pts[0] != start:
+            loop_pts[0] = start
+        if loop_pts and loop_pts[-1] != start:
+            loop_pts[-1] = start
             
         _, meta = _score_loop(loop_pts, target_m)
         
