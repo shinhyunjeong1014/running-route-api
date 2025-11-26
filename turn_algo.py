@@ -1,8 +1,9 @@
 import math
 import logging
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 logger = logging.getLogger("turn_algo")
+logger.setLevel(logging.INFO)
 
 # 각도/거리 기준(튜닝 가능 – 기존 값 유지 느낌으로)
 ANGLE_UTURN = 150.0          # U턴으로 볼 최소 각도
@@ -15,7 +16,7 @@ RUNNING_SPEED_KMH = 8.0      # 요약용 러닝 속도
 
 
 # -----------------------------
-# 기초 유틸
+# 기초 유틸 (route_algo.py와 중복되나, 독립성 위해 유지)
 # -----------------------------
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -61,7 +62,7 @@ def angle_diff_deg(a: float, b: float) -> float:
 
 
 def simplify_polyline(points: List[Tuple[float, float]], min_dist: float) -> List[Tuple[float, float]]:
-    """단순 거리 기반 polyline 축소 (연속점 사이 min_dist 미만이면 생략)."""
+    """단순 거리 기반 polyline 축소."""
     if len(points) < 2:
         return points[:]
 
@@ -69,6 +70,7 @@ def simplify_polyline(points: List[Tuple[float, float]], min_dist: float) -> Lis
     acc_dist = 0.0
 
     for i in range(1, len(points)):
+        # 마지막 저장된 점(simplified[-1])에서 현재 점(points[i])까지의 거리
         d = haversine_m(*simplified[-1], *points[i])
         acc_dist += d
         if acc_dist >= min_dist:
@@ -96,7 +98,6 @@ def _classify_turn(prev_b: float, cur_b: float) -> str:
         return "uturn"
     if adiff < ANGLE_TURN:
         return "straight"
-    # 양수면 우회전(오른쪽), 음수면 좌회전(왼쪽) 기준
     return "right" if diff > 0 else "left"
 
 
@@ -108,7 +109,6 @@ def _build_instruction(turn_type: str, distance_m: float) -> str:
         return f"{d}m 앞에서 좌회전"
     if turn_type == "right":
         return f"{d}m 앞에서 우회전"
-    # straight
     return f"{d}m 직진"
 
 
@@ -116,7 +116,7 @@ def build_turn_by_turn(
     polyline: List[Tuple[float, float]],
     km_requested: float,
 ) -> Tuple[List[Dict], Dict]:
-    """polyline 기준 턴바이턴 안내 및 요약 생성."""
+    """polyline 기준 턴바이턴 안내 및 요약 생성. (total_length_m 인자 제거)"""
     if len(polyline) < 2:
         return [], {
             "length_m": 0.0,
@@ -131,16 +131,15 @@ def build_turn_by_turn(
     # 2) polyline 단순화
     simp = simplify_polyline(polyline, MIN_DIST_SIMPLIFY)
     if len(simp) < 2:
-        # 단순화 후 2점 미만이면, 원본에서 첫 두 점만 사용 (매우 짧은 경로 대비)
         simp = polyline[:2] if len(polyline) >= 2 else polyline[:]
 
     turns: List[Dict] = []
 
     # 3) 전체 경로를 따라가며 누적 거리와 턴 계산
     cum_dist = 0.0
-    last_turn_at = 0.0  # 마지막 턴 발생 지점까지 거리
+    last_turn_at = 0.0
     last_pt = simp[0]
-    prev_bearing = None
+    prev_bearing: Optional[float] = None
 
     for i in range(1, len(simp)):
         cur_pt = simp[i]
@@ -151,10 +150,10 @@ def build_turn_by_turn(
             new_bearing = bearing_deg(*last_pt, *cur_pt)
             diff = angle_diff_deg(prev_bearing, new_bearing)
 
-            # 턴 감지 조건: 최소 각도 변화 + 직전 턴 이후 최소 거리
+            # 턴 감지 조건
             if diff >= ANGLE_TURN and (cum_dist - last_turn_at) >= MIN_DIST_TURN:
                 turn_type = _classify_turn(prev_bearing, new_bearing)
-                if turn_type != "straight": # 직진이 아닌, 의미 있는 턴만 기록
+                if turn_type != "straight": # 의미 있는 턴만 기록
                     turns.append(
                         {
                             "type": turn_type,
@@ -174,10 +173,8 @@ def build_turn_by_turn(
 
         last_pt = cur_pt
 
-    # 4) 너무 직선인 경우, 중간에 한 번 정도 '직진' 안내 추가
-    # 턴이 0개이고, 경로가 최소 길이 이상일 때
+    # 4) 너무 직선인 경우, 중간에 '직진' 안내 추가
     if not turns and total_length_m >= MIN_STRAIGHT_SEG:
-        # simp가 2점 이상일 때만 유효
         if len(simp) >= 2:
             mid_idx = len(simp) // 2
             mid_pt = simp[mid_idx]
@@ -191,8 +188,7 @@ def build_turn_by_turn(
                 }
             )
         else:
-             # 경로가 짧을 때 직진 안내
-            turns.append(
+             turns.append(
                 {
                     "type": "straight",
                     "lat": simp[0][0],
@@ -206,8 +202,9 @@ def build_turn_by_turn(
     # 요약 정보 계산
     estimated_time_min = (total_length_m / 1000.0) / (RUNNING_SPEED_KMH / 60.0)
     
-    # 턴 횟수는 "straight" 포함
-    turn_count = len(turns)
+    # 턴 횟수는 "straight"이 아닌 의미있는 턴만 세거나, 모든 안내를 포함할 수 있으나
+    # 여기서는 안내 항목 수로 count
+    turn_count = len(turns) 
 
     summary = {
         "length_m": round(total_length_m, 1),
