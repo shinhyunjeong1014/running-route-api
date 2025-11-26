@@ -24,9 +24,7 @@ app.add_middleware(
 def health():
     return {"status": "ok"}
 
-# -----------------------------
-# 폴리라인 형식 변환 함수
-# -----------------------------
+
 def _format_polyline_for_frontend(
     polyline: List[Tuple[float, float]],
 ) -> List[Dict[str, float]]:
@@ -42,23 +40,20 @@ def recommend_route(
     lng: float = Query(..., description="시작 지점 경도"),
     km: float = Query(..., gt=0.1, lt=50.0, description="목표 거리(km)"),
 ):
-    """러닝 루프 추천 API. (응답 Polyline 구조 유지)"""
+    """러닝 루프 추천 API. (응답 Polyline 구조 및 출발지=도착지 유지)"""
     
-    start_point = {"lat": lat, "lng": lng}
+    start_point_dict = {"lat": lat, "lng": lng}
     
-    # 1) 루프 생성 및 메타 정보 획득
+    # 1) 루프 생성 및 메타 정보 획득 (route_algo에서 이미 루프를 닫았음)
     polyline_tuples, meta = generate_area_loop(lat, lng, km)
 
-    target_m = km * 1000.0
-    length_m = meta.get("len", polyline_length_m(polyline_tuples))
-    
-    # 2) 턴바이턴 정보 생성
+    # 2) 턴바이턴 정보 생성 (폐쇄된 루프 기준으로 계산)
     turns, summary = build_turn_by_turn(polyline_tuples, km_requested=km)
 
-    
     # 3) 엄격한 경로 검증
     is_successful_route = meta.get("success", False)
 
+    # Fallback 경로 검증: 길이 OK + 의미 있는 턴 1개 이상
     is_valid_fallback = False
     if meta.get("used_fallback", False) and meta.get("length_ok", False):
         meaningful_turns = [t for t in turns if t["type"] in ("uturn", "left", "right")]
@@ -78,8 +73,8 @@ def recommend_route(
         # 성공/유효 경로 반환
         return {
             "status": "ok",
-            "start": start_point,
-            "polyline": formatted_polyline, # 변환된 List[Dict] 형태
+            "start": start_point_dict,
+            "polyline": formatted_polyline, 
             "turns": turns,
             "summary": summary,
             "meta": meta,
@@ -88,18 +83,21 @@ def recommend_route(
         # 실패 조건: 최적 루프/유효 Fallback 경로 모두 실패
         default_error_message = "경로를 생성하지 못했거나 유효성 검사를 통과하지 못했습니다. 위치/거리를 조정해 보세요."
         
+        # summary와 length_m을 실패 기준으로 재설정
+        summary = {
+            "length_m": 0.0,
+            "km_requested": km,
+            "estimated_time_min": 0.0,
+            "turn_count": 0,
+        }
+        
         return {
             "status": "error",
             "message": meta.get("message", default_error_message),
-            "start": start_point,
+            "start": start_point_dict,
             # 실패 시에도 기존 JSON 형식에 맞춰 변환된 폴리라인 반환
-            "polyline": formatted_polyline if polyline_tuples and len(polyline_tuples) > 1 else [start_point], 
+            "polyline": formatted_polyline if polyline_tuples and len(polyline_tuples) > 1 else [start_point_dict], 
             "turns": [],
-            "summary": {
-                "length_m": round(length_m, 1),
-                "km_requested": km,
-                "estimated_time_min": 0.0,
-                "turn_count": 0,
-            },
+            "summary": summary,
             "meta": meta,
         }
