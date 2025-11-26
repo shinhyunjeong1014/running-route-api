@@ -221,7 +221,7 @@ def _score_loop(
     points: List[Tuple[float, float]],
     target_m: float,
 ) -> Tuple[float, Dict]:
-    """경로 점수 계산 및 엄격한 길이 검증 (`± 300m`)."""
+    """경로 점수 계산 및 엄격한 길이 검증 (`± 500m`로 완화)."""
     length_m = polyline_length_m(points)
     
     if length_m <= 0.0:
@@ -237,8 +237,8 @@ def _score_loop(
 
     score = err + (1.0 - roundness) * 0.3 * target_m
 
-    # 엄격한 길이 검증 (target_m ± 300m)
-    length_ok = (abs(length_m - target_m) <= 300.0)
+    # [수정] 엄격한 길이 검증 조건 완화: target_m ± 500m 
+    length_ok = (abs(length_m - target_m) <= 500.0)
 
     meta = {
         "len": length_m,
