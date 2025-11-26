@@ -4,261 +4,189 @@ from typing import List, Dict, Tuple
 
 logger = logging.getLogger("turn_algo")
 
-# 각도/거리 기준(튜닝 가능)
-ANGLE_UTURN = 150           # U턴으로 볼 최소 각도
-ANGLE_TURN = 35             # 좌/우회전으로 볼 최소 각도
-MIN_DIST_TURN = 60.0        # 직전 턴 이후 최소 거리
-MIN_DIST_SIMPLIFY = 15.0    # polyline 단순화를 위한 최소 거리
-MIN_STRAIGHT_SEG = 40.0     # 직진 안내를 줄 최소 구간 길이
+# 각도/거리 기준(튜닝 가능 – 기존 값 유지 느낌으로)
+ANGLE_UTURN = 150.0          # U턴으로 볼 최소 각도
+ANGLE_TURN = 35.0            # 좌/우회전으로 볼 최소 각도
+MIN_DIST_TURN = 60.0         # 직전 턴 이후 최소 거리(m)
+MIN_DIST_SIMPLIFY = 15.0     # polyline 단순화 최소 거리(m)
+MIN_STRAIGHT_SEG = 40.0      # 직진 안내를 줄 최소 구간 길이(m)
 
+RUNNING_SPEED_KMH = 8.0      # 요약용 러닝 속도
+
+
+# -----------------------------
+# 기초 유틸
+# -----------------------------
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """두 위경도 사이의 거리 (m)."""
     R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = phi2 - phi1
-    dlambda = math.radians(lng2 - lng1)
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dphi = p2 - p1
+    dl = math.radians(lng2 - lng1)
 
     a = (
-        math.sin(dphi / 2.0) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+        math.sin(dphi / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     )
-    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
-    return R * c
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _cumulative_distances(points: List[Tuple[float, float]]) -> List[float]:
-    """각 점까지의 누적 거리 리스트 (0부터 시작)."""
-    if not points:
-        return []
-    dists = [0.0]
-    for i in range(1, len(points)):
-        d = haversine_m(points[i - 1][0], points[i - 1][1],
-                        points[i][0], points[i][1])
-        dists.append(dists[-1] + d)
-    return dists
+def polyline_length_m(points: List[Tuple[float, float]]) -> float:
+    if len(points) < 2:
+        return 0.0
+    total = 0.0
+    for (lat1, lon1), (lat2, lon2) in zip(points, points[1:]):
+        total += haversine_m(lat1, lon1, lat2, lon2)
+    return total
 
 
-def bearing_deg(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """두 점 사이의 방위각(0~360도)."""
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dlambda = math.radians(lng2 - lng1)
-
-    x = math.sin(dlambda) * math.cos(phi2)
-    y = math.cos(phi1) * math.sin(phi2) - \
-        math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """p1 → p2 방위각 (deg, 0=북)."""
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    x = math.sin(dl) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
     brng = math.degrees(math.atan2(x, y))
     return (brng + 360.0) % 360.0
 
 
-def angle_diff_deg(a1: float, a2: float) -> float:
-    """두 방위각의 signed difference (-180~180)."""
-    diff = (a2 - a1 + 180.0) % 360.0 - 180.0
-    return diff
+def angle_diff_deg(a: float, b: float) -> float:
+    """두 방위각 차이의 절대값(0~180)."""
+    d = abs(a - b) % 360.0
+    if d > 180.0:
+        d = 360.0 - d
+    return d
 
 
-def simplify_polyline(polyline: List[Dict[str, float]]) -> List[Dict[str, float]]:
-    """
-    너무 촘촘한 점들을 제거해서 턴 감지 시 노이즈를 줄이기.
-    """
-    if len(polyline) <= 2:
-        return polyline[:]
+def simplify_polyline(points: List[Tuple[float, float]], min_dist: float) -> List[Tuple[float, float]]:
+    """단순 거리 기반 polyline 축소 (연속점 사이 min_dist 미만이면 생략)."""
+    if len(points) < 2:
+        return points[:]
 
-    simplified = [polyline[0]]
-    last = polyline[0]
-    for pt in polyline[1:]:
-        d = haversine_m(last["lat"], last["lng"], pt["lat"], pt["lng"])
-        if d >= MIN_DIST_SIMPLIFY:
-            simplified.append(pt)
-            last = pt
-    if simplified[-1] is not polyline[-1]:
-        simplified.append(polyline[-1])
+    simplified = [points[0]]
+    acc_dist = 0.0
+
+    for i in range(1, len(points)):
+        d = haversine_m(*simplified[-1], *points[i])
+        acc_dist += d
+        if acc_dist >= min_dist:
+            simplified.append(points[i])
+            acc_dist = 0.0
+
+    if simplified[-1] != points[-1]:
+        simplified.append(points[-1])
     return simplified
 
 
-def _format_distance_m(distance_m: float) -> str:
-    """
-    음성 안내용 거리 문자열.
-    - 1000m 미만: 10m 단위 반올림 → "250m"
-    - 1000m 이상: 소수 1자리 km → "1.4km"
-    """
-    if distance_m < 1000.0:
-        d10 = int(round(distance_m / 10.0) * 10)
-        if d10 < 10:
-            d10 = 10
-        return f"{d10}m"
-    else:
-        km = distance_m / 1000.0
-        return f"{km:.1f}km"
+# -----------------------------
+# 턴바이턴 생성
+# -----------------------------
+
+def _classify_turn(prev_b: float, cur_b: float) -> str:
+    """방향 변화량을 바탕으로 좌/우/U턴 분류."""
+    diff = (cur_b - prev_b) % 360.0
+    if diff > 180.0:
+        diff -= 360.0  # -180~180
+
+    adiff = abs(diff)
+
+    if adiff >= ANGLE_UTURN:
+        return "uturn"
+    if adiff < ANGLE_TURN:
+        return "straight"
+    # 양수면 우회전(오른쪽), 음수면 좌회전(왼쪽) 기준
+    return "right" if diff > 0 else "left"
 
 
-def build_turn_by_turn(polyline: List[Dict[str, float]], km_requested: float):
-    """
-    폴리라인(지도 경로)을 받아 음성 안내용 턴 리스트와 요약 정보를 생성.
-    - '직진 x m' + 별도 '좌/우회전' 이벤트 (옵션 2 스타일)
-    """
-    # 예외 처리: 경로가 거의 없는 경우
-    if not polyline or len(polyline) < 2:
-        if not polyline:
-            return [], {
-                "length_m": 0.0,
-                "km_requested": km_requested,
-                "estimated_time_min": 0.0,
-                "turn_count": 0,
-            }
+def _build_instruction(turn_type: str, distance_m: float) -> str:
+    d = int(round(distance_m))
+    if turn_type == "uturn":
+        return f"{d}m 앞에서 U턴"
+    if turn_type == "left":
+        return f"{d}m 앞에서 좌회전"
+    if turn_type == "right":
+        return f"{d}m 앞에서 우회전"
+    # straight
+    return f"{d}m 직진"
 
-        start = polyline[0]
-        turns = [
-            {
-                "lat": start["lat"],
-                "lng": start["lng"],
-                "type": "start",
-                "distance": 0.0,
-                "instruction": "러닝을 시작합니다. 직진하세요.",
-            },
-            {
-                "lat": start["lat"],
-                "lng": start["lng"],
-                "type": "arrive",
-                "distance": 0.0,
-                "instruction": "목적지에 도착했습니다. 러닝을 완료했습니다.",
-            },
-        ]
-        return turns, {
+
+def build_turn_by_turn(
+    polyline: List[Tuple[float, float]],
+    km_requested: float,
+) -> Tuple[List[Dict], Dict]:
+    """polyline 기준 턴바이턴 안내 및 요약 생성."""
+    if len(polyline) < 2:
+        return [], {
             "length_m": 0.0,
             "km_requested": km_requested,
             "estimated_time_min": 0.0,
             "turn_count": 0,
         }
 
-    # 1) 폴리라인 단순화
-    simp = simplify_polyline(polyline)
-    points = [(p["lat"], p["lng"]) for p in simp]
-    cum = _cumulative_distances(points)
-    total_length_m = cum[-1]
+    # 1) 전체 길이 계산
+    total_length_m = polyline_length_m(polyline)
 
-    logger.info("[TurnAlgo] simplified points=%d, total_length=%.1fm",
-                len(points), total_length_m)
+    # 2) polyline 단순화
+    simp = simplify_polyline(polyline, MIN_DIST_SIMPLIFY)
+    if len(simp) < 2:
+        simp = polyline[:]
 
-    # 2) 턴 후보 탐지
-    turn_candidates = []
-    last_turn_idx = 0
-
-    for i in range(1, len(points) - 1):
-        lat0, lng0 = points[i - 1]
-        lat1, lng1 = points[i]
-        lat2, lng2 = points[i + 1]
-
-        d01 = haversine_m(lat0, lng0, lat1, lng1)
-        d12 = haversine_m(lat1, lng1, lat2, lng2)
-        if d01 < MIN_DIST_SIMPLIFY or d12 < MIN_DIST_SIMPLIFY:
-            continue
-
-        b1 = bearing_deg(lat0, lng0, lat1, lng1)
-        b2 = bearing_deg(lat1, lng1, lat2, lng2)
-        ang = angle_diff_deg(b1, b2)
-        abs_ang = abs(ang)
-
-        # 각도가 너무 작으면 직진으로 간주
-        if abs_ang < ANGLE_TURN:
-            continue
-
-        # 직전 턴 이후 충분한 거리가 쌓였는지 확인
-        dist_since_last = cum[i] - cum[last_turn_idx]
-        if dist_since_last < MIN_DIST_TURN:
-            continue
-
-        if abs_ang >= ANGLE_UTURN:
-            ttype = "uturn"
-        else:
-            ttype = "left" if ang > 0 else "right"
-
-        turn_candidates.append((i, ttype, ang))
-        last_turn_idx = i
-
-    logger.info("[TurnAlgo] detected turns=%d", len(turn_candidates))
-
-    # 3) 이벤트 리스트 구성
     turns: List[Dict] = []
-    start_lat, start_lng = points[0]
-    turns.append(
-        {
-            "lat": start_lat,
-            "lng": start_lng,
-            "type": "start",
-            "distance": 0.0,
-            "instruction": "러닝을 시작합니다. 직진하세요.",
-        }
-    )
 
-    anchor_idx = 0  # '직진 시작' 기준 인덱스
+    # 3) 전체 경로를 따라가며 누적 거리와 턴 계산
+    cum_dist = 0.0
+    last_turn_at = 0.0  # 마지막 턴 발생 지점까지 거리
+    last_pt = simp[0]
+    prev_bearing = None
 
-    def add_straight_event(from_idx: int, to_idx: int):
-        """anchor → 특정 턴 직전까지 '직진 x m' 이벤트 추가."""
-        if to_idx <= from_idx:
-            return
-        seg_len = cum[to_idx] - cum[from_idx]
-        if seg_len < MIN_STRAIGHT_SEG:
-            return
+    for i in range(1, len(simp)):
+        cur_pt = simp[i]
+        seg_d = haversine_m(*last_pt, *cur_pt)
+        cum_dist += seg_d
 
-        lat, lng = points[to_idx]
-        dist_text = _format_distance_m(seg_len)
-        turns.append(
-            {
-                "lat": lat,
-                "lng": lng,
-                "type": "straight",
-                "angle": 0.0,
-                "distance": round(seg_len, 1),
-                "instruction": f"{dist_text} 직진하세요",
-            }
-        )
+        if prev_bearing is not None:
+            new_bearing = bearing_deg(*last_pt, *cur_pt)
+            diff = angle_diff_deg(prev_bearing, new_bearing)
 
-    # 각 턴까지 직진 이벤트 → 턴 이벤트 → 앵커 갱신
-    for idx, ttype, ang in turn_candidates:
-        add_straight_event(anchor_idx, idx)
+            if diff >= ANGLE_TURN and (cum_dist - last_turn_at) >= MIN_DIST_TURN:
+                turn_type = _classify_turn(prev_bearing, new_bearing)
+                if turn_type != "straight":
+                    turns.append(
+                        {
+                            "type": turn_type,
+                            "lat": cur_pt[0],
+                            "lng": cur_pt[1],
+                            "at_dist_m": round(cum_dist, 1),
+                            "instruction": _build_instruction(
+                                turn_type, cum_dist - last_turn_at
+                            ),
+                        }
+                    )
+                    last_turn_at = cum_dist
 
-        lat, lng = points[idx]
-        if ttype == "left":
-            instr = "좌회전하세요."
-        elif ttype == "right":
-            instr = "우회전하세요."
+            prev_bearing = new_bearing
         else:
-            instr = "U턴 하세요."
+            prev_bearing = bearing_deg(*last_pt, *cur_pt)
 
+        last_pt = cur_pt
+
+    # 4) 너무 직선인 경우, 중간에 한 번 정도 '직진' 안내 추가
+    if not turns and total_length_m >= MIN_STRAIGHT_SEG:
+        mid_idx = len(simp) // 2
+        mid_pt = simp[mid_idx]
         turns.append(
             {
-                "lat": lat,
-                "lng": lng,
-                "type": ttype,
-                "angle": round(ang, 1),
-                "distance": 0.0,
-                "instruction": instr,
+                "type": "straight",
+                "lat": mid_pt[0],
+                "lng": mid_pt[1],
+                "at_dist_m": round(total_length_m / 2.0, 1),
+                "instruction": f"{int(round(total_length_m))}m 코스를 따라 직진",
             }
         )
-        anchor_idx = idx
 
-    # 마지막 턴 이후 → 도착점까지 직진 이벤트
-    last_idx = len(points) - 1
-    add_straight_event(anchor_idx, last_idx)
-
-    end_lat, end_lng = points[-1]
-    turns.append(
-        {
-            "lat": end_lat,
-            "lng": end_lng,
-            "type": "arrive",
-            "distance": 0.0,
-            "instruction": "목적지에 도착했습니다. 러닝을 완료했습니다.",
-        }
-    )
-
-    # 4) 요약 정보
-    RUNNING_SPEED_KMH = 8.0
     estimated_time_min = (total_length_m / 1000.0) / (RUNNING_SPEED_KMH / 60.0)
-
     turn_count = len(
         [t for t in turns if t["type"] in ("straight", "left", "right", "uturn")]
     )
