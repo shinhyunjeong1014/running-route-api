@@ -18,7 +18,8 @@ VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
 
 RUNNING_SPEED_KMH = 8.0  
-MAX_TOTAL_CALLS = 16 
+# 삼각형 루프 방식 적용에 따라, 8방향 대신 4방향 x 3호출 = 최대 12회 + Fallback 1회
+MAX_TOTAL_CALLS = 14 
 
 # -----------------------------
 # 거리 / 기하 유틸
@@ -236,7 +237,6 @@ def _score_loop(
 
     score = err + (1.0 - roundness) * 0.3 * target_m
 
-    # 엄격한 길이 검증 (target_m ± 300m)
     length_ok = (abs(length_m - target_m) <= 300.0)
 
     meta = {
@@ -251,7 +251,7 @@ def _score_loop(
 
 
 # -----------------------------
-# Area Loop 생성
+# Area Loop 생성 (삼각형 폐쇄 루프 방식)
 # -----------------------------
 
 def generate_area_loop(
@@ -259,24 +259,26 @@ def generate_area_loop(
     lng: float,
     km: float,
 ) -> Tuple[List[Tuple[float, float]], Dict]:
-    """목표 거리(km) 근처의 '짧은 러닝 루프'를 생성한다. (안정화 버전)"""
+    """목표 거리(km) 근처의 '닫힌 러닝 루프'를 생성한다. (좌표 중첩 해결 버전)"""
     
     start_time = time.time()
     
     target_m = max(300.0, km * 1000.0) 
     km_requested = km
 
-    ideal_R = target_m / (2.0 * math.pi)
+    # 루프의 각 변 길이 (대략) = target_m / 3
+    SEGMENT_LEN = target_m / 3.0
+    R_ideal = target_m / (2.0 * math.pi)
     
     # 3단계 가변 반경 테스트
-    R_SMALL = max(150.0, min(ideal_R * 0.7, 300.0))
-    R_MEDIUM = max(300.0, min(ideal_R, 600.0))
-    R_LARGE = max(450.0, min(ideal_R * 1.3, 1000.0))
+    R_SMALL = max(150.0, min(R_ideal * 0.7, 300.0))
+    R_MEDIUM = max(250.0, min(R_ideal, 500.0))
+    R_LARGE = max(400.0, min(R_ideal * 1.3, 800.0))
     
     radii = list(sorted(list(set([R_SMALL, R_MEDIUM, R_LARGE]))))
 
-    # 후보 방위각 (8방위)
-    bearings = [0, 45, 90, 135, 180, 225, 270, 315]
+    # 후보 방위각 (호출 횟수 관리를 위해 4방위 사용)
+    bearings = [0, 90, 180, 270] 
 
     best_route: List[Tuple[float, float]] = []
     best_meta: Dict = {}
@@ -285,67 +287,57 @@ def generate_area_loop(
     valhalla_calls = 0
     start = (lat, lng)
 
-    # 1. 3단계 반경 + 8방위 테스트
+    # 1. 3단계 반경 + 4방위 테스트 (최대 12회 호출)
     for R in radii:
-        if valhalla_calls >= MAX_TOTAL_CALLS: break
+        if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
 
         for br in bearings:
-            if valhalla_calls + 2 > MAX_TOTAL_CALLS:
+            if valhalla_calls + 3 > MAX_TOTAL_CALLS:
                 logger.warning(f"[Loop Gen] Max Valhalla calls limit ({MAX_TOTAL_CALLS}) reached.")
                 break 
 
-            via = project_point(lat, lng, R, br)
-
-            # 1) 출발 → via
-            out_seg = valhalla_route(start, via)
+            # A: 시작 → Via A (br 방향)
+            via_a = project_point(lat, lng, R, br)
+            
+            # B: Via A에서 Seg_len 만큼 회전 (삼각형 구조를 만들기 위한 다음 Via 지점)
+            seg_dist = max(50.0, SEGMENT_LEN) 
+            via_b = project_point(*via_a, seg_dist, (br + 120.0) % 360.0) 
+            
+            # 1) Seg A: 출발 → Via A
+            seg_a = valhalla_route(start, via_a)
             valhalla_calls += 1
 
-            if not out_seg or len(out_seg) < 2:
-                continue
+            if not seg_a or len(seg_a) < 2: continue
 
-            # 2) via → 출발
-            if valhalla_calls + 1 > MAX_TOTAL_CALLS: 
-                logger.warning(f"[Loop Gen] Max Valhalla calls limit ({MAX_TOTAL_CALLS}) reached.")
-                break 
-                
-            back_seg = valhalla_route(out_seg[-1], start)
+            # 2) Seg B: Via A → Via B
+            if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
+            seg_b = valhalla_route(seg_a[-1], via_b)
             valhalla_calls += 1
             
-            if not back_seg or len(back_seg) < 2:
-                continue
+            if not seg_b or len(seg_b) < 2: continue
 
-            # 왕복 루프 polyline 구성 (좌표 중첩 구간 제거)
-            loop_pts: List[Tuple[float, float]] = []
+            # 3) Seg C: Via B → 출발 (루프 폐쇄)
+            if valhalla_calls + 1 > MAX_TOTAL_CALLS: break
+            seg_c = valhalla_route(seg_b[-1], start)
+            valhalla_calls += 1
 
-            # 중복 구간 제거 로직 강화:
-            overlap_index = -1
-            max_overlap_check = min(len(out_seg), len(back_seg), 10) 
-            
-            for k in range(1, max_overlap_check + 1):
-                if out_seg[-k] == back_seg[k-1]:
-                    overlap_index = k
-                else:
-                    break
-            
-            if overlap_index > 0:
-                # 겹치는 부분이 있다면, back_seg의 겹치는 지점까지 자른다.
-                loop_pts = out_seg[:-overlap_index] + back_seg[overlap_index-1:] 
-            else:
-                loop_pts = out_seg + back_seg[1:]
+            if not seg_c or len(seg_c) < 2: continue
 
+            # 완전한 닫힌 루프 polyline 구성 (접점 중복 제거)
+            # A 끝 (via_a), B 시작 (via_a) / B 끝 (via_b), C 시작 (via_b) 중복 제거
+            loop_pts = seg_a + seg_b[1:] + seg_c[1:]
 
-            # 연속된 동일 좌표 제거 (계단식 반복 방지)
+            # [루프 폐쇄 강화] 루프의 끝을 출발 지점과 강제로 일치시켜 완벽한 루프 보장
+            if loop_pts and loop_pts[0] != loop_pts[-1]:
+                loop_pts.append(loop_pts[0])
+
+            # 연속된 동일 좌표 제거 (안전 장치)
             temp_pts = [loop_pts[0]]
             for p in loop_pts[1:]:
                 if p != temp_pts[-1]:
                     temp_pts.append(p)
             loop_pts = temp_pts
             
-            # [루프 폐쇄 강화] 루프의 끝을 출발 지점과 강제로 일치시켜 완벽한 루프 보장
-            if loop_pts and loop_pts[0] != loop_pts[-1]:
-                loop_pts.append(loop_pts[0])
-
-
             score, local_meta = _score_loop(loop_pts, target_m)
             
             if score < best_score and local_meta["length_ok"]: 
@@ -353,7 +345,7 @@ def generate_area_loop(
                 best_route = loop_pts
                 best_meta = local_meta
 
-        if valhalla_calls >= MAX_TOTAL_CALLS: break
+        if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
 
     # -----------------------------
     # 2. 결과 정리 (성공 케이스)
@@ -367,13 +359,13 @@ def generate_area_loop(
                 "target_m": target_m,
                 "valhalla_calls": valhalla_calls,
                 "time_s": round(time.time() - start_time, 2),
-                "message": "안정적인 러닝 루프를 찾았습니다.",
+                "message": "안정적인 닫힌 루프를 찾았습니다.",
             }
         )
         return best_route, best_meta
 
     # -----------------------------
-    # 3. 완전 실패 시: 가장 단순한 out-and-back 시도 (엄격 검증)
+    # 3. 완전 실패 시: 단순 왕복 시도 (기존 Fallback 유지)
     # -----------------------------
     
     R_fallback = R_MEDIUM * 0.6 
@@ -399,7 +391,6 @@ def generate_area_loop(
             
         _, meta = _score_loop(loop_pts, target_m)
         
-        # 엄격한 길이 검증을 통과한 경우에만 Fallback 후보로 반환
         if meta["length_ok"]:
             meta.update(
                 {
