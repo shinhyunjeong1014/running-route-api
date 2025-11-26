@@ -2,8 +2,8 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
+from typing import List, Dict, Tuple
 
-# generate_loop_route -> generate_area_loop 로 변경하여 route_algo.py와 통일
 from route_algo import generate_area_loop, polyline_length_m
 from turn_algo import build_turn_by_turn
 
@@ -24,6 +24,17 @@ app.add_middleware(
 def health():
     return {"status": "ok"}
 
+# -----------------------------
+# 폴리라인 형식 변환 함수
+# -----------------------------
+def _format_polyline_for_frontend(
+    polyline: List[Tuple[float, float]],
+) -> List[Dict[str, float]]:
+    """
+    [[lat, lng], ...] 형태를 [{"lat": lat, "lng": lng}, ...] 형태로 변환합니다.
+    """
+    return [{"lat": lat, "lng": lng} for lat, lng in polyline]
+
 
 @app.get("/api/recommend-route")
 def recommend_route(
@@ -31,63 +42,58 @@ def recommend_route(
     lng: float = Query(..., description="시작 지점 경도"),
     km: float = Query(..., gt=0.1, lt=50.0, description="목표 거리(km)"),
 ):
-    """러닝 루프 추천 API. (응답 구조 유지)"""
+    """러닝 루프 추천 API. (응답 Polyline 구조 유지)"""
     
     start_point = {"lat": lat, "lng": lng}
     
     # 1) 루프 생성 및 메타 정보 획득
-    polyline, meta = generate_area_loop(lat, lng, km)
+    polyline_tuples, meta = generate_area_loop(lat, lng, km)
 
     target_m = km * 1000.0
-    length_m = meta.get("len", polyline_length_m(polyline))
+    length_m = meta.get("len", polyline_length_m(polyline_tuples))
     
     # 2) 턴바이턴 정보 생성
-    turns, summary = build_turn_by_turn(polyline, km_requested=km)
+    turns, summary = build_turn_by_turn(polyline_tuples, km_requested=km)
 
     
     # 3) 엄격한 경로 검증
-    is_successful_route = meta.get("success", False) # 최적 루프 생성 성공
+    is_successful_route = meta.get("success", False)
 
-    # Fallback 경로 검증: 
-    #   1. route_algo 내에서 길이 검증(± 300m) 통과(meta["length_ok"] == True)
-    #   2. turn_algo 검사에서 최소 1개 이상의 의미 있는 턴(uturn, left, right)이 존재
     is_valid_fallback = False
     if meta.get("used_fallback", False) and meta.get("length_ok", False):
         meaningful_turns = [t for t in turns if t["type"] in ("uturn", "left", "right")]
         if meaningful_turns:
             is_valid_fallback = True
         else:
-            # Fallback이 너무 단순하거나 직선이어서 의미있는 턴이 없는 경우 실패 처리
             meta["message"] = "Fallback 경로가 너무 단순하여 안내를 제공할 수 없습니다."
             meta["validation_turns"] = len(meaningful_turns)
             
     
     # 4) 최종 상태 결정 및 응답
     
-    # 성공 조건: 최적 루프를 찾았거나 (is_successful_route), 유효한 Fallback 경로인 경우
+    # 최종 폴리라인 형식 변환 (프론트엔드 호환)
+    formatted_polyline = _format_polyline_for_frontend(polyline_tuples)
+    
     if is_successful_route or is_valid_fallback:
-        # 성공/유효 경로 반환 (FastAPI 응답 형식 유지)
+        # 성공/유효 경로 반환
         return {
             "status": "ok",
             "start": start_point,
-            "polyline": polyline,
+            "polyline": formatted_polyline, # 변환된 List[Dict] 형태
             "turns": turns,
             "summary": summary,
             "meta": meta,
         }
     else:
         # 실패 조건: 최적 루프/유효 Fallback 경로 모두 실패
-        # polyline이 아예 없거나, 길이 검증/턴 검증에 실패
-        
-        # 에러 발생 시, message, polyline, meta 를 항상 포함 (필수 요구사항)
         default_error_message = "경로를 생성하지 못했거나 유효성 검사를 통과하지 못했습니다. 위치/거리를 조정해 보세요."
         
         return {
             "status": "error",
             "message": meta.get("message", default_error_message),
             "start": start_point,
-            # 폴리라인이 비어있으면 빈 배열 반환, 아니면 디버깅 위해 현재 폴리라인 반환
-            "polyline": polyline if polyline and len(polyline) > 1 else [start_point], 
+            # 실패 시에도 기존 JSON 형식에 맞춰 변환된 폴리라인 반환
+            "polyline": formatted_polyline if polyline_tuples and len(polyline_tuples) > 1 else [start_point], 
             "turns": [],
             "summary": {
                 "length_m": round(length_m, 1),
