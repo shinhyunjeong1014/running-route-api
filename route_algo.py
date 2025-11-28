@@ -66,9 +66,9 @@ def project_point(lat: float, lon: float, distance_m: float, bearing_deg_: float
 # Valhalla/Kakao API 호출
 # -----------------------------
 
-def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: float = 0.0001) -> Optional[List[Tuple[float, float]]]:
+def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: float = 0.00001) -> Optional[List[Tuple[float, float]]]:
     """
-    경로 폴리라인 주변에 완충 영역(Buffer)을 둔 사각형 Polygon (Lat, Lon 순서)을 생성합니다.
+    [경로 중복 회피용] 경로 폴리라인의 Bounding Box Polygon을 생성합니다.
     """
     if not points:
         return None
@@ -78,8 +78,10 @@ def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: flo
     min_lon = min(p[1] for p in points)
     max_lon = max(p[1] for p in points)
     
-    # 완충 구역 (약 10m 정도의 위경도 차이)
-    buf = buffer_deg 
+    if haversine_m(min_lat, min_lon, max_lat, max_lon) < 20: 
+        return None 
+        
+    buf = buffer_deg
 
     return [
         (min_lat - buf, min_lon - buf),
@@ -93,7 +95,7 @@ def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: flo
 def valhalla_route(
     p1: Tuple[float, float],
     p2: Tuple[float, float],
-    avoid_polygons: Optional[List[List[Tuple[float, float]]]] = None, # 새로운 선택적 인자
+    avoid_polygons: Optional[List[List[Tuple[float, float]]]] = None,
     is_shrink_attempt: bool = False
 ) -> List[Tuple[float, float]]:
     lat1, lon1 = p1; lat2, lon2 = p2
@@ -105,7 +107,7 @@ def valhalla_route(
             "service_penalty": 1000, 
             "use_hills": 0.0,
             "use_ferry": 0.0,
-            "track_type_penalty": 50, # 좁은 길 패널티 완화 (길이 맞추기 유도)
+            "track_type_penalty": 50, 
             "private_road_penalty": 10000,
         }
     }
@@ -117,11 +119,10 @@ def valhalla_route(
                 "costing": "pedestrian",
                 "costing_options": costing_options
             }
-            # [핵심] avoid_polygons 인수가 있으면 payload에 추가
+            # avoid_polygons 인수가 있으면 payload에 추가
             if avoid_polygons:
                 valhalla_polys = []
                 for poly in avoid_polygons:
-                    # Valhalla는 Polygon 좌표를 [lng, lat] 순서로 받음
                     valhalla_polys.append([[lon, lat] for lat, lon in poly])
                 
                 payload["avoid_polygons"] = valhalla_polys
@@ -331,7 +332,7 @@ def generate_area_loop(
             if not seg_a or len(seg_a) < 2: continue
             
             # [핵심] Seg A를 기반으로 회피 다각형 생성 (Bbox 사용)
-            avoid_area = _get_bounding_box_polygon(seg_a)
+            avoid_area = _get_bounding_box_polygon(seg_a, buffer_deg=0.00001) # Buffer 극단적으로 축소
             avoid_polys = [avoid_area] if avoid_area else None
 
             # 2) Seg B: Via A → Via B (Seg A 회피)
@@ -343,7 +344,7 @@ def generate_area_loop(
             # [보강] Seg A + Seg B의 누적 Bounding Box 업데이트
             if avoid_polys:
                  all_points = seg_a + seg_b
-                 avoid_polys = [_get_bounding_box_polygon(all_points)]
+                 avoid_polys = [_get_bounding_box_polygon(all_points, buffer_deg=0.00001)]
             
             # 3) Seg C: Via B → 출발 (Seg A+B 회피)
             if valhalla_calls + 1 > MAX_TOTAL_CALLS: break
