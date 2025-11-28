@@ -18,6 +18,7 @@ VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) 
 
+# [핵심] 카카오 API 설정
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
@@ -102,6 +103,7 @@ def valhalla_route(
             "track_type_penalty": 50, 
             "private_road_penalty": 10000,
             
+            # [최종 보강] 도보 전용 경로 강제를 위한 Costing Options
             "sidewalk_preference": 1.0, 
             "alley_preference": -1.0, 
             "max_road_class": 0.5 
