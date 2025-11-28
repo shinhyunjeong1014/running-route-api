@@ -325,8 +325,9 @@ def generate_area_loop(
     # 품질 좋은 경로를 먼저 시도하도록 정렬
     candidate_routes.sort(key=lambda x: x["valhalla_score"])
     
-    # [핵심] 단축 로직 실행: 최대 5개의 최적 후보에 대해서만 단축 시도
-    for i, candidate in enumerate(candidate_routes[:MAX_BEST_ROUTES_TO_TEST]):
+    # [수정] 단축 로직 실행: 발견된 모든 경로 후보에 대해 단축 시도
+    # (candidate_routes[:MAX_BEST_ROUTES_TO_TEST] 대신 전체 리스트 사용)
+    for i, candidate in enumerate(candidate_routes): 
         
         if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
@@ -345,10 +346,10 @@ def generate_area_loop(
             )
 
             if shrunken_route:
-                # 단축 후 ±99m를 만족했으므로 최종 후보에 추가
+                final_score = _score_loop(shrunken_route, target_m)[0]
                 final_validated_routes.append({
                     "route": shrunken_route, 
-                    "score": _score_loop(shrunken_route, target_m)[0]
+                    "score": final_score
                 })
 
     # -----------------------------
@@ -408,3 +409,4 @@ def generate_area_loop(
         "message": f"탐색 결과, 유효한 경로 후보를 찾을 수 없습니다. (Valhalla 통신 불가 또는 지리적 단절)",
         "routes_checked": total_routes_checked,
     }
+
