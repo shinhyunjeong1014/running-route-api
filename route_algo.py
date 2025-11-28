@@ -18,6 +18,7 @@ VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
 
+# [핵심] 카카오 API 설정
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
@@ -79,6 +80,8 @@ def valhalla_route(
             "service_penalty": 1000, 
             "use_hills": 0.0,
             "use_ferry": 0.0,
+            "track_type_penalty": 50, # 좁은 길 패널티 완화
+            "private_road_penalty": 10000,
         }
     }
     
@@ -102,7 +105,7 @@ def valhalla_route(
     return []
 
 def kakao_walk_route(p1: Tuple[float, float], p2: Tuple[float, float]) -> Optional[List[Tuple[float, float]]]:
-    """카카오 길찾기 API (도보)를 호출하여 경로 폴리라인을 반환"""
+    """[수정] 카카오 길찾기 API 호출 및 JSON 구조를 맞춰 폴리라인 반환"""
     if not KAKAO_API_KEY:
         logger.error("[Kakao API] KAKAO_API_KEY not configured.")
         return None
@@ -119,17 +122,33 @@ def kakao_walk_route(p1: Tuple[float, float], p2: Tuple[float, float]) -> Option
 
         if data.get("routes") and data["routes"][0]["result_code"] == 0:
             coords = []
-            for section in data["routes"][0]["sections"]:
-                for guide in section["guides"]:
-                    point = guide["point"].split(",")
-                    if len(point) == 2:
-                        coords.append((float(point[1]), float(point[0]))) 
+            
+            # [핵심 수정] 카카오모빌리티 REST API의 실제 경로 구조 파싱 (roads -> vertexes)
+            for route in data["routes"]:
+                for section in route["sections"]:
+                    for road in section.get("roads", []):
+                        # vertexes는 [lon, lat, lon, lat, ...] 형식의 플랫 리스트
+                        vertices = road.get("vertexes", [])
+                        
+                        # 2개씩 묶어서 (lon, lat)을 추출하고 (lat, lon)으로 변환
+                        for i in range(0, len(vertices), 2): 
+                            if i + 1 < len(vertices):
+                                lon = vertices[i]
+                                lat = vertices[i+1]
+                                coords.append((lat, lon))
             
             if coords and len(coords) >= 2:
+                # [안전 보강] 시작점과 끝점이 정확히 포함되도록 보장
+                if coords[0] != p1: coords.insert(0, p1)
+                if coords[-1] != p2: coords.append(p2)
                 return coords
         
+        elif data.get("routes") and data["routes"][0]["result_code"] != 0:
+            logger.warning("[Kakao API] Route not found: %s", data["routes"][0]["result_msg"])
+            return None
+        
     except Exception as e:
-        logger.error("[Kakao API] Request failed: %s", e)
+        logger.error("[Kakao API] Request failed (Parsing or Network): %s", e)
         return None
     return None
 
@@ -188,7 +207,7 @@ def _score_loop(
     return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
 
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
-    """ [경로 안전 필터] 안전성 유연화를 위해, 현재는 항상 True를 반환합니다. """
+    """ 안전성 기준을 제거했으므로, 이 함수는 항상 True를 반환합니다. """
     return True 
 
 def _try_shrink_path_kakao(
@@ -321,13 +340,10 @@ def generate_area_loop(
     # -----------------------------
     
     final_validated_routes = []
-    
-    # 품질 좋은 경로를 먼저 시도하도록 정렬
     candidate_routes.sort(key=lambda x: x["valhalla_score"])
     
-    # [수정] 단축 로직 실행: 발견된 모든 경로 후보에 대해 단축 시도
-    # (candidate_routes[:MAX_BEST_ROUTES_TO_TEST] 대신 전체 리스트 사용)
-    for i, candidate in enumerate(candidate_routes): 
+    # 최대 5개의 최적 후보에 대해서만 단축 시도 (성능 제약 유지)
+    for i, candidate in enumerate(candidate_routes[:MAX_BEST_ROUTES_TO_TEST]): 
         
         if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
@@ -358,13 +374,13 @@ def generate_area_loop(
     
     best_final_route = None
     
-    # A. ±99m를 만족하는 경로가 있는 경우 (최우선)
     if final_validated_routes:
+        # A. ±99m를 만족하는 경로 중 최적 경로 선택
         final_validated_routes.sort(key=lambda x: x["score"])
         best_final_route = final_validated_routes[0]["route"]
         
-    # B. ±99m를 만족하는 경로가 없으면, 모든 원본 후보 중 '가장 인접한' 경로를 선택
     elif candidate_routes:
+        # B. ±99m를 만족하는 경로가 없으면, 모든 원본 후보 중 '가장 인접한' 경로를 선택
         min_error = float("inf")
         most_adjacent_route = None
 
@@ -409,4 +425,3 @@ def generate_area_loop(
         "message": f"탐색 결과, 유효한 경로 후보를 찾을 수 없습니다. (Valhalla 통신 불가 또는 지리적 단절)",
         "routes_checked": total_routes_checked,
     }
-
