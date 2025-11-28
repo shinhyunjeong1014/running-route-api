@@ -11,13 +11,14 @@ logger = logging.getLogger("route_algo")
 logger.setLevel(logging.INFO)
 
 # -----------------------------
-# 기본 설정 (유지)
+# 기본 설정 (강화)
 # -----------------------------
 
 VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
 
+# [핵심] 카카오 API 설정
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
@@ -27,9 +28,11 @@ MAX_TOTAL_CALLS = 30
 MAX_LENGTH_ERROR_M = 99.0
 
 # -----------------------------
-# 거리 / 기하 유틸 (유지)
+# 거리 / 기하 유틸
 # -----------------------------
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """두 위경도 사이의 대략적인 거리(m)."""
     R = 6371000.0
     p1 = math.radians(lat1); p2 = math.radians(lat2)
     dphi = p2 - p1; dl = math.radians(lon2 - lon1)
@@ -59,9 +62,106 @@ def project_point(lat: float, lon: float, distance_m: float, bearing_deg_: float
 
 
 # -----------------------------
-# Valhalla/Kakao API 호출 (유지)
+# Valhalla/Kakao API 호출 함수 정의
 # -----------------------------
-# ... (valhalla_route, kakao_walk_route, _decode_polyline 함수는 코드가 길어 생략하며, 이전 버전과 동일하게 유지됩니다.)
+
+def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
+    coords: List[Tuple[float, float]] = []; lat = 0; lng = 0; idx = 0; precision = 1e6
+
+    try:
+        while idx < len(shape):
+            shift = 0; result = 0
+            while True:
+                b = ord(shape[idx]) - 63; idx += 1; result |= (b & 0x1F) << shift; shift += 5
+                if b < 0x20: break
+            dlat = ~(result >> 1) if (result & 1) else (result >> 1); lat += dlat
+
+            shift = 0; result = 0
+            while True:
+                b = ord(shape[idx]) - 63; idx += 1; result |= (b & 0x1F) << shift; shift += 5
+                if b < 0x20: break
+            dlng = ~(result >> 1) if (result & 1) else (result >> 1); lng += dlng
+
+            current_lat = lat / precision; current_lng = lng / precision
+            if not (-90.0 <= current_lat <= 90.0 and -180.0 <= current_lng <= 180.0):
+                logger.error(f"[Valhalla Decode] Sanity check failed: ({current_lat}, {current_lng})")
+                return []
+            coords.append((current_lat, current_lng))
+    except IndexError:
+        logger.error("[Valhalla Decode] Unexpected end of polyline string.")
+        return []
+    return coords
+
+
+def valhalla_route(
+    p1: Tuple[float, float],
+    p2: Tuple[float, float],
+    is_shrink_attempt: bool = False
+) -> List[Tuple[float, float]]:
+    """[FastAPI에서 호출 가능하도록 정의]"""
+    lat1, lon1 = p1; lat2, lon2 = p2
+    last_error: Optional[Exception] = None
+    
+    costing_options = {
+        "pedestrian": {
+            "avoid_steps": 1.0, 
+            "service_penalty": 1000, 
+            "use_hills": 0.0,
+            "use_ferry": 0.0,
+        }
+    }
+    
+    for attempt in range(VALHALLA_MAX_RETRY):
+        try:
+            payload = {
+                "locations": [{"lat": lat1, "lon": lon1, "type": "break"}, {"lat": lat2, "lon": lon2, "type": "break"}],
+                "costing": "pedestrian",
+                "costing_options": costing_options
+            }
+            resp = requests.post(VALHALLA_URL, json=payload, timeout=VALHALLA_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            shape = data["trip"]["legs"][0]["shape"]
+            return _decode_polyline(shape)
+        except Exception as e:
+            last_error = e
+            logger.warning("[Valhalla] attempt %d failed for %s -> %s: %s", attempt + 1, p1, p2, e)
+
+    logger.error("[Valhalla] all attempts failed for %s -> %s: %s", p1, p2, last_error)
+    return []
+
+def kakao_walk_route(p1: Tuple[float, float], p2: Tuple[float, float]) -> Optional[List[Tuple[float, float]]]:
+    """카카오 길찾기 API (도보)를 호출하여 경로 폴리라인을 반환"""
+    if not KAKAO_API_KEY:
+        logger.error("[Kakao API] KAKAO_API_KEY not configured.")
+        return None
+    
+    lon1, lat1 = p1[::-1]; lon2, lat2 = p2[::-1]
+
+    headers = {"Authorization": f"KakaoAK {KAKAO_API_KEY}"}
+    params = {"origin": f"{lon1},{lat1}", "destination": f"{lon2},{lat2}", "waypoints": "", "priority": "RECOMMEND", "car_model": "walk"}
+
+    try:
+        resp = requests.get(KAKAO_ROUTE_URL, params=params, headers=headers, timeout=VALHALLA_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("routes") and data["routes"][0]["result_code"] == 0:
+            coords = []
+            for section in data["routes"][0]["sections"]:
+                for guide in section["guides"]:
+                    point = guide["point"].split(",")
+                    if len(point) == 2:
+                        coords.append((float(point[1]), float(point[0]))) 
+            
+            if coords and len(coords) >= 2:
+                return coords
+        
+    except Exception as e:
+        logger.error("[Kakao API] Request failed: %s", e)
+        return None
+    return None
+
 
 # -----------------------------
 # 루프 품질 평가 / 안전성 필터 / 단축 재연결 로직
@@ -91,7 +191,6 @@ def _score_loop(
 
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
     """ 안전성 기준을 제거했으므로, 이 함수는 항상 True를 반환합니다. """
-    # 이 함수는 현재 로직에서 안전성 필터링 역할은 하지 않습니다.
     return True 
 
 def _try_shrink_path_kakao(
@@ -158,7 +257,7 @@ def generate_area_loop(
     SEGMENT_LEN = target_m / 3.0
     R_ideal = target_m / (2.0 * math.pi)
     
-    # [수정] R 제약 완화 (100m까지 낮춰 탐색 공간 최대화)
+    # R 제약 완화 (100m까지 낮춰 탐색 공간 최대화)
     R_MIN = max(100.0, min(R_ideal * 0.3, 200.0))
     R_SMALL = max(200.0, min(R_ideal * 0.6, 400.0))
     R_MEDIUM = max(400.0, min(R_ideal * 1.0, 700.0))
@@ -173,12 +272,17 @@ def generate_area_loop(
 
     # 1. 5단계 반경 + 4방위 테스트 (최대 30회 호출)
     for R in radii:
-        if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
-        if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
+        # Python 3.10 호환성 수정 적용
+        if valhalla_calls + 3 > MAX_TOTAL_CALLS: 
+            break
+        if time.time() - start_time >= GLOBAL_TIMEOUT_S: 
+            break
 
         for br in bearings:
-            if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
-            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
+            if valhalla_calls + 3 > MAX_TOTAL_CALLS: 
+                break
+            if time.time() - start_time >= GLOBAL_TIMEOUT_S: 
+                break
 
             via_a = project_point(lat, lng, R, br)
             seg_dist = max(50.0, SEGMENT_LEN) 
@@ -209,12 +313,9 @@ def generate_area_loop(
             
             final_len = polyline_length_m(loop_pts)
             
-            # [핵심 수정] 길이 조건(±99m)에 관계없이, 안전성만 통과하면 best_route로 저장
-            # 카카오 단축 로직이 실행될 수 있도록 후보군을 모음
+            # [핵심 수정] 길이 조건(±99m)에 관계없이, 안전성만 통과하면 best_route로 저장 (단축 대상 후보)
             if _is_path_safe(loop_pts) and final_len > 0 and score < best_score:
-                best_score = score
-                best_route = loop_pts
-                best_meta = local_meta
+                best_score = score; best_route = loop_pts; best_meta = local_meta
 
         if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
 
@@ -225,7 +326,7 @@ def generate_area_loop(
         final_len = polyline_length_m(best_route)
         
         # [핵심] 길이 초과 시 (99m 초과) 카카오 단축 로직 시도
-        if abs(final_len - target_m) > MAX_LENGTH_ERROR_M:
+        if abs(final_len - target_m) > MAX_LENGTH_ERROR_M and final_len > target_m:
             logger.info("[Loop Gen] Path found (len=%d), but error > 99m. Attempting Kakao shrink...", final_len)
             
             shrunken_route, valhalla_calls = _try_shrink_path_kakao(
@@ -253,6 +354,9 @@ def generate_area_loop(
                 }
             )
             return best_route, best_meta
+        
+        # [추가 실패 처리] 경로가 있었지만, 단축 시도 후에도 99m를 맞추지 못하면 실패 처리
+        logger.warning("[Loop Gen] Found path, but failed to meet strict +/- 99m requirement even after shrink.")
 
     # -----------------------------
     # 3. 완전 실패 시: 단순 왕복 시도 (Fallback)
@@ -284,8 +388,8 @@ def generate_area_loop(
         fallback_len = polyline_length_m(loop_pts)
         fallback_err = abs(fallback_len - target_m)
         
-        # [핵심] Fallback도 ±99m 이내일 때만 허용 (안전성 필터는 제거됨)
-        if fallback_err <= MAX_LENGTH_ERROR_M: 
+        # [핵심] Fallback도 ±99m 이내일 때만 허용
+        if fallback_err <= MAX_LENGTH_ERROR_M and _is_path_safe(loop_pts): 
             meta = {
                 "len": fallback_len, "err": fallback_err, "roundness": _loop_roundness(loop_pts), 
                 "score": fallback_err + (1.0 - _loop_roundness(loop_pts)) * 0.3 * target_m,
