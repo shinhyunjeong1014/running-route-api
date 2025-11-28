@@ -221,7 +221,7 @@ def _score_loop(
     points: List[Tuple[float, float]],
     target_m: float,
 ) -> Tuple[float, Dict]:
-    """경로 점수 계산 및 엄격한 길이 검증 (`± 500m`로 완화)."""
+    """경로 점수 계산 및 엄격한 길이 검증 (`± 99m` 강화)."""
     length_m = polyline_length_m(points)
     
     if length_m <= 0.0:
@@ -237,8 +237,8 @@ def _score_loop(
 
     score = err + (1.0 - roundness) * 0.3 * target_m
 
-    # [수정] 엄격한 길이 검증 조건 완화: target_m ± 500m 
-    length_ok = (abs(length_m - target_m) <= 500.0)
+    # [수정] 엄격한 길이 검증 조건 강화: target_m ± 99m 
+    length_ok = (abs(length_m - target_m) <= 99.0)
 
     meta = {
         "len": length_m,
@@ -260,7 +260,7 @@ def generate_area_loop(
     lng: float,
     km: float,
 ) -> Tuple[List[Tuple[float, float]], Dict]:
-    """목표 거리(km) 근처의 '닫힌 러닝 루프'를 생성한다. (좌표 중첩 해결 버전)"""
+    """목표 거리(km) 근처의 '닫힌 러닝 루프'를 생성한다. (길이/안전성 강화 버전)"""
     
     start_time = time.time()
     
@@ -271,12 +271,15 @@ def generate_area_loop(
     SEGMENT_LEN = target_m / 3.0
     R_ideal = target_m / (2.0 * math.pi)
     
-    # 3단계 가변 반경 테스트
-    R_SMALL = max(150.0, min(R_ideal * 0.7, 300.0))
-    R_MEDIUM = max(250.0, min(R_ideal, 500.0))
-    R_LARGE = max(400.0, min(R_ideal * 1.3, 800.0))
+    # [수정] 5단계 가변 반경 테스트 및 하한선 조정 (골목길 회피 유도)
+    R_MIN = max(450.0, min(R_ideal * 0.7, 500.0))
+    R_SMALL = max(500.0, min(R_ideal * 0.9, 700.0))
+    R_MEDIUM = max(700.0, min(R_ideal * 1.1, 1000.0))
+    R_LARGE = max(900.0, min(R_ideal * 1.3, 1300.0))
+    R_XLARGE = max(1100.0, min(R_ideal * 1.5, 1600.0))
     
-    radii = list(sorted(list(set([R_SMALL, R_MEDIUM, R_LARGE]))))
+    # 5단계 반경을 테스트
+    radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
 
     # 후보 방위각 (호출 횟수 관리를 위해 4방위 사용)
     bearings = [0, 90, 180, 270] 
@@ -288,7 +291,7 @@ def generate_area_loop(
     valhalla_calls = 0
     start = (lat, lng)
 
-    # 1. 3단계 반경 + 4방위 테스트 (최대 12회 호출)
+    # 1. 5단계 반경 + 4방위 테스트 (최대 12회 호출)
     for R in radii:
         if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
 
@@ -413,20 +416,27 @@ def generate_area_loop(
         if loop_pts and loop_pts[-1] != start:
             loop_pts[-1] = start
             
-        _, meta = _score_loop(loop_pts, target_m)
+        # Fallback 전용 길이 검증: ±500m
+        fallback_len = polyline_length_m(loop_pts)
+        fallback_err = abs(fallback_len - target_m)
         
-        if meta["length_ok"]:
-            meta.update(
-                {
-                    "success": False, 
-                    "used_fallback": True,
-                    "km_requested": km_requested,
-                    "target_m": target_m,
-                    "valhalla_calls": valhalla_calls,
-                    "time_s": round(time.time() - start_time, 2),
-                    "message": "최적 루프를 찾지 못해 길이 검증을 통과한 단순 왕복 경로를 사용했습니다.",
-                }
-            )
+        if fallback_err <= 500.0: # ±500m 이내일 때 Fallback 허용
+            
+            # Fallback meta 정보를 수동으로 업데이트
+            meta = {
+                "len": fallback_len,
+                "err": fallback_err,
+                "roundness": _loop_roundness(loop_pts),
+                "score": fallback_err + (1.0 - _loop_roundness(loop_pts)) * 0.3 * target_m,
+                "length_ok": True, # Fallback 기준 통과!
+                "success": False, 
+                "used_fallback": True,
+                "km_requested": km_requested,
+                "target_m": target_m,
+                "valhalla_calls": valhalla_calls,
+                "time_s": round(time.time() - start_time, 2),
+                "message": f"최적 루프를 찾지 못해 길이({fallback_len:.1f}m) 검증 통과한 단순 왕복 경로를 사용했습니다.",
+            }
             return loop_pts, meta
 
     # 최종 실패
