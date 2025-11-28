@@ -18,7 +18,6 @@ VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) 
 
-# [핵심] 카카오 API 설정
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
@@ -103,7 +102,6 @@ def valhalla_route(
             "track_type_penalty": 50, 
             "private_road_penalty": 10000,
             
-            # [최종 보강] 도보 전용 경로 강제를 위한 Costing Options
             "sidewalk_preference": 1.0, 
             "alley_preference": -1.0, 
             "max_road_class": 0.5 
@@ -230,7 +228,37 @@ def _score_loop(
     return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
 
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
-    """ 안전성 기준을 제거했으므로, 이 함수는 항상 True를 반환합니다. """
+    """ [핵심 복구] 경로의 안전성을 판단합니다. (좁고 급회전이 많은 골목길을 회피)"""
+    if len(points) < 5: return True 
+
+    total_len = polyline_length_m(points)
+    if total_len == 0: return False
+
+    avg_segment_len = total_len / (len(points) - 1)
+    
+    # 좁은 길(골목길) 회피
+    if avg_segment_len < 8.0:
+        return False
+        
+    # 곡률 분석 (잦은 급회전 회피)
+    turn_count = 0
+    ANGLE_TURN_THRESHOLD = 30.0 
+    
+    for i in range(1, len(points) - 1):
+        lat1, lon1 = points[i-1]; lat2, lon2 = points[i]; lat3, lon3 = points[i+1]
+        
+        brng1 = math.degrees(math.atan2(lon2 - lon1, lat2 - lat1))
+        brng2 = math.degrees(math.atan2(lon3 - lon2, lat3 - lat2))
+        
+        angle_diff = abs((brng2 - brng1 + 360) % 360)
+        d = angle_diff % 360.0
+        if d > 180.0: d = 360.0 - d
+            
+        if d >= ANGLE_TURN_THRESHOLD: turn_count += 1
+            
+    if total_len > 300 and turn_count / (total_len / 100.0) > 2.0:
+        return False
+
     return True 
 
 def _try_shrink_path_kakao(
@@ -369,7 +397,6 @@ def generate_area_loop(
             seg_out = valhalla_route(start, via_a); valhalla_calls += 1
             if not seg_out or len(seg_out) < 2: continue
             
-            # Comeback Point 설정 (seg_out의 끝점)
             comback_point = seg_out[-1]
             
             # 2. 2차 경로 생성 후보 확보 (Comeback → Start)
@@ -393,7 +420,6 @@ def generate_area_loop(
                 # 겹침 페널티 계산 (핵심)
                 overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
                 
-                # 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
                 if overlap_penalty > 300.0: continue
 
                 total_route = seg_out + seg_back[1:] 
