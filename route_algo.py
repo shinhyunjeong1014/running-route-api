@@ -16,7 +16,7 @@ logger.setLevel(logging.INFO)
 
 VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
-VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
+VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) # 재시도 2회로 유지
 
 # [핵심] 카카오 API 설정
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
@@ -343,7 +343,6 @@ def generate_area_loop(
     R_XLARGE = max(1100.0, min(R_ideal * 1.6, 1800.0))
     
     radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
-    # 8방위 복구
     bearings = [0, 45, 90, 135, 180, 225, 270, 315] 
 
     candidate_routes = []
@@ -352,6 +351,7 @@ def generate_area_loop(
 
     # 1. Valhalla 탐색 (전수 조사)
     for R in radii:
+        # 주 루프는 2회 호출을 사용 (Out + Back)
         if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
         if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
@@ -360,7 +360,6 @@ def generate_area_loop(
             if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
             via_a = project_point(lat, lng, R, br)
-            seg_dist = max(50.0, SEGMENT_LEN) 
             
             # 1) Seg A: 출발 → Via A (Out Segment)
             seg_out = valhalla_route(start, via_a); valhalla_calls += 1
@@ -390,7 +389,7 @@ def generate_area_loop(
                 # 겹침 페널티 계산 (핵심)
                 overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
                 
-                # [핵심] 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
+                # 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
                 if overlap_penalty > 300.0: continue
 
                 total_route = seg_out + seg_back[1:] 
@@ -408,7 +407,7 @@ def generate_area_loop(
                     })
                     total_routes_checked += 1
 
-        if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
+        if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
 
     # -----------------------------
     # 4. 모든 후보 경로 후처리 (카카오 단축 시도)
