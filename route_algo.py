@@ -3,7 +3,7 @@ import os
 import time
 import logging
 import json
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 import requests
 
@@ -27,6 +27,7 @@ GLOBAL_TIMEOUT_S = 10.0
 MAX_TOTAL_CALLS = 30 
 MAX_LENGTH_ERROR_M = 99.0
 MAX_BEST_ROUTES_TO_TEST = 5 
+MAX_ROUTES_TO_PROCESS = 10 # Valhalla/Kakao 복귀 경로 후보 수
 
 # -----------------------------
 # 거리 / 기하 유틸
@@ -66,36 +67,9 @@ def project_point(lat: float, lon: float, distance_m: float, bearing_deg_: float
 # Valhalla/Kakao API 호출
 # -----------------------------
 
-def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: float = 0.00001) -> Optional[List[Tuple[float, float]]]:
-    """
-    [경로 중복 회피용] 경로 폴리라인의 Bounding Box Polygon을 생성합니다.
-    """
-    if not points:
-        return None
-        
-    min_lat = min(p[0] for p in points)
-    max_lat = max(p[0] for p in points)
-    min_lon = min(p[1] for p in points)
-    max_lon = max(p[1] for p in points)
-    
-    if haversine_m(min_lat, min_lon, max_lat, max_lon) < 20: 
-        return None 
-        
-    buf = buffer_deg
-
-    return [
-        (min_lat - buf, min_lon - buf),
-        (max_lat + buf, min_lon - buf),
-        (max_lat + buf, max_lon + buf),
-        (min_lat - buf, max_lon + buf),
-        (min_lat - buf, min_lon - buf), # Polygon 닫기
-    ]
-
-
 def valhalla_route(
     p1: Tuple[float, float],
     p2: Tuple[float, float],
-    avoid_polygons: Optional[List[List[Tuple[float, float]]]] = None,
     is_shrink_attempt: bool = False
 ) -> List[Tuple[float, float]]:
     lat1, lon1 = p1; lat2, lon2 = p2
@@ -119,13 +93,7 @@ def valhalla_route(
                 "costing": "pedestrian",
                 "costing_options": costing_options
             }
-            # avoid_polygons 인수가 있으면 payload에 추가
-            if avoid_polygons:
-                valhalla_polys = []
-                for poly in avoid_polygons:
-                    valhalla_polys.append([[lon, lat] for lat, lon in poly])
-                
-                payload["avoid_polygons"] = valhalla_polys
+            # 이 로직에서는 avoid_polygons를 사용하지 않습니다 (성공률 저하 방지)
 
             resp = requests.post(VALHALLA_URL, json=payload, timeout=VALHALLA_TIMEOUT)
             resp.raise_for_status()
@@ -276,9 +244,34 @@ def _try_shrink_path_kakao(
 
     return None, valhalla_calls
 
+def _calculate_overlap_penalty(seg_out: List[Tuple[float, float]], seg_back: List[Tuple[float, float]]) -> float:
+    """
+    복귀 경로(seg_back)가 나가는 경로(seg_out)와 공간적으로 겹치는 정도를 측정하여 페널티를 부과합니다.
+    """
+    if not seg_out or not seg_back: return 0.0
+
+    overlap_count = 0
+    OVERLAP_THRESHOLD_DEG = 0.0002 # 약 20m 근접성
+    
+    for lat_c, lon_c in seg_back:
+        is_close = False
+        for lat_a, lon_a in seg_out:
+            if abs(lat_c - lat_a) < OVERLAP_THRESHOLD_DEG and abs(lon_c - lon_a) < OVERLAP_THRESHOLD_DEG:
+                is_close = True
+                break
+        if is_close:
+            overlap_count += 1
+
+    seg_back_len = len(seg_back)
+    if seg_back_len > 0 and overlap_count / seg_back_len > 0.1: # 10% 이상 겹치면 페널티
+        overlap_ratio = overlap_count / seg_back_len
+        return overlap_ratio * 200.0 # 200m 상당의 페널티 부과
+        
+    return 0.0
+
 
 # -----------------------------
-# Area Loop 생성 (삼각형 폐쇄 루프 방식)
+# Area Loop 생성 (Two-Segment Hybrid)
 # -----------------------------
 
 def generate_area_loop(
@@ -286,7 +279,7 @@ def generate_area_loop(
     lng: float,
     km: float,
 ) -> Tuple[List[Tuple[float, float]], Dict]:
-    """목표 거리(km) 근처의 '닫힌 러닝 루프'를 생성한다. (전체 탐색 및 카카오 단축 적용)"""
+    """[최종] 목표 거리(km)를 위해 Two-Segment 구조를 사용하며, 겹침 페널티를 적용합니다."""
     
     start_time = time.time()
     
@@ -297,7 +290,7 @@ def generate_area_loop(
     if time.time() - start_time >= GLOBAL_TIMEOUT_S:
          return [start], {"len": 0.0, "err": target_m, "success": False, "used_fallback": False, "valhalla_calls": 0, "time_s": 0.0, "message": "경로 생성 요청이 시작하자마자 시간 제한(10초)을 초과했습니다."}
 
-    SEGMENT_LEN = target_m / 3.0
+    SEGMENT_LEN = target_m / 2.0 # Half distance for two segments
     R_ideal = target_m / (2.0 * math.pi)
     
     # R 제약 완화 (100m까지 낮춰 탐색 공간 최대화)
@@ -314,70 +307,70 @@ def generate_area_loop(
     valhalla_calls = 0
     total_routes_checked = 0
 
-    # 1. Valhalla 탐색 (전수 조사)
+    # 1. Valhalla 탐색 (전수 조사: Start -> Comeback)
     for R in radii:
-        if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
+        if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
         if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
         for br in bearings:
-            if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
+            if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
             if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
             via_a = project_point(lat, lng, R, br)
-            seg_dist = max(50.0, SEGMENT_LEN) 
-            via_b = project_point(*via_a, seg_dist, (br + 120.0) % 360.0) 
             
-            # 1) Seg A: 출발 → Via A
-            seg_a = valhalla_route(start, via_a); valhalla_calls += 1
-            if not seg_a or len(seg_a) < 2: continue
+            # [수정] 1차 경로 생성: Start -> Comeback (Far Away)
+            seg_out = valhalla_route(start, via_a); valhalla_calls += 1
+            if not seg_out or len(seg_out) < 2: continue
             
-            # [핵심] Seg A를 기반으로 회피 다각형 생성 (Bbox 사용)
-            avoid_area = _get_bounding_box_polygon(seg_a, buffer_deg=0.00001) # Buffer 극단적으로 축소
-            avoid_polys = [avoid_area] if avoid_area else None
+            # Comeback Point 설정 (seg_out의 끝점)
+            comback_point = seg_out[-1]
+            
+            # 2. 2차 경로 생성 후보 확보 (Comeback -> Start)
+            
+            back_segments = []
+            
+            # 2.1 Valhalla 복귀 경로 (2회 시도)
+            if valhalla_calls + 1 <= MAX_TOTAL_CALLS:
+                seg_back_v = valhalla_route(comback_point, start)
+                valhalla_calls += 1
+                if seg_back_v and len(seg_back_v) >= 2: back_segments.append({"seg": seg_back_v, "source": "Valhalla"})
+            
+            # 2.2 카카오 복귀 경로 (1회 시도)
+            seg_back_k = kakao_walk_route(comback_point, start)
+            if seg_back_k and len(seg_back_k) >= 2: back_segments.append({"seg": seg_back_k, "source": "Kakao"})
 
-            # 2) Seg B: Via A → Via B (Seg A 회피)
-            if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
-            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
-            seg_b = valhalla_route(seg_a[-1], via_b, avoid_polygons=avoid_polys); valhalla_calls += 1
-            if not seg_b or len(seg_b) < 2: continue
-
-            # [보강] Seg A + Seg B의 누적 Bounding Box 업데이트
-            if avoid_polys:
-                 all_points = seg_a + seg_b
-                 avoid_polys = [_get_bounding_box_polygon(all_points, buffer_deg=0.00001)]
-            
-            # 3) Seg C: Via B → 출발 (Seg A+B 회피)
-            if valhalla_calls + 1 > MAX_TOTAL_CALLS: break
-            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
-            seg_c = valhalla_route(seg_b[-1], start, avoid_polygons=avoid_polys); valhalla_calls += 1
-            if not seg_c or len(seg_c) < 2: continue
-
-            # 경로 생성 및 보정
-            loop_pts = seg_a + seg_b[1:] + seg_c[1:]
-            if loop_pts and loop_pts[0] != start: loop_pts[0] = start
-            if loop_pts and loop_pts[-1] != start: loop_pts[-1] = start
-            temp_pts = [loop_pts[0]]; [temp_pts.append(p) for p in loop_pts[1:] if p != temp_pts[-1]]; loop_pts = temp_pts
-            
-            score, local_meta = _score_loop(loop_pts, target_m)
-            
-            # [핵심] 안전성만 통과하면 (현재는 항상 True), 길이와 관계없이 모든 경로 후보를 저장
-            if _is_path_safe(loop_pts) and polyline_length_m(loop_pts) > 0:
-                candidate_routes.append({
-                    "route": loop_pts, 
-                    "valhalla_score": score, # 품질 점수
-                })
-                total_routes_checked += 1
+            # 3. 최종 루프 구성 및 페널티 적용
+            for back_seg_data in back_segments:
+                seg_back = back_seg_data["seg"]
+                
+                # 겹침 페널티 계산 (핵심)
+                overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
+                
+                total_route = seg_out + seg_back[1:] # 겹치는 Comeback Point 제거
+                if total_route and total_route[0] != start: total_route.insert(0, start)
+                if total_route and total_route[-1] != start: total_route.append(start)
+                temp_pts = [total_route[0]]; [temp_pts.append(p) for p in total_route[1:] if p != temp_pts[-1]]; total_route = temp_pts
+                
+                # 최종 점수 계산 (Roundness와 길이 오차 + 겹침 페널티)
+                score_base, local_meta = _score_loop(total_route, target_m)
+                total_score = score_base + overlap_penalty 
+                
+                if polyline_length_m(total_route) > 0:
+                    candidate_routes.append({
+                        "route": total_route, 
+                        "valhalla_score": total_score, # 페널티가 포함된 점수
+                    })
+                    total_routes_checked += 1
 
         if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
 
     # -----------------------------
-    # 2. 모든 후보 경로 후처리 (카카오 단축 시도)
+    # 4. 모든 후보 경로 후처리 (카카오 단축 시도)
     # -----------------------------
     
     final_validated_routes = []
     candidate_routes.sort(key=lambda x: x["valhalla_score"])
     
-    # 최대 5개의 최적 후보에 대해서만 단축 시도 (성능 제약 유지)
     for i, candidate in enumerate(candidate_routes[:MAX_BEST_ROUTES_TO_TEST]): 
         
         if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
@@ -404,7 +397,7 @@ def generate_area_loop(
                 })
 
     # -----------------------------
-    # 3. 최종 베스트 경로 선택 (절대 반환 보장)
+    # 5. 최종 베스트 경로 선택 (절대 반환 보장)
     # -----------------------------
     
     best_final_route = None
@@ -430,7 +423,7 @@ def generate_area_loop(
         best_final_route = most_adjacent_route
     
     # -----------------------------
-    # 4. 결과 반환 (성공/최인접 경로 반환 보장)
+    # 6. 결과 반환 (성공/최인접 경로 반환 보장)
     # -----------------------------
     
     if best_final_route:
@@ -452,7 +445,7 @@ def generate_area_loop(
         return best_final_route, meta
 
     # -----------------------------
-    # 5. 최종 실패 (경로 후보가 0개)
+    # 7. 최종 실패 (경로 후보가 0개)
     # -----------------------------
     return [start], {
         "len": 0.0, "err": target_m, "success": False, "used_fallback": False, 
