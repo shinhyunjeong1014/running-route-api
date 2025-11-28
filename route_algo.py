@@ -297,7 +297,7 @@ def generate_area_loop(
     R_ideal = target_m / (2.0 * math.pi)
     
     # [수정] 골목길 회피 기준 유연화 (R_MIN 250m 이상으로 낮춤)
-    R_MIN = max(250.0, min(R_ideal * 0.5, 300.0))
+    R_MIN = max(200.0, min(R_ideal * 0.5, 300.0))
     R_SMALL = max(350.0, min(R_ideal * 0.8, 600.0))
     R_MEDIUM = max(600.0, min(R_ideal, 900.0))
     R_LARGE = max(900.0, min(R_ideal * 1.2, 1300.0))
@@ -433,3 +433,4 @@ def generate_area_loop(
 
     # 최종 실패
     return [start], {"len": 0.0, "err": target_m, "success": False, "used_fallback": False, "km_requested": km_requested, "target_m": target_m, "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2), "message": f"요청 오차(±{MAX_LENGTH_ERROR_M}m)를 만족하는 경로를 찾을 수 없습니다. 거리를 조정해 주세요."}
+
