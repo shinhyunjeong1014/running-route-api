@@ -23,8 +23,8 @@ KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
 RUNNING_SPEED_KMH = 8.0  
-MAX_TOTAL_CALLS = 14 
-GLOBAL_TIMEOUT_S = 5.0 
+MAX_TOTAL_CALLS = 30 
+GLOBAL_TIMEOUT_S = 10.0 
 MAX_LENGTH_ERROR_M = 99.0
 
 # -----------------------------
@@ -402,3 +402,4 @@ def generate_area_loop(
 
     # 최종 실패
     return [start], {"len": 0.0, "err": target_m, "success": False, "used_fallback": False, "km_requested": km_requested, "target_m": target_m, "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2), "message": f"요청 오차(±{MAX_LENGTH_ERROR_M}m)를 만족하는 경로를 찾을 수 없습니다. 거리를 조정해 주세요."}
+
