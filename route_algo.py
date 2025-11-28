@@ -25,10 +25,10 @@ RUNNING_SPEED_KMH = 8.0
 GLOBAL_TIMEOUT_S = 10.0 
 MAX_TOTAL_CALLS = 30 
 MAX_LENGTH_ERROR_M = 99.0
-MAX_BEST_ROUTES_TO_TEST = 5 # 카카오 단축 시도 횟수 제한 (5개 최적 후보만 시도)
+MAX_BEST_ROUTES_TO_TEST = 5 # 카카오 단축 시도 횟수 제한
 
 # -----------------------------
-# 거리 / 기하 유틸 (유지)
+# 거리 / 기하 유틸
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -265,12 +265,11 @@ def generate_area_loop(
     radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
     bearings = [0, 90, 180, 270] 
 
-    # [핵심 변경] 모든 유효 경로 후보를 저장할 리스트
     candidate_routes = []
     valhalla_calls = 0
     total_routes_checked = 0
 
-    # 1. 5단계 반경 + 4방위 테스트 (최대 30회 호출)
+    # 1. Valhalla 탐색 (전수 조사)
     for R in radii:
         if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
         if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
@@ -298,18 +297,20 @@ def generate_area_loop(
             if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
             seg_c = valhalla_route(seg_b[-1], start); valhalla_calls += 1
             if not seg_c or len(seg_c) < 2: continue
-            
+
             # 경로 생성 및 보정
             loop_pts = seg_a + seg_b[1:] + seg_c[1:]
             if loop_pts and loop_pts[0] != start: loop_pts[0] = start
             if loop_pts and loop_pts[-1] != start: loop_pts[-1] = start
             temp_pts = [loop_pts[0]]; [temp_pts.append(p) for p in loop_pts[1:] if p != temp_pts[-1]]; loop_pts = temp_pts
             
-            # [수정] 모든 Valhalla 경로 후보를 저장 (점수는 추후 계산)
-            if loop_pts and len(loop_pts) >= 2:
+            score, local_meta = _score_loop(loop_pts, target_m)
+            
+            # [핵심] 안전성만 통과하면 (현재는 항상 True), 길이와 관계없이 모든 경로 후보를 저장
+            if _is_path_safe(loop_pts) and polyline_length_m(loop_pts) > 0:
                 candidate_routes.append({
                     "route": loop_pts, 
-                    "valhalla_score": _score_loop(loop_pts, target_m)[0],
+                    "valhalla_score": score, # 품질 점수
                 })
                 total_routes_checked += 1
 
@@ -319,14 +320,12 @@ def generate_area_loop(
     # 2. 모든 후보 경로 후처리 (카카오 단축 시도)
     # -----------------------------
     
+    final_validated_routes = []
+    
     # 품질 좋은 경로를 먼저 시도하도록 정렬
     candidate_routes.sort(key=lambda x: x["valhalla_score"])
     
-    best_final_route: Optional[List[Tuple[float, float]]] = None
-    best_final_score = float("inf")
-    routes_after_shrink = []
-    
-    # 최대 5개의 최적 후보에 대해서만 단축 시도
+    # [핵심] 단축 로직 실행: 최대 5개의 최적 후보에 대해서만 단축 시도
     for i, candidate in enumerate(candidate_routes[:MAX_BEST_ROUTES_TO_TEST]):
         
         if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
@@ -334,54 +333,78 @@ def generate_area_loop(
         current_route = candidate['route']
         final_len = polyline_length_m(current_route)
         
-        # 1. 길이가 ±99m 이내면 바로 최종 후보로 저장
+        # 1. 이미 ±99m 이내인 경우 (단축 불필요)
         if abs(final_len - target_m) <= MAX_LENGTH_ERROR_M:
-            final_score = _score_loop(current_route, target_m)[0]
-            if final_score < best_final_score:
-                best_final_score = final_score
-                best_final_route = current_route
-            routes_after_shrink.append(current_route)
+            final_validated_routes.append({"route": current_route, "score": _score_loop(current_route, target_m)[0]})
             continue
             
-        # 2. 길이가 99m 초과하면 카카오 단축 시도 (길이 초과 보정)
+        # 2. 길이가 99m 초과하면 카카오 단축 시도
         if final_len > target_m + MAX_LENGTH_ERROR_M:
             shrunken_route, valhalla_calls = _try_shrink_path_kakao(
                 current_route, target_m, valhalla_calls, start_time, GLOBAL_TIMEOUT_S
             )
 
             if shrunken_route:
-                final_score = _score_loop(shrunken_route, target_m)[0]
-                if final_score < best_final_score:
-                    best_final_score = final_score
-                    best_final_route = shrunken_route
-                routes_after_shrink.append(shrunken_route)
+                # 단축 후 ±99m를 만족했으므로 최종 후보에 추가
+                final_validated_routes.append({
+                    "route": shrunken_route, 
+                    "score": _score_loop(shrunken_route, target_m)[0]
+                })
 
     # -----------------------------
-    # 3. 최종 결과 반환
+    # 3. 최종 베스트 경로 선택 (절대 반환 보장)
+    # -----------------------------
+    
+    best_final_route = None
+    
+    # A. ±99m를 만족하는 경로가 있는 경우 (최우선)
+    if final_validated_routes:
+        final_validated_routes.sort(key=lambda x: x["score"])
+        best_final_route = final_validated_routes[0]["route"]
+        
+    # B. ±99m를 만족하는 경로가 없으면, 모든 원본 후보 중 '가장 인접한' 경로를 선택
+    elif candidate_routes:
+        min_error = float("inf")
+        most_adjacent_route = None
+
+        for candidate in candidate_routes:
+            length = polyline_length_m(candidate["route"])
+            error = abs(length - target_m)
+            
+            if error < min_error:
+                min_error = error
+                most_adjacent_route = candidate["route"]
+                
+        best_final_route = most_adjacent_route
+    
+    # -----------------------------
+    # 4. 결과 반환 (성공/최인접 경로 반환 보장)
     # -----------------------------
     
     if best_final_route:
-        # [수정] 가장 베스트 경로 출력
         final_len = polyline_length_m(best_final_route)
+        is_perfect = abs(final_len - target_m) <= MAX_LENGTH_ERROR_M
+        
         meta = {
             "len": final_len, "err": abs(final_len - target_m), "roundness": _loop_roundness(best_final_route), 
-            "success": True, "used_fallback": False, "km_requested": km_requested, "target_m": target_m,
+            "success": is_perfect,
+            "used_fallback": False, 
             "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2),
-            "message": "카카오 단축/Valhalla 탐색을 통해 최적의 정밀 경로를 찾았습니다.", "length_ok": True,
-            "routes_checked": total_routes_checked, # 1, 2, 3 수행 중 몇개의 경로에 대해 수행되었는지 표시
+            "message": "최적의 경로가 도출되었습니다." if is_perfect else "요청 오차(±99m)를 초과하지만, 가장 인접한 경로를 반환합니다.",
+            "length_ok": is_perfect,
+            "routes_checked": total_routes_checked,
+            "routes_processed": len(candidate_routes),
+            "routes_validated": len(final_validated_routes)
         }
+        
         return best_final_route, meta
 
     # -----------------------------
-    # 4. 최종 실패 (Fallback 시도 안 함: 99m 기준 고수)
+    # 5. 최종 실패 (경로 후보가 0개)
     # -----------------------------
-    
-    final_valhalla_calls = valhalla_calls + (1 if total_routes_checked == 0 else 0) # Fallback 시도 횟수는 1회로 간주
-
     return [start], {
         "len": 0.0, "err": target_m, "success": False, "used_fallback": False, 
-        "km_requested": km_requested, "target_m": target_m,
-        "valhalla_calls": final_valhalla_calls, "time_s": round(time.time() - start_time, 2),
-        "message": f"요청 오차(±{MAX_LENGTH_ERROR_M}m)를 만족하는 경로를 찾을 수 없습니다. 거리를 조정해 주세요.",
+        "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2),
+        "message": f"탐색 결과, 유효한 경로 후보를 찾을 수 없습니다. (Valhalla 통신 불가 또는 지리적 단절)",
         "routes_checked": total_routes_checked,
     }
