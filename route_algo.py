@@ -353,34 +353,47 @@ def _try_shrink_path_kakao(
     start_time: float,
     global_timeout: float,
 ) -> Tuple[Optional[List[Tuple[float, float]]], int]:
+    """
+    현재 경로가 '너무 길 때만' 카카오 경로로 단축을 시도한다.
+    - 목표보다 짧은 경우에는 여기서 처리하지 않고, 별도의 연장 로직을 사용해야 한다.
+    - 성공 조건: 길이가 target_m 이상이면서, target_m + MAX_LENGTH_ERROR_M 이내인 경우만 True.
+    """
+
     current_len = polyline_length_m(current_route)
     error_m = current_len - target_m
 
     if time.time() - start_time >= global_timeout:
         return None, valhalla_calls
 
+    # 이미 목표보다 짧거나 같은 경우: 단축 대상이 아님
+    if error_m <= 0:
+        return None, valhalla_calls
+
     pts = current_route
     idx_a = max(1, int(len(pts) * 0.40))
     idx_b = min(len(pts) - 2, int(len(pts) * 0.60))
+
+    route_to_shrink = current_route[:]
 
     if idx_a < idx_b:
         p_a = pts[idx_a]
         p_b = pts[idx_b]
 
-        # [핵심] 반복 단축 시도 시작
         MAX_SHRINK_ATTEMPTS = 3
-        route_to_shrink = current_route[:]
 
-        for attempt in range(MAX_SHRINK_ATTEMPTS):
+        for _ in range(MAX_SHRINK_ATTEMPTS):
+            if time.time() - start_time >= global_timeout:
+                break
+
             current_len = polyline_length_m(route_to_shrink)
             error_m = current_len - target_m
 
-            if abs(error_m) <= MAX_LENGTH_ERROR_M:
-                return route_to_shrink, valhalla_calls  # 목표 달성
-            if error_m < 0:
-                break
+            # 한 방향 조건: target_m 이상이면서 +99m 이내만 OK
+            if 0.0 <= error_m <= MAX_LENGTH_ERROR_M:
+                return route_to_shrink, valhalla_calls
 
-            if time.time() - start_time >= global_timeout:
+            # 이미 target 보다 짧아졌다면 더 이상 단축하면 안 됨
+            if error_m < 0:
                 break
 
             reconnect_seg = kakao_walk_route(p_a, p_b)
@@ -390,21 +403,20 @@ def _try_shrink_path_kakao(
                 seg_len_new = polyline_length_m(reconnect_seg)
                 reduction = seg_len_original - seg_len_new
 
-                if reduction > 0:  # 단축 효과가 있다면 경로 교체
+                if reduction > 0:
                     new_route = pts[:idx_a] + reconnect_seg + pts[idx_b + 1 :]
-                    route_to_shrink = new_route[:]  # 다음 반복을 위해 경로 업데이트
+                    route_to_shrink = new_route[:]
                 else:
                     break
 
-    # 최종 검증 후, 목표 달성했으면 경로 반환, 아니면 None 반환
-    if (
-        abs(polyline_length_m(current_route) - target_m)
-        <= MAX_LENGTH_ERROR_M
-    ):
-        return current_route, valhalla_calls
+    # 마지막으로 한 번 더 검사
+    final_len = polyline_length_m(route_to_shrink)
+    final_error = final_len - target_m
+
+    if 0.0 <= final_error <= MAX_LENGTH_ERROR_M:
+        return route_to_shrink, valhalla_calls
     else:
         return None, valhalla_calls
-
 
 def _calculate_overlap_penalty(
     seg_out: List[Tuple[float, float]], seg_back: List[Tuple[float, float]]
@@ -438,28 +450,22 @@ def _calculate_overlap_penalty(
 
     return 0.0
 
-
-# -----------------------------
-# 루프 길이 "연장" 스퍼 추가 (NEW)
-# -----------------------------
-
-
-def _try_extend_path_kakao(
+def _extend_path_kakao_spur(
     current_route: List[Tuple[float, float]],
     target_m: float,
     start_time: float,
     global_timeout: float,
-) -> Optional[List[Tuple[float, float]]]:
+) -> List[Tuple[float, float]]:
     """
-    경로 길이가 target_m보다 짧을 때,
-    중간 지점에서 카카오 도보 경로를 왕복 스퍼로 붙여 길이를 늘린다.
-    - 되돌아가는 메인 Back 경로는 여전히 '최단 복귀' 전략을 유지
-    - 여기서는 루프 중간에만 작은 왕복 꼬리를 붙여 전체 거리만 보정
+    현재 루프가 target_m 보다 짧을 때,
+    중간 지점 근처에 작은 왕복 스퍼(spur)를 붙여 전체 길이를 늘린다.
+    - 카카오 도보 경로만 사용 (Valhalla 호출 수 증가 없음)
+    - 모양은 루프 + 작은 돌출부 형태가 되지만, '한 바퀴 돈 느낌'은 유지됨.
     """
-    if len(current_route) < 4:
-        return None
 
     route = current_route[:]
+    if len(route) < 3:
+        return route
 
     MAX_EXTEND_ATTEMPTS = 3
 
@@ -467,85 +473,51 @@ def _try_extend_path_kakao(
         if time.time() - start_time >= global_timeout:
             break
 
-        cur_len = polyline_length_m(route)
-        error_m = target_m - cur_len
-
-        # 이미 충분히 가까우면 종료
-        if abs(error_m) <= MAX_LENGTH_ERROR_M:
-            return route
-        # 이미 target보다 길어졌다면 여기서는 멈춤 (단축 로직은 다른 함수에서 처리)
-        if error_m <= 0:
+        current_len = polyline_length_m(route)
+        if current_len >= target_m:
             break
 
-        # 스퍼로 추가할 총 길이 (최대 1.5km)
-        extend_len = min(error_m, 1500.0)
-        spur_dist = max(150.0, extend_len / 2.0)  # 왕복이므로 절반씩
-
-        # 경로 중간 지점 선택
-        idx_mid = len(route) // 2
-        p_mid = route[idx_mid]
-
-        # 중간 지점의 진행 방향(대략적인 bearing) 추정
-        if 0 < idx_mid < len(route) - 1:
-            br_forward = bearing_deg(
-                route[idx_mid][0],
-                route[idx_mid][1],
-                route[idx_mid + 1][0],
-                route[idx_mid + 1][1],
-            )
-        else:
-            br_forward = 0.0
-
-        # 진행 방향에 수직(좌/우)인 두 방향으로 스퍼 후보 생성
-        candidate_bearings = [
-            (br_forward + 90.0) % 360.0,
-            (br_forward + 270.0) % 360.0,
-        ]
-
-        best_spur: Optional[List[Tuple[float, float]]] = None
-        best_spur_len = 0.0
-
-        for br in candidate_bearings:
-            spur_point = project_point(
-                p_mid[0], p_mid[1], spur_dist, br
-            )
-
-            spur_out = kakao_walk_route(p_mid, spur_point)
-            spur_back = kakao_walk_route(spur_point, p_mid)
-
-            if not spur_out or not spur_back:
-                continue
-
-            spur_path = spur_out + spur_back[1:]
-            spur_len = polyline_length_m(spur_path)
-
-            # 스퍼 길이가 너무 짧으면 의미 없음
-            if spur_len < 100.0:
-                continue
-
-            if spur_len > best_spur_len:
-                best_spur_len = spur_len
-                best_spur = spur_path
-
-        if not best_spur:
-            # 더 이상 유의미한 연장 불가
+        remaining = target_m - current_len
+        # 남은 거리가 너무 작으면 의미 없는 스퍼이므로 종료
+        if remaining < 30.0:
             break
 
-        # 스퍼를 경로 중간에 삽입
-        # route[idx_mid] == p_mid 이므로, 중복을 피하기 위해 스퍼 첫 점은 제외
-        route = (
-            route[: idx_mid + 1]
-            + best_spur[1:]
-            + route[idx_mid + 1 :]
-        )
+        # 직선 기준 스퍼 크기 설정 (조금 여유를 둬서 이후 shrink로 조정할 수 있게)
+        spur_straight = min(remaining + 50.0, 600.0)
 
-    # 마지막으로 target 근처인지 확인
-    final_len = polyline_length_m(route)
-    if abs(final_len - target_m) <= MAX_LENGTH_ERROR_M:
-        return route
+        mid_idx = len(route) // 2
+        mid_point = route[mid_idx]
 
-    return None
+        extended = False
+        # 기존 진행방향과 직각/수직 방향 우선 시도
+        spur_bearings = [90.0, 270.0, 0.0, 180.0]
 
+        for br in spur_bearings:
+            if time.time() - start_time >= global_timeout:
+                break
+
+            spur_target = project_point(mid_point[0], mid_point[1], spur_straight / 2.0, br)
+            spur_out = kakao_walk_route(mid_point, spur_target)
+            spur_back = kakao_walk_route(spur_target, mid_point)
+
+            if spur_out and spur_back and len(spur_out) >= 2 and len(spur_back) >= 2:
+                spur_path = spur_out + spur_back[1:]
+                new_route = route[: mid_idx + 1] + spur_path[1:] + route[mid_idx + 1 :]
+
+                # 연속 중복 좌표 제거
+                cleaned = [new_route[0]]
+                for p in new_route[1:]:
+                    if p != cleaned[-1]:
+                        cleaned.append(p)
+                route = cleaned
+                extended = True
+                break
+
+        if not extended:
+            # 더 이상 스퍼를 붙이기 어렵다면 종료
+            break
+
+    return route
 
 # -----------------------------
 # Area Loop 생성 (Two-Segment Hybrid)
@@ -709,24 +681,72 @@ def generate_area_loop(
     # ---------------------------------------------------
     final_validated_routes: List[Dict[str, Any]] = []
     candidate_routes.sort(key=lambda x: x["valhalla_score"])
-
-    # 우선 상위 N개만 본다 (너무 많으면 시간 초과 위험)
-    for i, candidate in enumerate(candidate_routes[:MAX_BEST_ROUTES_TO_TEST]):
+    
+    for i, candidate in enumerate(candidate_routes[:MAX_BEST_ROUTES_TO_TEST]): 
+        
         if time.time() - start_time >= GLOBAL_TIMEOUT_S:
             break
 
-        current_route = candidate["route"]
-        final_len = polyline_length_m(current_route)
+        # 원본 후보 경로
+        base_route = candidate["route"]
+        route_variant = base_route
+        final_len = polyline_length_m(route_variant)
+        error_m = final_len - target_m
 
-        # 이미 ±99m 이내면 그대로 채택
-        if abs(final_len - target_m) <= MAX_LENGTH_ERROR_M:
+        # 1) 이미 조건 만족: target_m 이상이면서 +99m 이내
+        if 0.0 <= error_m <= MAX_LENGTH_ERROR_M:
             final_validated_routes.append(
-                {
-                    "route": current_route,
-                    "score": _score_loop(current_route, target_m)[0],
-                }
+                {"route": route_variant, "score": _score_loop(route_variant, target_m)[0]}
             )
             continue
+
+        # 2) 너무 긴 경우 → 카카오 단축 시도
+        if error_m > MAX_LENGTH_ERROR_M:
+            shrunken_route, valhalla_calls = _try_shrink_path_kakao(
+                route_variant, target_m, valhalla_calls, start_time, GLOBAL_TIMEOUT_S
+            )
+            if shrunken_route:
+                final_len = polyline_length_m(shrunken_route)
+                error_m = final_len - target_m
+                if 0.0 <= error_m <= MAX_LENGTH_ERROR_M:
+                    final_score = _score_loop(shrunken_route, target_m)[0]
+                    final_validated_routes.append(
+                        {"route": shrunken_route, "score": final_score}
+                    )
+            continue
+
+        # 3) 아직 짧은 경우 (< target_m) → 스퍼로 연장 시도
+        if error_m < 0.0:
+            extended_route = _extend_path_kakao_spur(
+                route_variant, target_m, start_time, GLOBAL_TIMEOUT_S
+            )
+            final_len = polyline_length_m(extended_route)
+            error_m = final_len - target_m
+
+            # 3-1) 연장 후 바로 조건 만족
+            if 0.0 <= error_m <= MAX_LENGTH_ERROR_M:
+                final_score = _score_loop(extended_route, target_m)[0]
+                final_validated_routes.append(
+                    {"route": extended_route, "score": final_score}
+                )
+                continue
+
+            # 3-2) 연장 후 너무 길어졌으면 다시 단축 시도
+            if error_m > MAX_LENGTH_ERROR_M:
+                shrunken_route, valhalla_calls = _try_shrink_path_kakao(
+                    extended_route, target_m, valhalla_calls, start_time, GLOBAL_TIMEOUT_S
+                )
+                if shrunken_route:
+                    final_len = polyline_length_m(shrunken_route)
+                    error_m = final_len - target_m
+                    if 0.0 <= error_m <= MAX_LENGTH_ERROR_M:
+                        final_score = _score_loop(shrunken_route, target_m)[0]
+                        final_validated_routes.append(
+                            {"route": shrunken_route, "score": final_score}
+                        )
+            # 조건을 만족하지 못해도, 이 후보는 버리고 다음 후보로 넘어감
+            continue
+
 
         # (여기서 너무 길 때만 _try_shrink_path_kakao를 다시 붙여도 됨.
         #  일단은 단순 버전으로 두고, 나중에 길이 미세조정이 필요하면 그때 추가하자.)
@@ -735,7 +755,7 @@ def generate_area_loop(
 
     if final_validated_routes:
         final_validated_routes.sort(key=lambda x: x["score"])
-        best_final_route = final_valid_routes[0]["route"]
+        best_final_route = final_validated_routes[0]["route"]
     elif candidate_routes:
         # ±99m 안에 드는 건 없어도, 그 중에서 가장 거리 오차가 적은 루프 선택
         min_error = float("inf")
@@ -753,7 +773,9 @@ def generate_area_loop(
     # ---------------------------------------------------
     if best_final_route:
         final_len = polyline_length_m(best_final_route)
-        is_perfect = abs(final_len - target_m) <= MAX_LENGTH_ERROR_M
+        # 요청 길이보다 짧지 않고, +99m 이내인 경우만 성공으로 간주
+        is_perfect = (final_len >= target_m) and (final_len <= target_m + MAX_LENGTH_ERROR_M)
+
 
         meta = {
             "len": final_len,
@@ -788,3 +810,4 @@ def generate_area_loop(
         "routes_processed": 0,
         "routes_validated": 0,
     }
+
