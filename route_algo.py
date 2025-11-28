@@ -29,10 +29,11 @@ MAX_BEST_ROUTES_TO_TEST = 5
 MAX_ROUTES_TO_PROCESS = 10 
 
 # -----------------------------
-# 거리 / 기하 유틸 (유지)
+# 거리 / 기하 유틸
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """두 위경도 사이의 대략적인 거리(m)."""
     R = 6371000.0
     p1 = math.radians(lat1); p2 = math.radians(lat2)
     dphi = p2 - p1; dl = math.radians(lon2 - lon1)
@@ -92,7 +93,6 @@ def valhalla_route(
     lat1, lon1 = p1; lat2, lon2 = p2
     last_error: Optional[Exception] = None
     
-    # [핵심 보강] 도보 전용 경로 강제를 위한 Costing Options
     costing_options = {
         "pedestrian": {
             "avoid_steps": 1.0, 
@@ -102,10 +102,9 @@ def valhalla_route(
             "track_type_penalty": 50, 
             "private_road_penalty": 10000,
             
-            # [최종 보강] 도보가 아닌 길 회피 가중치 (차도 등)
-            "sidewalk_preference": 1.0, # 보도 선호도 최대화
-            "alley_preference": -1.0, # 골목길 비선호도 최대화
-            "max_road_class": 0.5 # 보행자가 이용할 수 있는 최대 도로 등급 제한 (차도 회피)
+            "sidewalk_preference": 1.0, 
+            "alley_preference": -1.0, 
+            "max_road_class": 0.5 
         }
     }
     
@@ -267,7 +266,7 @@ def _try_shrink_path_kakao(
             if abs(error_m) <= MAX_LENGTH_ERROR_M:
                 return route_to_shrink, valhalla_calls # 목표 달성
             if error_m < 0:
-                break # 이미 목표보다 짧으면 중단
+                break 
 
             if time.time() - start_time >= global_timeout: break
             
@@ -392,7 +391,7 @@ def generate_area_loop(
                 # 겹침 페널티 계산 (핵심)
                 overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
                 
-                # [핵심] 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
+                # 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
                 if overlap_penalty > 300.0: continue
 
                 total_route = seg_out + seg_back[1:] 
