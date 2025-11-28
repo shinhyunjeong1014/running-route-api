@@ -343,6 +343,7 @@ def generate_area_loop(
     R_XLARGE = max(1100.0, min(R_ideal * 1.6, 1800.0))
     
     radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
+    # 8방위 복구
     bearings = [0, 45, 90, 135, 180, 225, 270, 315] 
 
     candidate_routes = []
@@ -360,8 +361,6 @@ def generate_area_loop(
 
             via_a = project_point(lat, lng, R, br)
             seg_dist = max(50.0, SEGMENT_LEN) 
-            # Comeback 지점은 A에서 특정 방위각(120도)으로 투영하여 B를 찾던 기존 방식 대신,
-            # Start에서 먼 지점(A)까지 가는 Two-Segment 방식으로 변경되었으므로, via_b는 제거
             
             # 1) Seg A: 출발 → Via A (Out Segment)
             seg_out = valhalla_route(start, via_a); valhalla_calls += 1
@@ -370,7 +369,7 @@ def generate_area_loop(
             # Comeback Point 설정 (seg_out의 끝점)
             comback_point = seg_out[-1]
             
-            # 2. 2차 경로 생성 후보 확보 (Comeback -> Start)
+            # 2. 2차 경로 생성 후보 확보 (Comeback → Start)
             
             back_segments = []
             
@@ -391,8 +390,8 @@ def generate_area_loop(
                 # 겹침 페널티 계산 (핵심)
                 overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
                 
-                # 겹침이 너무 심하면 해당 경로 폐기 (추가적인 안전장치)
-                if overlap_penalty > 300.0: continue 
+                # [핵심] 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
+                if overlap_penalty > 300.0: continue
 
                 total_route = seg_out + seg_back[1:] 
                 if total_route and total_route[0] != start: total_route.insert(0, start)
@@ -400,19 +399,19 @@ def generate_area_loop(
                 temp_pts = [total_route[0]]; [temp_pts.append(p) for p in total_route[1:] if p != temp_pts[-1]]; total_route = temp_pts
                 
                 score_base, local_meta = _score_loop(total_route, target_m)
-                total_score = score_base + overlap_penalty 
+                total_score = score_base + overlap_penalty # 최종 점수에 겹침 페널티 부과
                 
                 if polyline_length_m(total_route) > 0:
                     candidate_routes.append({
                         "route": total_route, 
-                        "valhalla_score": total_score,
+                        "valhalla_score": total_score, # 페널티가 포함된 점수
                     })
                     total_routes_checked += 1
 
         if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
 
     # -----------------------------
-    # 2. 모든 후보 경로 후처리 (카카오 단축 시도)
+    # 4. 모든 후보 경로 후처리 (카카오 단축 시도)
     # -----------------------------
     
     final_validated_routes = []
@@ -444,12 +443,13 @@ def generate_area_loop(
                 })
 
     # -----------------------------
-    # 3. 최종 베스트 경로 선택 (절대 반환 보장)
+    # 5. 최종 베스트 경로 선택 (절대 반환 보장)
     # -----------------------------
     
     best_final_route = None
     
     if final_validated_routes:
+        # A. ±99m를 만족하는 경로 중 최적 경로 선택
         final_validated_routes.sort(key=lambda x: x["score"])
         best_final_route = final_validated_routes[0]["route"]
         
@@ -469,7 +469,7 @@ def generate_area_loop(
         best_final_route = most_adjacent_route
     
     # -----------------------------
-    # 4. 결과 반환 (성공/최인접 경로 반환 보장)
+    # 6. 결과 반환 (성공/최인접 경로 반환 보장)
     # -----------------------------
     
     if best_final_route:
@@ -491,7 +491,7 @@ def generate_area_loop(
         return best_final_route, meta
 
     # -----------------------------
-    # 5. 최종 실패 (경로 후보가 0개)
+    # 7. 최종 실패 (경로 후보가 0개)
     # -----------------------------
     return [start], {
         "len": 0.0, "err": target_m, "success": False, "used_fallback": False, 
