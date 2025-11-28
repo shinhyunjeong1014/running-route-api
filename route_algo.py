@@ -16,9 +16,8 @@ logger.setLevel(logging.INFO)
 
 VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
-VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) # 재시도 2회로 유지
+VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) 
 
-# [핵심] 카카오 API 설정
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
@@ -30,11 +29,10 @@ MAX_BEST_ROUTES_TO_TEST = 5
 MAX_ROUTES_TO_PROCESS = 10 
 
 # -----------------------------
-# 거리 / 기하 유틸
+# 거리 / 기하 유틸 (유지)
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """두 위경도 사이의 대략적인 거리(m)."""
     R = 6371000.0
     p1 = math.radians(lat1); p2 = math.radians(lat2)
     dphi = p2 - p1; dl = math.radians(lon2 - lon1)
@@ -94,6 +92,7 @@ def valhalla_route(
     lat1, lon1 = p1; lat2, lon2 = p2
     last_error: Optional[Exception] = None
     
+    # [핵심 보강] 도보 전용 경로 강제를 위한 Costing Options
     costing_options = {
         "pedestrian": {
             "avoid_steps": 1.0, 
@@ -102,6 +101,11 @@ def valhalla_route(
             "use_ferry": 0.0,
             "track_type_penalty": 50, 
             "private_road_penalty": 10000,
+            
+            # [최종 보강] 도보가 아닌 길 회피 가중치 (차도 등)
+            "sidewalk_preference": 1.0, # 보도 선호도 최대화
+            "alley_preference": -1.0, # 골목길 비선호도 최대화
+            "max_road_class": 0.5 # 보행자가 이용할 수 있는 최대 도로 등급 제한 (차도 회피)
         }
     }
     
@@ -307,7 +311,7 @@ def _calculate_overlap_penalty(seg_out: List[Tuple[float, float]], seg_back: Lis
     seg_back_len = len(seg_back)
     if seg_back_len > 0 and overlap_count / seg_back_len > 0.1: # 10% 이상 겹치면 페널티
         overlap_ratio = overlap_count / seg_back_len
-        return overlap_ratio * 200.0 # 200m 상당의 페널티 부과
+        return overlap_ratio * 1000.0 # 1000m 상당의 페널티 부과 (최대화)
         
     return 0.0
 
@@ -351,7 +355,6 @@ def generate_area_loop(
 
     # 1. Valhalla 탐색 (전수 조사)
     for R in radii:
-        # 주 루프는 2회 호출을 사용 (Out + Back)
         if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
         if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
@@ -389,7 +392,7 @@ def generate_area_loop(
                 # 겹침 페널티 계산 (핵심)
                 overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
                 
-                # 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
+                # [핵심] 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
                 if overlap_penalty > 300.0: continue
 
                 total_route = seg_out + seg_back[1:] 
@@ -448,7 +451,6 @@ def generate_area_loop(
     best_final_route = None
     
     if final_validated_routes:
-        # A. ±99m를 만족하는 경로 중 최적 경로 선택
         final_validated_routes.sort(key=lambda x: x["score"])
         best_final_route = final_validated_routes[0]["route"]
         
