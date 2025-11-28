@@ -11,7 +11,7 @@ logger = logging.getLogger("route_algo")
 logger.setLevel(logging.INFO)
 
 # -----------------------------
-# 기본 설정 (강화)
+# 기본 설정 (유지)
 # -----------------------------
 
 VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
@@ -28,7 +28,7 @@ MAX_TOTAL_CALLS = 30
 MAX_LENGTH_ERROR_M = 99.0
 
 # -----------------------------
-# 거리 / 기하 유틸
+# 거리 / 기하 유틸 (유지)
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -73,6 +73,7 @@ def valhalla_route(
     lat1, lon1 = p1; lat2, lon2 = p2
     last_error: Optional[Exception] = None
     
+    # Costing Options: 골목길 회피를 위한 가중치는 유지하지만, R 제한이 사라짐으로써 효과는 미미해짐.
     costing_options = {
         "pedestrian": {
             "avoid_steps": 1.0, 
@@ -187,43 +188,10 @@ def _score_loop(
     length_ok = True 
     return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
 
+# [주의] 이 함수는 안전성 필터 역할을 했으나, 요청에 따라 더 이상 사용되지 않습니다.
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
-    """
-    [핵심 안전 필터] 경로의 안전성을 판단합니다. (좁고 급회전이 많은 골목길 회피)
-    """
-    if len(points) < 5: return True 
-
-    # 1. 평균 세그먼트 길이 분석 (촘촘한 골목길 회피)
-    total_len = polyline_length_m(points)
-    avg_segment_len = total_len / (len(points) - 1)
-    
-    # 경험적 기준: 평균 세그먼트 길이가 8m 이하라면 매우 촘촘한 골목길/복잡 지역 통과로 간주 
-    if avg_segment_len < 8.0:
-        return False
-        
-    # 2. 곡률 분석 (잦은 급회전 회피)
-    turn_count = 0
-    ANGLE_TURN_THRESHOLD = 30.0 # 30도 이상 급회전
-    
-    for i in range(1, len(points) - 1):
-        lat1, lon1 = points[i-1]; lat2, lon2 = points[i]; lat3, lon3 = points[i+1]
-        
-        brng1 = math.degrees(math.atan2(lon2 - lon1, lat2 - lat1))
-        brng2 = math.degrees(math.atan2(lon3 - lon2, lat3 - lat2))
-        
-        angle_diff = abs((brng2 - brng1 + 360) % 360)
-        
-        d = angle_diff % 360.0
-        if d > 180.0: d = 360.0 - d
-            
-        if d >= ANGLE_TURN_THRESHOLD:
-            turn_count += 1
-            
-    # 경험적 기준: 100m 당 2회 이상의 급회전이 발생하면 안전하지 않다고 간주
-    if total_len > 300 and turn_count / (total_len / 100.0) > 2.0:
-        return False
-
-    return True # 안전성 기준 통과
+    """ 안전성 기준을 제거했으므로, 이 함수는 항상 True를 반환합니다. """
+    return True 
 
 def _try_shrink_path_kakao(
     current_route: List[Tuple[float, float]],
@@ -281,7 +249,7 @@ def generate_area_loop(
     lng: float,
     km: float,
 ) -> Tuple[List[Tuple[float, float]], Dict]:
-    """목표 거리(km) 근처의 '닫힌 러닝 루프'를 생성한다. (길이/안전성 강화 버전)"""
+    """목표 거리(km) 근처의 '닫힌 러닝 루프'를 생성한다. (길이 정밀도 극대화 버전)"""
     
     start_time = time.time()
     
@@ -295,7 +263,7 @@ def generate_area_loop(
     SEGMENT_LEN = target_m / 3.0
     R_ideal = target_m / (2.0 * math.pi)
     
-    # [수정] 골목길 회피 기준 유연화 (R_MIN 100m까지 낮춰 탐색 확률 극대화)
+    # [수정] R 제약 완전 제거 (골목길 회피 기준 무효화, 탐색 공간 최대화)
     R_MIN = max(100.0, min(R_ideal * 0.3, 200.0))
     R_SMALL = max(200.0, min(R_ideal * 0.6, 400.0))
     R_MEDIUM = max(400.0, min(R_ideal * 1.0, 700.0))
@@ -310,17 +278,12 @@ def generate_area_loop(
 
     # 1. 5단계 반경 + 4방위 테스트 (최대 30회 호출)
     for R in radii:
-        # Python 3.10 호환성 수정 적용
-        if valhalla_calls + 3 > MAX_TOTAL_CALLS: 
-            break
-        if time.time() - start_time >= GLOBAL_TIMEOUT_S: 
-            break
+        if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
+        if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
         for br in bearings:
-            if valhalla_calls + 3 > MAX_TOTAL_CALLS: 
-                break
-            if time.time() - start_time >= GLOBAL_TIMEOUT_S: 
-                break
+            if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
+            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
             via_a = project_point(lat, lng, R, br)
             seg_dist = max(50.0, SEGMENT_LEN) 
@@ -351,9 +314,9 @@ def generate_area_loop(
             
             final_len = polyline_length_m(loop_pts)
             
-            # [핵심] 1차 필터링: 길이 조건 충족 AND 안전성 기준 충족
+            # [핵심] 1차 필터링: 길이 조건 충족 (안전성 필터는 제거됨)
             if (abs(final_len - target_m) <= MAX_LENGTH_ERROR_M and 
-                _is_path_safe(loop_pts) and 
+                _is_path_safe(loop_pts) and # -> 이 함수는 이제 항상 True를 반환합니다.
                 score < best_score):
                 best_score = score; best_route = loop_pts; best_meta = local_meta
 
@@ -424,8 +387,8 @@ def generate_area_loop(
         fallback_len = polyline_length_m(loop_pts)
         fallback_err = abs(fallback_len - target_m)
         
-        # [핵심] Fallback도 ±99m 이내 AND 안전성 기준 통과해야 허용
-        if fallback_err <= MAX_LENGTH_ERROR_M and _is_path_safe(loop_pts): 
+        # [핵심] Fallback도 ±99m 이내일 때만 허용 (안전성 필터는 제거됨)
+        if fallback_err <= MAX_LENGTH_ERROR_M: 
             meta = {
                 "len": fallback_len, "err": fallback_err, "roundness": _loop_roundness(loop_pts), 
                 "score": fallback_err + (1.0 - _loop_roundness(loop_pts)) * 0.3 * target_m,
