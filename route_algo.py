@@ -18,11 +18,15 @@ VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
 
 RUNNING_SPEED_KMH = 8.0  
-# 삼각형 루프 방식 적용: 4방향 x 3호출 = 최대 12회 + Fallback 1회
 MAX_TOTAL_CALLS = 14 
 
+# [핵심] 전체 응답 시간 제한 (5초)
+GLOBAL_TIMEOUT_S = 5.0 
+# [핵심] 절대적 길이 오차 제한
+MAX_LENGTH_ERROR_M = 99.0
+
 # -----------------------------
-# 거리 / 기하 유틸
+# 거리 / 기하 유틸 (유지)
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -84,7 +88,7 @@ def project_point(
 
 
 # -----------------------------
-# Valhalla polyline 디코딩 (1e6 정밀도)
+# Valhalla polyline 디코딩 (유지)
 # -----------------------------
 
 def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
@@ -141,7 +145,7 @@ def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
 
 
 # -----------------------------
-# Valhalla API 호출 (도보 전용)
+# Valhalla API 호출 (유지)
 # -----------------------------
 
 def valhalla_route(
@@ -195,24 +199,13 @@ def valhalla_route(
 
 def _loop_roundness(points: List[Tuple[float, float]]) -> float:
     """루프의 '원형도'를 0~1 사이로 대략 계산."""
-    if len(points) < 4:
-        return 0.0
-
-    xs = [p[1] for p in points]
-    ys = [p[0] for p in points]
-    cx = sum(xs) / len(xs)
-    cy = sum(ys) / len(ys)
-
+    if len(points) < 4: return 0.0
+    xs = [p[1] for p in points]; ys = [p[0] for p in points]
+    cx = sum(xs) / len(xs); cy = sum(ys) / len(ys)
     dists = [haversine_m(cy, cx, lat, lon) for lat, lon in points]
-    if not dists:
-        return 0.0
-
     mean_r = sum(dists) / len(dists)
-    if mean_r <= 0:
-        return 0.0
-
+    if mean_r <= 0: return 0.0
     var = sum((d - mean_r) ** 2 for d in dists) / len(dists)
-    
     score = 1.0 / (1.0 + var / (mean_r * mean_r + 1e-6))
     return max(0.0, min(1.0, score))
 
@@ -221,7 +214,7 @@ def _score_loop(
     points: List[Tuple[float, float]],
     target_m: float,
 ) -> Tuple[float, Dict]:
-    """경로 점수 계산 및 엄격한 길이 검증 (`± 99m` 강화)."""
+    """경로 점수 계산 (길이 검증 로직 제거 -> 항상 True 반환)."""
     length_m = polyline_length_m(points)
     
     if length_m <= 0.0:
@@ -237,8 +230,8 @@ def _score_loop(
 
     score = err + (1.0 - roundness) * 0.3 * target_m
 
-    # [수정] 엄격한 길이 검증 조건 강화: target_m ± 99m 
-    length_ok = (abs(length_m - target_m) <= 99.0)
+    # 엄격한 길이 검증 조건 (±99m)을 제거하고 항상 True로 설정.
+    length_ok = True 
 
     meta = {
         "len": length_m,
@@ -249,6 +242,73 @@ def _score_loop(
     }
 
     return score, meta
+
+
+# -----------------------------
+# [NEW HELPER] 단축 및 재연결 로직
+# -----------------------------
+
+def _try_shrink_path(
+    current_route: List[Tuple[float, float]],
+    target_m: float,
+    valhalla_calls: int,
+    start_time: float,
+    max_calls: int,
+    global_timeout: float,
+) -> Tuple[Optional[List[Tuple[float, float]]], int]:
+    """
+    경로가 목표 오차(MAX_LENGTH_ERROR_M)를 초과할 때, 경로를 단축하여 재연결을 시도합니다.
+    최대 2회의 추가 Valhalla 호출 내에서 수행됩니다.
+    """
+    
+    current_len = polyline_length_m(current_route)
+    error_m = current_len - target_m
+    
+    # 단축이 필요한 길이
+    target_reduction = error_m 
+    
+    # Valhalla 호출 횟수 여유 확인 (최대 2회 시도)
+    if max_calls - valhalla_calls < 2:
+        return None, valhalla_calls 
+
+    # --- 단축 시도 1: 경로 중앙부에서 단축 시도 ---
+    pts = current_route
+    
+    # A와 B 지점 설정: 중앙부에서 40% ~ 60% 지점을 후보로 사용
+    idx_a = max(1, int(len(pts) * 0.40))
+    idx_b = min(len(pts) - 2, int(len(pts) * 0.60))
+    
+    if idx_a < idx_b:
+        p_a = pts[idx_a]
+        p_b = pts[idx_b]
+        
+        # 1. 재연결 경로 요청 (Valhalla 호출 1회)
+        if time.time() - start_time >= global_timeout or valhalla_calls + 1 > max_calls:
+            return None, valhalla_calls
+        
+        reconnect_seg = valhalla_route(p_a, p_b)
+        valhalla_calls += 1
+        
+        if reconnect_seg and len(reconnect_seg) >= 2:
+            seg_len_original = polyline_length_m(pts[idx_a : idx_b + 1])
+            seg_len_new = polyline_length_m(reconnect_seg)
+            reduction = seg_len_original - seg_len_new
+
+            # 단축량이 필요량의 50% 이상이고, 재연결된 경로가 원래 경로보다 짧을 때
+            if reduction > target_reduction * 0.5 and reduction > 0:
+                # 경로 교체: pts[0]...pts[idx_a] + reconnect_seg[1:]... + pts[idx_b+1]...
+                # reconnect_seg[0] == p_a, reconnect_seg[-1] == p_b (거의 일치)
+                new_route = pts[:idx_a] + reconnect_seg + pts[idx_b+1:]
+                
+                # 최종 길이 검증
+                final_len = polyline_length_m(new_route)
+                
+                if abs(final_len - target_m) <= MAX_LENGTH_ERROR_M:
+                    # 완벽하게 성공! (길이 조건 충족)
+                    return new_route, valhalla_calls
+
+    # 단축 실패 시, None 반환
+    return None, valhalla_calls
 
 
 # -----------------------------
@@ -267,18 +327,29 @@ def generate_area_loop(
     target_m = max(300.0, km * 1000.0) 
     km_requested = km
 
+    # [핵심] 5초 제한 체크 (시작 시)
+    if time.time() - start_time >= GLOBAL_TIMEOUT_S:
+         return [start], {
+            "len": 0.0,
+            "err": target_m,
+            "success": False,
+            "used_fallback": False,
+            "valhalla_calls": 0,
+            "time_s": 0.0,
+            "message": "경로 생성 요청이 시작하자마자 시간 제한(5초)을 초과했습니다.",
+        }
+
     # 루프의 각 변 길이 (대략) = target_m / 3
     SEGMENT_LEN = target_m / 3.0
     R_ideal = target_m / (2.0 * math.pi)
     
-    # [수정] 5단계 가변 반경 테스트 및 하한선 조정 (골목길 회피 유도)
+    # 3단계 가변 반경 테스트 (큰길 위주 유도를 위한 R 조정)
     R_MIN = max(450.0, min(R_ideal * 0.7, 500.0))
     R_SMALL = max(500.0, min(R_ideal * 0.9, 700.0))
     R_MEDIUM = max(700.0, min(R_ideal * 1.1, 1000.0))
     R_LARGE = max(900.0, min(R_ideal * 1.3, 1300.0))
     R_XLARGE = max(1100.0, min(R_ideal * 1.5, 1600.0))
     
-    # 5단계 반경을 테스트
     radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
 
     # 후보 방위각 (호출 횟수 관리를 위해 4방위 사용)
@@ -294,18 +365,17 @@ def generate_area_loop(
     # 1. 5단계 반경 + 4방위 테스트 (최대 12회 호출)
     for R in radii:
         if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
+        if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
         for br in bearings:
-            if valhalla_calls + 3 > MAX_TOTAL_CALLS:
-                logger.warning(f"[Loop Gen] Max Valhalla calls limit ({MAX_TOTAL_CALLS}) reached.")
-                break 
+            if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
+            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
             # A: 시작 → Via A (br 방향)
             via_a = project_point(lat, lng, R, br)
             
             # B: Via A에서 Seg_len 만큼 회전 (삼각형 구조를 만들기 위한 다음 Via 지점)
             seg_dist = max(50.0, SEGMENT_LEN) 
-            # 120도는 정삼각형을 위한 각도이며, 시작 방향(br)에 대한 상대 각도
             via_b = project_point(*via_a, seg_dist, (br + 120.0) % 360.0) 
             
             # 1) Seg A: 출발 → Via A
@@ -316,6 +386,7 @@ def generate_area_loop(
 
             # 2) Seg B: Via A → Via B
             if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
+            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
             seg_b = valhalla_route(seg_a[-1], via_b)
             valhalla_calls += 1
             
@@ -323,23 +394,20 @@ def generate_area_loop(
 
             # 3) Seg C: Via B → 출발 (루프 폐쇄)
             if valhalla_calls + 1 > MAX_TOTAL_CALLS: break
+            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
             seg_c = valhalla_route(seg_b[-1], start)
             valhalla_calls += 1
 
             if not seg_c or len(seg_c) < 2: continue
 
             # 완전한 닫힌 루프 polyline 구성 (접점 중복 제거)
-            # A 끝 (via_a), B 시작 (via_a) / B 끝 (via_b), C 시작 (via_b) 중복 제거
             loop_pts = seg_a + seg_b[1:] + seg_c[1:]
 
-            # [핵심 수정] 루프의 끝을 API 입력 좌표(start)로 강제 일치시켜 완벽한 루프 보장
-            # 시작점과 끝점을 API 입력 좌표로 강제 보정
-            if loop_pts and loop_pts[0] != start:
-                loop_pts[0] = start
-            if loop_pts and loop_pts[-1] != start:
-                loop_pts[-1] = start
+            # 루프의 끝을 API 입력 좌표(start)로 강제 일치시켜 완벽한 루프 보장
+            if loop_pts and loop_pts[0] != start: loop_pts[0] = start
+            if loop_pts and loop_pts[-1] != start: loop_pts[-1] = start
 
-            # 연속된 동일 좌표 제거 (안전 장치)
+            # 연속된 동일 좌표 제거
             temp_pts = [loop_pts[0]]
             for p in loop_pts[1:]:
                 if p != temp_pts[-1]:
@@ -348,7 +416,9 @@ def generate_area_loop(
             
             score, local_meta = _score_loop(loop_pts, target_m)
             
-            if score < best_score and local_meta["length_ok"]: 
+            # [핵심] 성공 경로 최종 길이 검증: ±99m
+            final_len = polyline_length_m(loop_pts)
+            if abs(final_len - target_m) <= MAX_LENGTH_ERROR_M and score < best_score:
                 best_score = score
                 best_route = loop_pts
                 best_meta = local_meta
@@ -359,6 +429,32 @@ def generate_area_loop(
     # 2. 결과 정리 (성공 케이스)
     # -----------------------------
     if best_route:
+        # [핵심] 길이가 99m 초과 시 단축 로직 시도
+        final_len = polyline_length_m(best_route)
+        if abs(final_len - target_m) > MAX_LENGTH_ERROR_M:
+            
+            # 단축 로직 실행 (최대 2회 Valhalla 호출 가능)
+            shrunken_route, valhalla_calls = _try_shrink_path(
+                best_route, target_m, valhalla_calls, start_time, MAX_TOTAL_CALLS, GLOBAL_TIMEOUT_S
+            )
+
+            if shrunken_route:
+                best_route = shrunken_route
+                final_len = polyline_length_m(best_route) # 최종 단축 길이
+                
+                best_meta.update({
+                    "len": final_len,
+                    "err": abs(final_len - target_m),
+                    "success": True,
+                    "used_fallback": False,
+                    "valhalla_calls": valhalla_calls,
+                    "time_s": round(time.time() - start_time, 2),
+                    "message": "경로가 길어 단축 후 반환합니다.",
+                    "length_ok": True,
+                })
+                return best_route, best_meta
+        
+        # 길이 조건 (±99m) 충족 또는 단축 후 성공
         best_meta.update(
             {
                 "success": True,
@@ -368,6 +464,7 @@ def generate_area_loop(
                 "valhalla_calls": valhalla_calls,
                 "time_s": round(time.time() - start_time, 2),
                 "message": "안정적인 닫힌 루프를 찾았습니다.",
+                "length_ok": True, # ±99m 검증 통과!
             }
         )
         return best_route, best_meta
@@ -376,6 +473,18 @@ def generate_area_loop(
     # 3. 완전 실패 시: 단순 왕복 시도 (Fallback 보강)
     # -----------------------------
     
+    # [핵심] 시간 초과 검사
+    if time.time() - start_time >= GLOBAL_TIMEOUT_S:
+         return [start], {
+            "len": 0.0,
+            "err": target_m,
+            "success": False,
+            "used_fallback": False,
+            "valhalla_calls": valhalla_calls,
+            "time_s": round(time.time() - start_time, 2),
+            "message": "경로 생성 요청이 시간 제한(5초)을 초과했습니다.",
+        }
+
     R_fallback = R_MEDIUM * 0.6 
     simple_via = project_point(lat, lng, R_fallback, 0.0)
     
@@ -385,23 +494,19 @@ def generate_area_loop(
     if out_seg and len(out_seg) >= 2:
         back_seg = list(reversed(out_seg))
         
-        # [Fallback 특화] 경로 중첩 구간 제거 로직 적용
+        # Fallback 경로 중첩 구간 제거 로직 적용
         overlap_index = -1
         max_overlap_check = min(len(out_seg), len(back_seg), 10) 
         
         for k in range(1, max_overlap_check + 1):
             if out_seg[-k] == back_seg[k-1]:
                 overlap_index = k
-            else:
-                break
+            else: break
         
         if overlap_index > 0:
-            # 겹치는 부분이 있다면, back_seg의 겹치는 지점까지 자른다.
             loop_pts = out_seg[:-overlap_index] + back_seg[overlap_index-1:] 
         else:
-            # 안전장치로 기존 로직 적용 (via 지점만 중복 제거)
             loop_pts = out_seg + back_seg[1:]
-
 
         # 연속된 동일 좌표 제거
         temp_pts = [loop_pts[0]]
@@ -410,32 +515,30 @@ def generate_area_loop(
                 temp_pts.append(p)
         loop_pts = temp_pts
         
-        # [핵심 수정] Fallback 루프의 시작과 끝을 API 입력 좌표(start)로 강제 일치
-        if loop_pts and loop_pts[0] != start:
-            loop_pts[0] = start
-        if loop_pts and loop_pts[-1] != start:
-            loop_pts[-1] = start
+        # Fallback 루프의 시작과 끝을 API 입력 좌표(start)로 강제 일치
+        if loop_pts and loop_pts[0] != start: loop_pts[0] = start
+        if loop_pts and loop_pts[-1] != start: loop_pts[-1] = start
             
-        # Fallback 전용 길이 검증: ±500m
+        # Fallback 전용 길이 검증: ±99m 강제
         fallback_len = polyline_length_m(loop_pts)
         fallback_err = abs(fallback_len - target_m)
         
-        if fallback_err <= 500.0: # ±500m 이내일 때 Fallback 허용
-            
+        # [핵심] Fallback도 ±99m 이내일 때만 허용
+        if fallback_err <= MAX_LENGTH_ERROR_M: 
             # Fallback meta 정보를 수동으로 업데이트
             meta = {
                 "len": fallback_len,
                 "err": fallback_err,
                 "roundness": _loop_roundness(loop_pts),
                 "score": fallback_err + (1.0 - _loop_roundness(loop_pts)) * 0.3 * target_m,
-                "length_ok": True, # Fallback 기준 통과!
+                "length_ok": True, # ±99m 검증 통과!
                 "success": False, 
                 "used_fallback": True,
                 "km_requested": km_requested,
                 "target_m": target_m,
                 "valhalla_calls": valhalla_calls,
                 "time_s": round(time.time() - start_time, 2),
-                "message": f"최적 루프를 찾지 못해 길이({fallback_len:.1f}m) 검증 통과한 단순 왕복 경로를 사용했습니다.",
+                "message": f"최적 루프를 찾지 못했으나, 길이({fallback_len:.1f}m)가 요청 오차(±{MAX_LENGTH_ERROR_M}m)를 만족하여 반환합니다.",
             }
             return loop_pts, meta
 
@@ -449,5 +552,5 @@ def generate_area_loop(
         "target_m": target_m,
         "valhalla_calls": valhalla_calls,
         "time_s": round(time.time() - start_time, 2),
-        "message": "경로 생성 엔진이 응답하지 않거나 부적합한 경로만 생성했습니다.",
+        "message": f"요청 오차(±{MAX_LENGTH_ERROR_M}m)를 만족하는 경로를 찾을 수 없습니다. 거리를 조정해 주세요.",
     }
