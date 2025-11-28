@@ -93,18 +93,21 @@ def valhalla_route(
     lat1, lon1 = p1; lat2, lon2 = p2
     last_error: Optional[Exception] = None
     
+    # [핵심] 도보 전용 경로 강제를 위한 Costing Options
     costing_options = {
         "pedestrian": {
             "avoid_steps": 1.0, 
             "service_penalty": 1000, 
             "use_hills": 0.0,
             "use_ferry": 0.0,
-            "track_type_penalty": 50, 
+            "track_type_penalty": 0, # 좁은 길 패널티 제거 (탐색 유연화)
             "private_road_penalty": 10000,
             
+            # [최종 보강] 넓은 길 활용: 자전거 네트워크 활용 및 차도 회피 강화
+            "bicycle_network_preference": 0.5, # 자전거 네트워크 선호도 (넓은 길 확보)
             "sidewalk_preference": 1.0, 
             "alley_preference": -1.0, 
-            "max_road_class": 0.5 
+            "max_road_class": 0.5 # 보행자가 이용할 수 있는 최대 도로 등급 제한
         }
     }
     
@@ -228,37 +231,7 @@ def _score_loop(
     return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
 
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
-    """ [핵심 복구] 경로의 안전성을 판단합니다. (좁고 급회전이 많은 골목길을 회피)"""
-    if len(points) < 5: return True 
-
-    total_len = polyline_length_m(points)
-    if total_len == 0: return False
-
-    avg_segment_len = total_len / (len(points) - 1)
-    
-    # 좁은 길(골목길) 회피
-    if avg_segment_len < 8.0:
-        return False
-        
-    # 곡률 분석 (잦은 급회전 회피)
-    turn_count = 0
-    ANGLE_TURN_THRESHOLD = 30.0 
-    
-    for i in range(1, len(points) - 1):
-        lat1, lon1 = points[i-1]; lat2, lon2 = points[i]; lat3, lon3 = points[i+1]
-        
-        brng1 = math.degrees(math.atan2(lon2 - lon1, lat2 - lat1))
-        brng2 = math.degrees(math.atan2(lon3 - lon2, lat3 - lat2))
-        
-        angle_diff = abs((brng2 - brng1 + 360) % 360)
-        d = angle_diff % 360.0
-        if d > 180.0: d = 360.0 - d
-            
-        if d >= ANGLE_TURN_THRESHOLD: turn_count += 1
-            
-    if total_len > 300 and turn_count / (total_len / 100.0) > 2.0:
-        return False
-
+    """ 안전성 기준을 제거했으므로, 이 함수는 항상 True를 반환합니다. """
     return True 
 
 def _try_shrink_path_kakao(
