@@ -18,7 +18,6 @@ VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
 
-# [핵심] 카카오 API 설정
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
@@ -26,7 +25,7 @@ RUNNING_SPEED_KMH = 8.0
 GLOBAL_TIMEOUT_S = 10.0 
 MAX_TOTAL_CALLS = 30 
 MAX_LENGTH_ERROR_M = 99.0
-MAX_BEST_ROUTES_TO_TEST = 5 # 카카오 단축 시도 횟수 제한
+MAX_BEST_ROUTES_TO_TEST = 5 
 
 # -----------------------------
 # 거리 / 기하 유틸
@@ -80,7 +79,7 @@ def valhalla_route(
             "service_penalty": 1000, 
             "use_hills": 0.0,
             "use_ferry": 0.0,
-            "track_type_penalty": 50, # 좁은 길 패널티 완화
+            "track_type_penalty": 50, # 좁은 길 패널티 완화 (길이 맞추기 유도)
             "private_road_penalty": 10000,
         }
     }
@@ -105,7 +104,7 @@ def valhalla_route(
     return []
 
 def kakao_walk_route(p1: Tuple[float, float], p2: Tuple[float, float]) -> Optional[List[Tuple[float, float]]]:
-    """[수정] 카카오 길찾기 API 호출 및 JSON 구조를 맞춰 폴리라인 반환"""
+    """카카오 길찾기 API (도보)를 호출하여 경로 폴리라인을 반환"""
     if not KAKAO_API_KEY:
         logger.error("[Kakao API] KAKAO_API_KEY not configured.")
         return None
@@ -122,15 +121,12 @@ def kakao_walk_route(p1: Tuple[float, float], p2: Tuple[float, float]) -> Option
 
         if data.get("routes") and data["routes"][0]["result_code"] == 0:
             coords = []
-            
-            # [핵심 수정] 카카오모빌리티 REST API의 실제 경로 구조 파싱 (roads -> vertexes)
             for route in data["routes"]:
                 for section in route["sections"]:
                     for road in section.get("roads", []):
                         # vertexes는 [lon, lat, lon, lat, ...] 형식의 플랫 리스트
                         vertices = road.get("vertexes", [])
                         
-                        # 2개씩 묶어서 (lon, lat)을 추출하고 (lat, lon)으로 변환
                         for i in range(0, len(vertices), 2): 
                             if i + 1 < len(vertices):
                                 lon = vertices[i]
@@ -207,7 +203,7 @@ def _score_loop(
     return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
 
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
-    """ 안전성 기준을 제거했으므로, 이 함수는 항상 True를 반환합니다. """
+    """ 안전성 유연화가 적용되었으므로, 이 함수는 항상 True를 반환합니다. """
     return True 
 
 def _try_shrink_path_kakao(
@@ -282,7 +278,8 @@ def generate_area_loop(
     R_XLARGE = max(1100.0, min(R_ideal * 1.6, 1800.0))
     
     radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
-    bearings = [0, 90, 180, 270] 
+    # [수정] 8방위 탐색 적용
+    bearings = [0, 45, 90, 135, 180, 225, 270, 315] 
 
     candidate_routes = []
     valhalla_calls = 0
