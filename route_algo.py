@@ -28,7 +28,7 @@ MAX_TOTAL_CALLS = 30
 MAX_LENGTH_ERROR_M = 99.0
 
 # -----------------------------
-# 거리 / 기하 유틸 (유지)
+# 거리 / 기하 유틸
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -189,26 +189,25 @@ def _score_loop(
 
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
     """
-    경로의 안전성을 판단합니다. (좁고 급회전이 많은 골목길 회피)
+    [핵심 안전 필터] 경로의 안전성을 판단합니다. (좁고 급회전이 많은 골목길 회피)
     """
     if len(points) < 5: return True 
 
-    # 1. 평균 세그먼트 길이 분석 (좁은 길은 세그먼트가 짧고 촘촘함)
+    # 1. 평균 세그먼트 길이 분석 (촘촘한 골목길 회피)
     total_len = polyline_length_m(points)
     avg_segment_len = total_len / (len(points) - 1)
     
-    # 경험적 기준: 평균 세그먼트 길이가 8m 이하라면 매우 촘촘한 골목길/복잡 지역 통과로 간주 (8m로 하한선 낮춤)
+    # 경험적 기준: 평균 세그먼트 길이가 8m 이하라면 매우 촘촘한 골목길/복잡 지역 통과로 간주 
     if avg_segment_len < 8.0:
         return False
         
-    # 2. 곡률 분석 (급격한 회피 또는 U턴이 잦은지 확인)
+    # 2. 곡률 분석 (잦은 급회전 회피)
     turn_count = 0
     ANGLE_TURN_THRESHOLD = 30.0 # 30도 이상 급회전
     
     for i in range(1, len(points) - 1):
         lat1, lon1 = points[i-1]; lat2, lon2 = points[i]; lat3, lon3 = points[i+1]
         
-        # 방위각 계산 (atan2는 lon, lat 순서)
         brng1 = math.degrees(math.atan2(lon2 - lon1, lat2 - lat1))
         brng2 = math.degrees(math.atan2(lon3 - lon2, lat3 - lat2))
         
@@ -296,12 +295,12 @@ def generate_area_loop(
     SEGMENT_LEN = target_m / 3.0
     R_ideal = target_m / (2.0 * math.pi)
     
-    # [수정] 골목길 회피 기준 유연화 (R_MIN 250m 이상으로 낮춤)
-    R_MIN = max(200.0, min(R_ideal * 0.5, 300.0))
-    R_SMALL = max(350.0, min(R_ideal * 0.8, 600.0))
-    R_MEDIUM = max(600.0, min(R_ideal, 900.0))
-    R_LARGE = max(900.0, min(R_ideal * 1.2, 1300.0))
-    R_XLARGE = max(1200.0, min(R_ideal * 1.5, 1800.0))
+    # [수정] 골목길 회피 기준 유연화 (R_MIN 100m까지 낮춰 탐색 확률 극대화)
+    R_MIN = max(100.0, min(R_ideal * 0.3, 200.0))
+    R_SMALL = max(200.0, min(R_ideal * 0.6, 400.0))
+    R_MEDIUM = max(400.0, min(R_ideal * 1.0, 700.0))
+    R_LARGE = max(700.0, min(R_ideal * 1.3, 1100.0))
+    R_XLARGE = max(1100.0, min(R_ideal * 1.6, 1800.0))
     
     radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
     bearings = [0, 90, 180, 270] 
@@ -311,12 +310,17 @@ def generate_area_loop(
 
     # 1. 5단계 반경 + 4방위 테스트 (최대 30회 호출)
     for R in radii:
-        if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
-        if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
+        # Python 3.10 호환성 수정 적용
+        if valhalla_calls + 3 > MAX_TOTAL_CALLS: 
+            break
+        if time.time() - start_time >= GLOBAL_TIMEOUT_S: 
+            break
 
         for br in bearings:
-            if valhalla_calls + 3 > MAX_TOTAL_CALLS: break
-            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
+            if valhalla_calls + 3 > MAX_TOTAL_CALLS: 
+                break
+            if time.time() - start_time >= GLOBAL_TIMEOUT_S: 
+                break
 
             via_a = project_point(lat, lng, R, br)
             seg_dist = max(50.0, SEGMENT_LEN) 
@@ -433,4 +437,3 @@ def generate_area_loop(
 
     # 최종 실패
     return [start], {"len": 0.0, "err": target_m, "success": False, "used_fallback": False, "km_requested": km_requested, "target_m": target_m, "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2), "message": f"요청 오차(±{MAX_LENGTH_ERROR_M}m)를 만족하는 경로를 찾을 수 없습니다. 거리를 조정해 주세요."}
-
