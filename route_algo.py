@@ -18,6 +18,7 @@ VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "1"))
 
+# [핵심] 카카오 API 설정
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
@@ -65,9 +66,34 @@ def project_point(lat: float, lon: float, distance_m: float, bearing_deg_: float
 # Valhalla/Kakao API 호출
 # -----------------------------
 
+def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: float = 0.0001) -> Optional[List[Tuple[float, float]]]:
+    """
+    경로 폴리라인 주변에 완충 영역(Buffer)을 둔 사각형 Polygon (Lat, Lon 순서)을 생성합니다.
+    """
+    if not points:
+        return None
+        
+    min_lat = min(p[0] for p in points)
+    max_lat = max(p[0] for p in points)
+    min_lon = min(p[1] for p in points)
+    max_lon = max(p[1] for p in points)
+    
+    # 완충 구역 (약 10m 정도의 위경도 차이)
+    buf = buffer_deg 
+
+    return [
+        (min_lat - buf, min_lon - buf),
+        (max_lat + buf, min_lon - buf),
+        (max_lat + buf, max_lon + buf),
+        (min_lat - buf, max_lon + buf),
+        (min_lat - buf, min_lon - buf), # Polygon 닫기
+    ]
+
+
 def valhalla_route(
     p1: Tuple[float, float],
     p2: Tuple[float, float],
+    avoid_polygons: Optional[List[List[Tuple[float, float]]]] = None, # 새로운 선택적 인자
     is_shrink_attempt: bool = False
 ) -> List[Tuple[float, float]]:
     lat1, lon1 = p1; lat2, lon2 = p2
@@ -91,6 +117,15 @@ def valhalla_route(
                 "costing": "pedestrian",
                 "costing_options": costing_options
             }
+            # [핵심] avoid_polygons 인수가 있으면 payload에 추가
+            if avoid_polygons:
+                valhalla_polys = []
+                for poly in avoid_polygons:
+                    # Valhalla는 Polygon 좌표를 [lng, lat] 순서로 받음
+                    valhalla_polys.append([[lon, lat] for lat, lon in poly])
+                
+                payload["avoid_polygons"] = valhalla_polys
+
             resp = requests.post(VALHALLA_URL, json=payload, timeout=VALHALLA_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
@@ -124,7 +159,6 @@ def kakao_walk_route(p1: Tuple[float, float], p2: Tuple[float, float]) -> Option
             for route in data["routes"]:
                 for section in route["sections"]:
                     for road in section.get("roads", []):
-                        # vertexes는 [lon, lat, lon, lat, ...] 형식의 플랫 리스트
                         vertices = road.get("vertexes", [])
                         
                         for i in range(0, len(vertices), 2): 
@@ -134,14 +168,9 @@ def kakao_walk_route(p1: Tuple[float, float], p2: Tuple[float, float]) -> Option
                                 coords.append((lat, lon))
             
             if coords and len(coords) >= 2:
-                # [안전 보강] 시작점과 끝점이 정확히 포함되도록 보장
                 if coords[0] != p1: coords.insert(0, p1)
                 if coords[-1] != p2: coords.append(p2)
                 return coords
-        
-        elif data.get("routes") and data["routes"][0]["result_code"] != 0:
-            logger.warning("[Kakao API] Route not found: %s", data["routes"][0]["result_msg"])
-            return None
         
     except Exception as e:
         logger.error("[Kakao API] Request failed (Parsing or Network): %s", e)
@@ -177,7 +206,7 @@ def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
 
 
 # -----------------------------
-# 루프 품질 평가 / 안전성 필터 / 단축 재연결 로직
+# 루프 품질 평가 / 단축 재연결 로직
 # -----------------------------
 
 def _loop_roundness(points: List[Tuple[float, float]]) -> float:
@@ -203,7 +232,7 @@ def _score_loop(
     return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
 
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
-    """ 안전성 유연화가 적용되었으므로, 이 함수는 항상 True를 반환합니다. """
+    """ 안전성 기준을 제거했으므로, 이 함수는 항상 True를 반환합니다. """
     return True 
 
 def _try_shrink_path_kakao(
@@ -278,7 +307,6 @@ def generate_area_loop(
     R_XLARGE = max(1100.0, min(R_ideal * 1.6, 1800.0))
     
     radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
-    # [수정] 8방위 탐색 적용
     bearings = [0, 45, 90, 135, 180, 225, 270, 315] 
 
     candidate_routes = []
@@ -301,17 +329,26 @@ def generate_area_loop(
             # 1) Seg A: 출발 → Via A
             seg_a = valhalla_route(start, via_a); valhalla_calls += 1
             if not seg_a or len(seg_a) < 2: continue
+            
+            # [핵심] Seg A를 기반으로 회피 다각형 생성 (Bbox 사용)
+            avoid_area = _get_bounding_box_polygon(seg_a)
+            avoid_polys = [avoid_area] if avoid_area else None
 
-            # 2) Seg B: Via A → Via B
+            # 2) Seg B: Via A → Via B (Seg A 회피)
             if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
             if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
-            seg_b = valhalla_route(seg_a[-1], via_b); valhalla_calls += 1
+            seg_b = valhalla_route(seg_a[-1], via_b, avoid_polygons=avoid_polys); valhalla_calls += 1
             if not seg_b or len(seg_b) < 2: continue
 
-            # 3) Seg C: Via B → 출발
+            # [보강] Seg A + Seg B의 누적 Bounding Box 업데이트
+            if avoid_polys:
+                 all_points = seg_a + seg_b
+                 avoid_polys = [_get_bounding_box_polygon(all_points)]
+            
+            # 3) Seg C: Via B → 출발 (Seg A+B 회피)
             if valhalla_calls + 1 > MAX_TOTAL_CALLS: break
             if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
-            seg_c = valhalla_route(seg_b[-1], start); valhalla_calls += 1
+            seg_c = valhalla_route(seg_b[-1], start, avoid_polygons=avoid_polys); valhalla_calls += 1
             if not seg_c or len(seg_c) < 2: continue
 
             # 경로 생성 및 보정
