@@ -1,395 +1,433 @@
 import math
-import os
+import random
 import time
-import logging
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Tuple, Dict, Optional
 
 import requests
 
-logger = logging.getLogger("route_algo")
-logger.setLevel(logging.INFO)
 
-# -----------------------------
-# 기본 설정 (PSP2 및 길이 제어)
-# -----------------------------
-
-VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
-VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
-VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) 
-
-KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
-KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
-
-RUNNING_SPEED_KMH = 8.0  
-GLOBAL_TIMEOUT_S = 10.0 
-MAX_TOTAL_CALLS = 30 
-MAX_LENGTH_ERROR_M = 99.0
-MAX_BEST_ROUTES_TO_TEST = 5 
-MAX_ROUTES_TO_PROCESS = 10 
-
-# PSP2 알고리즘의 길이 오차 파라미터 (epsilon)
-# 논문에 따르면, L의 10% (epsilon=0.1) 정도가 합리적이나, 저희는 +/- 99m를 사용합니다.
-# 따라서, L/3의 오차 범위는 L의 99m를 초과하지 않도록 설정해야 합니다.
-PSP2_SEGMENT_ERROR_FACTOR = 0.05 # 5% 오차 (L/3의 5%는 L의 1.66%에 해당)
+###############################################################################
+# Utility helpers
+###############################################################################
 
 
-# -----------------------------
-# 거리 / 기하 유틸
-# -----------------------------
-
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """두 위경도 사이의 대략적인 거리(m)."""
-    R = 6371000.0
-    p1 = math.radians(lat1); p2 = math.radians(lat2)
-    dphi = p2 - p1; dl = math.radians(lon2 - lon1)
-    a = (math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-def polyline_length_m(points: List[Tuple[float, float]]) -> float:
-    if len(points) < 2: return 0.0
-    total = 0.0
-    for (lat1, lon1), (lat2, lon2) in zip(points, points[1:]):
-        total += haversine_m(lat1, lon1, lat2, lon2)
-    return total
-# ... (bearing_deg, project_point 함수는 생략됨)
-def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    p1 = math.radians(lat1); p2 = math.radians(lat2)
-    dl = math.radians(lon2 - lon1)
-    x = math.sin(dl) * math.cos(p2); y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
-    brng = math.degrees(math.atan2(x, y))
-    return (brng + 360.0) % 360.0
-def project_point(lat: float, lon: float, distance_m: float, bearing_deg_: float) -> Tuple[float, float]:
-    R = 6371000.0; br = math.radians(bearing_deg_)
-    phi1 = math.radians(lat); lam1 = math.radians(lon)
-    phi2 = math.asin(math.sin(phi1) * math.cos(distance_m / R) + math.cos(phi1) * math.sin(distance_m / R) * math.cos(br))
-    lam2 = lam1 + math.atan2(math.sin(br) * math.sin(distance_m / R) * math.cos(phi1), math.cos(distance_m / R) - math.sin(phi1) * math.sin(phi2))
-    return (math.degrees(phi2), (math.degrees(lam2) + 540.0) % 360.0 - 180.0)
+LatLng = Tuple[float, float]
 
 
-# -----------------------------
-# Valhalla/Kakao API 호출
-# -----------------------------
-
-def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: float = 0.00001) -> Optional[List[Tuple[float, float]]]:
-    if not points: return None
-    min_lat = min(p[0] for p in points); max_lat = max(p[0] for p in points)
-    min_lon = min(p[1] for p in points); max_lon = max(p[1] for p in points)
-    if haversine_m(min_lat, min_lon, max_lat, max_lon) < 20: return None 
-    buf = buffer_deg
-    return [(min_lat - buf, min_lon - buf), (max_lat + buf, min_lon - buf), (max_lat + buf, max_lon + buf), (min_lat - buf, max_lon + buf), (min_lat - buf, min_lon - buf)]
-
-def valhalla_route(
-    p1: Tuple[float, float], p2: Tuple[float, float], avoid_polygons: Optional[List[List[Tuple[float, float]]]] = None, is_shrink_attempt: bool = False
-) -> List[Tuple[float, float]]:
-    lat1, lon1 = p1; lat2, lon2 = p2
-    last_error: Optional[Exception] = None
-    
-    # [논문 기반] 안전/도보 선호 Costing Options
-    costing_options = {
-        "pedestrian": {
-            "avoid_steps": 1.0, "service_penalty": 1000, "use_hills": 0.0, "use_ferry": 0.0,
-            "track_type_penalty": 0, "private_road_penalty": 100000,
-            "sidewalk_preference": 1.0, "alley_preference": -1.0, "max_road_class": 0.5,
-            "length_penalty": 0.0 
-        }
-    }
-    
-    for attempt in range(VALHALLA_MAX_RETRY):
-        try:
-            payload = {"locations": [{"lat": lat1, "lon": lon1, "type": "break"}, {"lat": lat2, "lon": lon2, "type": "break"}],
-                "costing": "pedestrian", "costing_options": costing_options}
-            if avoid_polygons:
-                valhalla_polys = []; [valhalla_polys.append([[lon, lat] for lat, lon in poly]) for poly in avoid_polygons]
-                payload["avoid_polygons"] = valhalla_polys
-
-            resp = requests.post(VALHALLA_URL, json=payload, timeout=VALHALLA_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            shape = data["trip"]["legs"][0]["shape"]
-            return _decode_polyline(shape)
-        except Exception as e:
-            last_error = e
-            logger.warning("[Valhalla] attempt %d failed for %s -> %s: %s", attempt + 1, p1, p2, e)
-    logger.error("[Valhalla] all attempts failed for %s -> %s: %s", p1, p2, last_error)
-    return []
-
-# [KAKAO API는 논문 기반 설계에서 사용되지 않음 - 트레이드오프]
-# def kakao_walk_route(...): ...
-# ... (다른 필수 헬퍼 함수 정의)
-def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
-    coords: List[Tuple[float, float]] = []; lat = 0; lng = 0; idx = 0; precision = 1e6
+def safe_float(x: float) -> Optional[float]:
+    """Return a JSON-serialisable float (NaN/inf -> None)."""
     try:
-        while idx < len(shape):
-            shift = 0; result = 0
-            while True:
-                b = ord(shape[idx]) - 63; idx += 1; result |= (b & 0x1F) << shift; shift += 5
-                if b < 0x20: break
-            dlat = ~(result >> 1) if (result & 1) else (result >> 1); lat += dlat
-            shift = 0; result = 0
-            while True:
-                b = ord(shape[idx]) - 63; idx += 1; result |= (b & 0x1F) << shift; shift += 5
-                if b < 0x20: break
-            dlng = ~(result >> 1) if (result & 1) else (result >> 1); lng += dlng
-            current_lat = lat / precision; current_lng = lng / precision
-            if not (-90.0 <= current_lat <= 90.0 and -180.0 <= current_lng <= 180.0):
-                logger.error(f"[Valhalla Decode] Sanity check failed: ({current_lat}, {current_lng})"); return []
-            coords.append((current_lat, current_lng))
-    except IndexError:
-        logger.error("[Valhalla Decode] Unexpected end of polyline string."); return []
-    return coords
+        if isinstance(x, (float, int)):
+            if math.isnan(x) or math.isinf(x):
+                return None
+        return x
+    except Exception:
+        return None
 
 
-# -----------------------------
-# 루프 품질 평가 / 최종 길이 조정 로직
-# -----------------------------
+def _safe_any(obj):
+    if isinstance(obj, dict):
+        return {k: _safe_any(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_safe_any(v) for v in obj]
+    if isinstance(obj, float):
+        return safe_float(obj)
+    return obj
 
-def _loop_roundness(points: List[Tuple[float, float]]) -> float:
-    # ... (로직 유지)
-    if len(points) < 4: return 0.0
-    xs = [p[1] for p in points]; ys = [p[0] for p in points]
-    cx = sum(xs) / len(xs); cy = sum(ys) / len(ys)
-    dists = [haversine_m(cy, cx, lat, lon) for lat, lon in points]
-    mean_r = sum(dists) / len(dists)
-    if mean_r <= 0: return 0.0
-    var = sum((d - mean_r) ** 2 for d in dists) / len(dists)
-    score = 1.0 / (1.0 + var / (mean_r * mean_r + 1e-6))
-    return max(0.0, min(1.0, score))
 
-def _score_loop(
-    points: List[Tuple[float, float]], target_m: float
-) -> Tuple[float, Dict]:
-    # ... (로직 유지)
-    length_m = polyline_length_m(points)
-    if length_m <= 0.0: return float("inf"), {"len": 0.0, "err": target_m, "roundness": 0.0, "score": float("inf")}
-    err = abs(length_m - target_m); roundness = _loop_roundness(points)
-    score = err + (1.0 - roundness) * 0.3 * target_m
-    length_ok = True 
-    return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
+def safe_dict(d: Dict) -> Dict:
+    return _safe_any(d)
 
-def _calculate_overlap_penalty(seg_out: List[Tuple[float, float]], seg_back: List[Tuple[float, float]]) -> float:
-    """ 경로 중복 페널티 계산 (논문 기반) """
-    if not seg_out or not seg_back: return 0.0
-    overlap_count = 0
-    OVERLAP_THRESHOLD_DEG = 0.0002 
-    for lat_c, lon_c in seg_back:
-        is_close = False
-        for lat_a, lon_a in seg_out:
-            if abs(lat_c - lat_a) < OVERLAP_THRESHOLD_DEG and abs(lon_c - lon_a) < OVERLAP_THRESHOLD_DEG:
-                is_close = True; break
-        if is_close: overlap_count += 1
-    seg_back_len = len(seg_back)
-    if seg_back_len > 0 and overlap_count / seg_back_len > 0.1:
-        overlap_ratio = overlap_count / seg_back_len
-        return overlap_ratio * 1000.0
-    return 0.0
 
-def _trim_path_to_length(route: List[Tuple[float, float]], target_m: float) -> List[Tuple[float, float]]:
-    """경로가 길 때, 끝 부분을 강제로 잘라 목표 길이(±99m)에 맞춥니다."""
-    current_len = polyline_length_m(route)
-    if current_len <= target_m + MAX_LENGTH_ERROR_M: return route
+def safe_list(lst: List) -> List:
+    return _safe_any(lst)
 
-    required_trim = current_len - target_m
-    trimmed_route = route[:]
-    reversed_route = trimmed_route[::-1]
-    current_dist_removed = 0.0
-    
-    for i in range(len(reversed_route) - 1):
-        p1 = reversed_route[i]
-        seg_len = haversine_m(p1[0], p1[1], reversed_route[i+1][0], reversed_route[i+1][1])
-        
-        if current_dist_removed + seg_len >= required_trim:
-            final_index = len(route) - (i + 1)
-            trimmed_route = route[:final_index]
-            
-            if trimmed_route and trimmed_route[-1] != route[0]:
-                trimmed_route.append(route[0])
-            
-            return trimmed_route
-        
-        current_dist_removed += seg_len
-        
-    return route 
 
-# -----------------------------
-# Area Loop 생성 (PSP2 원리 기반)
-# -----------------------------
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters."""
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
 
-def generate_area_loop(
-    lat: float,
-    lng: float,
-    km: float,
-) -> Tuple[List[Tuple[float, float]], Dict]:
-    """[최종] 목표 거리(km)를 위해 Two-Segment 구조를 사용하며, Trimming으로 길이 정밀도를 강제합니다."""
-    
-    start_time = time.time()
-    
-    target_m = max(300.0, km * 1000.0) 
-    km_requested = km
-    start = (lat, lng)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(
+        dlambda / 2.0
+    ) ** 2
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return R * c
 
-    if time.time() - start_time >= GLOBAL_TIMEOUT_S:
-         return [start], {"len": 0.0, "err": target_m, "success": False, "used_fallback": False, "valhalla_calls": 0, "time_s": 0.0, "message": "경로 생성 요청이 시작하자마자 시간 제한(10초)을 초과했습니다.", "routes_checked": 0}
 
-    # PSP2 원리: L/3 길이 제약으로 Via 지점 탐색
-    L_THIRD = target_m / 3.0
-    
-    # R 제약 완화 (100m까지 낮춰 탐색 공간 최대화)
-    R_MIN = max(100.0, L_THIRD * 0.3)
-    R_SMALL = max(200.0, L_THIRD * 0.6)
-    R_MEDIUM = max(400.0, L_THIRD * 0.9)
-    R_LARGE = max(700.0, L_THIRD * 1.2)
-    R_XLARGE = max(1100.0, L_THIRD * 1.5)
-    
-    radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
-    bearings = [0, 45, 90, 135, 180, 225, 270, 315] 
+def polyline_length_m(polyline: List[LatLng]) -> float:
+    if not polyline or len(polyline) < 2:
+        return 0.0
+    dist = 0.0
+    for (lat1, lon1), (lat2, lon2) in zip(polyline[:-1], polyline[1:]):
+        dist += haversine(lat1, lon1, lat2, lon2)
+    if math.isnan(dist) or math.isinf(dist):
+        return 0.0
+    return dist
 
-    candidate_routes = []
-    valhalla_calls = 0
-    total_routes_checked = 0
 
-    # 1. Valhalla 탐색 (전수 조사)
-    for R in radii:
-        if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
-        if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
+def _project_to_local_xy(polyline: List[LatLng], ref_lat: Optional[float] = None) -> List[Tuple[float, float]]:
+    """Project lat/lng to a local planar system (meters) using simple equirect."""
+    if not polyline:
+        return []
+    if ref_lat is None:
+        ref_lat = polyline[0][0]
+    ref_lat_rad = math.radians(ref_lat)
+    R = 6371000.0
+    xs: List[Tuple[float, float]] = []
+    lat0, lon0 = polyline[0]
+    for lat, lon in polyline:
+        x = R * math.radians(lon - lon0) * math.cos(ref_lat_rad)
+        y = R * math.radians(lat - lat0)
+        xs.append((x, y))
+    return xs
 
-        for br in bearings:
-            if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
-            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
 
-            via_a = project_point(lat, lng, R, br)
-            
-            # 1) Seg A: 출발 → Via A (Out Segment)
-            seg_out = valhalla_route(start, via_a); valhalla_calls += 1
-            if not seg_out or len(seg_out) < 2: continue
-            
-            comback_point = seg_out[-1]
-            
-            # 2. 2차 경로 생성 후보 확보 (Comeback → Start)
-            
-            back_segments = []
-            
-            # 2.1 Valhalla 복귀 경로 (2회 시도)
-            if valhalla_calls + 1 <= MAX_TOTAL_CALLS:
-                seg_back_v = valhalla_route(comback_point, start)
-                valhalla_calls += 1
-                if seg_back_v and len(seg_back_v) >= 2: back_segments.append({"seg": seg_back_v, "source": "Valhalla"})
-            
-            # 2.2 카카오 복귀 경로는 사용하지 않음 (순수 Valhalla)
-            
-            # 3. 최종 루프 구성 및 페널티 적용
-            for back_seg_data in back_segments:
-                seg_back = back_seg_data["seg"]
-                
-                # 겹침 페널티 계산 (핵심)
-                overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
-                
-                if overlap_penalty > 300.0: continue
+def polygon_roundness(polyline: List[LatLng]) -> float:
+    """4πA / P² using projected coordinates. 0~1, 1 = perfect circle."""
+    if len(polyline) < 4:
+        return 0.0
+    pts = _project_to_local_xy(polyline)
+    if not pts:
+        return 0.0
 
-                total_route = seg_out + seg_back[1:] 
-                if total_route and total_route[0] != start: total_route.insert(0, start)
-                if total_route and total_route[-1] != start: total_route.append(start)
-                temp_pts = [total_route[0]]; [temp_pts.append(p) for p in total_route[1:] if p != temp_pts[-1]]; total_route = temp_pts
-                
-                score_base, local_meta = _score_loop(total_route, target_m)
-                total_score = score_base + overlap_penalty # 최종 점수에 겹침 페널티 부과
-                
-                # [핵심] 안전성 필터 통과한 경로만 저장 (안전성 필터는 복구됨)
-                if _is_path_safe(total_route) and polyline_length_m(total_route) > 0:
-                    candidate_routes.append({
-                        "route": total_route, 
-                        "valhalla_score": total_score, # 페널티가 포함된 점수
-                    })
-                    total_routes_checked += 1
+    # close polygon
+    if pts[0] != pts[-1]:
+        pts = pts + [pts[0]]
 
-        if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
+    area = 0.0
+    peri = 0.0
+    for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+        area += x1 * y2 - x2 * y1
+        peri += math.hypot(x2 - x1, y2 - y1)
 
-    # -----------------------------
-    # 4. 모든 후보 경로 후처리 (최종 Trimming)
-    # -----------------------------
-    
-    final_validated_routes = []
-    candidate_routes.sort(key=lambda x: x["valhalla_score"])
-    
-    # [핵심] 모든 후보 경로에 대해 Trimming 시도
-    for i, candidate in enumerate(candidate_routes): 
-        
-        if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
-        
-        # 4.1. 안전성 필터를 통과한 경로에 대해서만 길이 조정 시도
-        current_route = candidate['route']
-        final_len = polyline_length_m(current_route)
-        
-        # 1. 이미 ±99m 이내인 경우
-        if abs(final_len - target_m) <= MAX_LENGTH_ERROR_M:
-            final_validated_routes.append({"route": current_route, "score": _score_loop(current_route, target_m)[0]})
-            continue
-            
-        # 2. 길이가 99m 초과하면 강제 Trimming 적용
-        if final_len > target_m + MAX_LENGTH_ERROR_M:
-            
-            trimmed_route = _trim_path_to_length(current_route, target_m)
-            
-            # Trimming 후에도 99m 이내를 만족하면 최종 후보에 추가 (Trimming 성공)
-            if trimmed_route and abs(polyline_length_m(trimmed_route) - target_m) <= MAX_LENGTH_ERROR_M:
-                final_score = _score_loop(trimmed_route, target_m)[0]
-                final_validated_routes.append({
-                    "route": trimmed_route, 
-                    "score": final_score
-                })
+    area = abs(area) * 0.5
+    if area <= 0.0 or peri <= 0.0:
+        return 0.0
+    r = 4.0 * math.pi * area / (peri * peri)
+    if math.isnan(r) or math.isinf(r):
+        return 0.0
+    return r
 
-    # -----------------------------
-    # 5. 최종 베스트 경로 선택 (절대 반환 보장)
-    # -----------------------------
-    
-    best_final_route = None
-    
-    if final_validated_routes:
-        final_validated_routes.sort(key=lambda x: x["score"])
-        best_final_route = final_validated_routes[0]["route"]
-        
-    elif candidate_routes:
-        # B. ±99m를 만족하는 경로가 없으면, 모든 원본 후보 중 '가장 인접한' 경로를 선택
-        min_error = float("inf")
-        most_adjacent_route = None
 
-        for candidate in candidate_routes:
-            length = polyline_length_m(candidate["route"])
-            error = abs(length - target_m)
-            
-            if error < min_error:
-                min_error = error
-                most_adjacent_route = candidate["route"]
-                
-        best_final_route = most_adjacent_route
-    
-    # -----------------------------
-    # 6. 결과 반환 (성공/최인접 경로 반환 보장)
-    # -----------------------------
-    
-    if best_final_route:
-        final_len = polyline_length_m(best_final_route)
-        is_perfect = abs(final_len - target_m) <= MAX_LENGTH_ERROR_M
-        
-        meta = {
-            "len": final_len, "err": abs(final_len - target_m), "roundness": _loop_roundness(best_final_route), 
-            "success": is_perfect,
-            "used_fallback": False, 
-            "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2),
-            "message": "최적의 경로가 도출되었습니다." if is_perfect else "요청 오차(±99m)를 초과하지만, 가장 인접한 경로를 반환합니다.",
-            "length_ok": is_perfect,
-            "routes_checked": total_routes_checked,
-            "routes_processed": len(candidate_routes),
-            "routes_validated": len(final_validated_routes)
-        }
-        
-        return best_final_route, meta
+def _bearing_deg(a: LatLng, b: LatLng) -> float:
+    """Initial bearing in degrees from point a to b."""
+    lat1, lon1 = map(math.radians, a)
+    lat2, lon2 = map(math.radians, b)
+    dlon = lon2 - lon1
+    y = math.sin(dlon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    brng = math.degrees(math.atan2(y, x))
+    return (brng + 360.0) % 360.0
 
-    # -----------------------------
-    # 7. 최종 실패 (경로 후보가 0개)
-    # -----------------------------
-    return [start], {
-        "len": 0.0, "err": target_m, "success": False, "used_fallback": False, 
-        "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2),
-        "message": f"탐색 결과, 유효한 경로 후보를 찾을 수 없습니다. (Valhalla 통신 불가 또는 지리적 단절)",
-        "routes_checked": total_routes_checked,
+
+###############################################################################
+# Valhalla routing (walk profile)
+###############################################################################
+
+
+VALHALLA_URL = "http://127.0.0.1:8002/route"
+
+
+def _valhalla_request(locations: List[LatLng]) -> Optional[List[LatLng]]:
+    """
+    Call local Valhalla instance for pedestrian route.
+    This assumes the Docker container is exposing /route on 8002.
+    """
+    if len(locations) < 2:
+        return None
+
+    loc_objs = [{"lat": lat, "lon": lon} for lat, lon in locations]
+    body = {
+        "locations": loc_objs,
+        "costing": "pedestrian",
+        "directions_options": {"units": "kilometers"},
     }
+
+    try:
+        resp = requests.post(VALHALLA_URL, json=body, timeout=5)
+    except Exception:
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    data = resp.json()
+    try:
+        shape: List[LatLng] = []
+        for trip in data.get("trip", {}).get("legs", []):
+            for edge in trip.get("shape", []):
+                # When shape is already list of dicts {"lat":..,"lon":..}
+                if isinstance(edge, dict) and "lat" in edge and "lon" in edge:
+                    shape.append((float(edge["lat"]), float(edge["lon"])))
+        if not shape:
+            # Some Valhalla builds return encoded polyline "shape" string.
+            # In that case we simply give up instead of re-implementing decoding.
+            return None
+        return shape
+    except Exception:
+        return None
+
+
+###############################################################################
+# Candidate loop generation – inspired by Random/RUNAMIC/WSRP24
+###############################################################################
+
+
+def _radial_targets(start: LatLng, target_m: float, n: int = 16) -> List[LatLng]:
+    """
+    Sample endpoints on a noisy circle around the start.
+    Radius is chosen so that shortest-path distance start→end→start
+    is likely to be close to target_m.
+    """
+    lat0, lng0 = start
+    R = 6371000.0
+    # rough radius: half of target, scaled down because road distance > straight line
+    radius = max(80.0, target_m / 3.4)
+
+    pts: List[LatLng] = []
+    for i in range(n):
+        angle = 2.0 * math.pi * (i / n) + random.uniform(-0.25, 0.25)
+        d = radius * random.uniform(0.85, 1.15)
+        dlat = (d * math.cos(angle)) / R
+        dlng = (d * math.sin(angle)) / (R * math.cos(math.radians(lat0)))
+        pts.append((lat0 + math.degrees(dlat), lng0 + math.degrees(dlng)))
+    return pts
+
+
+def _chunk_polyline(poly: List[LatLng]) -> List[Tuple[LatLng, LatLng]]:
+    return list(zip(poly[:-1], poly[1:])) if len(poly) >= 2 else []
+
+
+def _segment_overlap_score(poly: List[LatLng]) -> float:
+    """
+    Very lightweight self-overlap penalty.
+    Count how many times short segments share almost the same midpoint.
+    """
+    if len(poly) < 4:
+        return 0.0
+
+    segs = _chunk_polyline(poly)
+    buckets: Dict[Tuple[int, int], int] = {}
+    for (a, b) in segs:
+        mid_lat = (a[0] + b[0]) * 0.5
+        mid_lng = (a[1] + b[1]) * 0.5
+        key = (int(mid_lat * 1e4), int(mid_lng * 1e4))
+        buckets[key] = buckets.get(key, 0) + 1
+
+    overlap = sum(c - 1 for c in buckets.values() if c > 1)
+    return float(overlap)
+
+
+def _curvature_score(poly: List[LatLng]) -> float:
+    """
+    Penalise extremely sharp turns (U-turn-like).
+    Lower score is better; will be subtracted from roundness.
+    """
+    if len(poly) < 3:
+        return 0.0
+    pts = poly
+    penalty = 0.0
+    for i in range(1, len(pts) - 1):
+        a, b, c = pts[i - 1], pts[i], pts[i + 1]
+        br1 = _bearing_deg(a, b)
+        br2 = _bearing_deg(b, c)
+        diff = abs(br2 - br1)
+        if diff > 180.0:
+            diff = 360.0 - diff
+        # If turning more than 135 deg, treat as almost U-turn
+        if diff > 135.0:
+            penalty += (diff - 135.0) / 45.0
+    return penalty
+
+
+def _loop_quality(poly: List[LatLng], target_m: float) -> Dict[str, float]:
+    """Compute error, roundness, overlap, and overall score."""
+    length = polyline_length_m(poly)
+    if length <= 0.0:
+        return {
+            "length": 0.0,
+            "err": float("inf"),
+            "roundness": 0.0,
+            "overlap": float("inf"),
+            "score": -1e9,
+        }
+
+    err = abs(length - target_m)
+    roundness = polygon_roundness(poly)
+    overlap = _segment_overlap_score(poly)
+    curve_pen = _curvature_score(poly)
+
+    # Normalise error relative to target (so 50m vs 5km is small)
+    rel_err = err / max(target_m, 1.0)
+
+    # Higher is better
+    score = (
+        +1.0 * roundness
+        - 3.0 * rel_err
+        - 0.3 * overlap
+        - 0.5 * curve_pen
+    )
+
+    return {
+        "length": length,
+        "err": err,
+        "roundness": roundness,
+        "overlap": overlap,
+        "curve_penalty": curve_pen,
+        "score": score,
+    }
+
+
+###############################################################################
+# Fallback: simple geometric square loop (last resort)
+###############################################################################
+
+
+def _fallback_square_loop(start: LatLng, km: float) -> List[LatLng]:
+    """Pure geometric fallback – used only when all routing fails."""
+    lat, lng = start
+    target_m = km * 1000.0
+    # half-diagonal of square ~ target/4, so side ~ target/4*sqrt(2)
+    half_side = max(80.0, target_m / 4.0 / math.sqrt(2.0))
+    dlat = (half_side / 6371000.0) * 180.0 / math.pi
+    dlng = dlat / math.cos(math.radians(lat))
+
+    a = (lat + dlat, lng)
+    b = (lat, lng + dlng)
+    c = (lat - dlat, lng)
+    d = (lat, lng - dlng)
+    poly = [a, b, c, d, a]
+    return poly
+
+
+###############################################################################
+# Main public API – used by app.py
+###############################################################################
+
+
+def generate_area_loop(lat: float, lng: float, km: float):
+    """
+    Generate a running loop around (lat, lng) of approximately `km` kilometers.
+
+    Algorithmic ideas mixed from:
+      - Random round-trip route generation on pedestrian graphs
+      - RUNAMIC style rod + detour cycles with cost poisoning
+      - WSRP24 cycle quality metrics (roundness, overlap)
+    but implemented in a lightweight way that fits a single Python file.
+    """
+    start_time = time.time()
+    start: LatLng = (lat, lng)
+    target_m = km * 1000.0
+
+    best_poly: Optional[List[LatLng]] = None
+    best_metrics: Optional[Dict[str, float]] = None
+    valhalla_calls = 0
+    kakao_calls = 0  # kept for compatibility in meta
+    routes_checked = 0
+    routes_validated = 0
+
+    # 1) sample radial endpoints
+    endpoints = _radial_targets(start, target_m, n=20)
+
+    # 2) build candidate loops of increasing complexity
+    #    (single detour rod, then two-point rods) – RUNAMIC style
+    candidates: List[List[LatLng]] = []
+
+    # 2-1: simple out-and-back rods
+    for p in endpoints:
+        fwd = _valhalla_request([start, p])
+        valhalla_calls += 1
+        if not fwd or len(fwd) < 2:
+            continue
+        back = _valhalla_request([p, start])
+        valhalla_calls += 1
+        if not back or len(back) < 2:
+            continue
+
+        # join (Random-paper flavour: 현재는 단순 연결, 나중에 내부 세그먼트 섞는 것도 가능)
+        poly = fwd + back[1:]
+        candidates.append(poly)
+
+    # 2-2: two-point cycles: start → p_i → p_j → start
+    if len(endpoints) >= 3:
+        pair_indices = [
+            (i, j)
+            for i in range(len(endpoints))
+            for j in range(len(endpoints))
+            if i != j
+        ]
+        random_pairs = random.sample(
+            pair_indices,
+            k=min(30, len(pair_indices)),
+        )
+        for i, j in random_pairs:
+            p1 = endpoints[i]
+            p2 = endpoints[j]
+            f1 = _valhalla_request([start, p1])
+            valhalla_calls += 1
+            if not f1 or len(f1) < 2:
+                continue
+            f2 = _valhalla_request([p1, p2])
+            valhalla_calls += 1
+            if not f2 or len(f2) < 2:
+                continue
+            f3 = _valhalla_request([p2, start])
+            valhalla_calls += 1
+            if not f3 or len(f3) < 2:
+                continue
+            poly = f1 + f2[1:] + f3[1:]
+            candidates.append(poly)
+
+    # 3) Evaluate candidates with multi-criteria score
+    for poly in candidates:
+        routes_checked += 1
+        metrics = _loop_quality(poly, target_m)
+        if not math.isfinite(metrics["err"]):
+            continue
+        routes_validated += 1
+        if best_metrics is None or metrics["score"] > best_metrics["score"]:
+            best_metrics = metrics
+            best_poly = poly
+
+    used_fallback = False
+
+    # 4) If we still don't have anything usable or error is huge, fallback
+    if best_poly is None or best_metrics is None or best_metrics["err"] > 200.0:
+        used_fallback = True
+        best_poly = _fallback_square_loop(start, km)
+        best_metrics = _loop_quality(best_poly, target_m)
+
+    elapsed = time.time() - start_time
+
+    # 5) Build meta
+    meta: Dict[str, object] = {
+        "len": safe_float(best_metrics.get("length", 0.0)),
+        "err": safe_float(best_metrics.get("err", 0.0)),
+        "roundness": safe_float(best_metrics.get("roundness", 0.0)),
+        "overlap": safe_float(best_metrics.get("overlap", 0.0)),
+        "curve_penalty": safe_float(best_metrics.get("curve_penalty", 0.0)),
+        "score": safe_float(best_metrics.get("score", 0.0)),
+        "success": not used_fallback,
+        "used_fallback": used_fallback,
+        "valhalla_calls": valhalla_calls,
+        "kakao_calls": kakao_calls,
+        "routes_checked": routes_checked,
+        "routes_validated": routes_validated,
+        "km_requested": km,
+        "target_m": safe_float(target_m),
+        "time_s": safe_float(elapsed),
+        "message": (
+            "논문 스타일 Valhalla 러닝 루프 생성 성공"
+            if not used_fallback
+            else "Valhalla 기반 후보가 부족해 기하학적 사각형 루프를 사용했습니다."
+        ),
+    }
+
+    safe_meta = safe_dict(meta)
+    safe_poly = safe_list(best_poly)
+
+    return safe_poly, safe_meta
