@@ -50,6 +50,7 @@ def safe_dict(d):
 # ==========================
 # 거리 계산 (Haversine)
 # ==========================
+
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """두 위경도 점 사이의 대원거리 (미터)."""
     R = 6371000.0
@@ -77,6 +78,7 @@ def polyline_length_m(polyline: List[Tuple[float, float]]) -> float:
 # ==========================
 # roundness 계산용 로컬 좌표 변환
 # ==========================
+
 def _to_local_xy(polyline: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
     """작은 영역에서는 위경도를 간단한 평면 좌표(미터)로 근사."""
     if not polyline:
@@ -94,10 +96,7 @@ def _to_local_xy(polyline: List[Tuple[float, float]]) -> List[Tuple[float, float
 
 
 def polygon_roundness(polyline: List[Tuple[float, float]]) -> float:
-    """
-    4πA / P^2 로 정의되는 roundness.
-    1에 가까울수록 원에 가까운 형태, 0에 가까울수록 길쭉/찌그러진 형태.
-    """
+    """4πA / P^2 로 정의되는 roundness."""
     if len(polyline) < 4:
         return 0.0
     xy = _to_local_xy(polyline)
@@ -121,11 +120,9 @@ def polygon_roundness(polyline: List[Tuple[float, float]]) -> float:
 # ==========================
 # overlap / 커브 페널티
 # ==========================
+
 def _edge_overlap_fraction(node_path: List[int]) -> float:
-    """
-    노드 시퀀스에서 같은 간선을 여러 번 쓰는 비율.
-    (반복 루프 생성 시 중복을 줄이기 위해 사용)
-    """
+    """노드 시퀀스에서 같은 간선을 여러 번 쓰는 비율."""
     if len(node_path) < 2:
         return 0.0
     edge_counts: Dict[Tuple[int, int], int] = {}
@@ -141,10 +138,7 @@ def _edge_overlap_fraction(node_path: List[int]) -> float:
 
 
 def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
-    """
-    경로에서 너무 급격한 커브(예: 60도 이하)를 얼마나 많이 만드는지 측정.
-    작을수록 부드러운 경로.
-    """
+    """경로에서 너무 급격한 커브(예: 60도 이하)를 얼마나 많이 만드는지 측정."""
     if len(node_path) < 3:
         return 0.0
     penalty = 0.0
@@ -152,14 +146,11 @@ def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
         a = node_path[i - 1]
         b = node_path[i]
         c = node_path[i + 1]
-
         if a not in G.nodes or b not in G.nodes or c not in G.nodes:
             continue
-
         ya, xa = G.nodes[a]["y"], G.nodes[a]["x"]
         yb, xb = G.nodes[b]["y"], G.nodes[b]["x"]
         yc, xc = G.nodes[c]["y"], G.nodes[c]["x"]
-
         v1x = xb - xa
         v1y = yb - ya
         v2x = xc - xb
@@ -168,14 +159,11 @@ def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
         n2 = math.hypot(v2x, v2y)
         if n1 == 0 or n2 == 0:
             continue
-
         dot = (v1x * v2x + v1y * v2y) / (n1 * n2)
         dot = max(-1.0, min(1.0, dot))
-        theta = math.acos(dot)  # 0 ~ pi (180도)
-
-        if theta < math.pi / 3.0:  # 60도 미만
+        theta = math.acos(dot)
+        if theta < math.pi / 3.0:
             penalty += (math.pi / 3.0 - theta)
-
     return penalty
 
 
@@ -192,18 +180,30 @@ def _path_length_on_graph(G: nx.Graph, nodes: List[int]) -> float:
     return length
 
 
-# ==========================
-# OSM 보행자 그래프 구축 (Cycle-Hunt용)
-# ==========================
-def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGraph:
-    """
-    OSMnx 'walk' 네트워크를 기반으로 보행 가능 그래프 생성.
-    - 너무 공격적인 필터는 넣지 않고,
-    - 고속도로 계열만 한 번 더 제거.
-    """
-    # km가 커질수록 반경 확대 (상한 4000m)
-    radius_m = min(max(800.0, km * 800.0 + 500.0), 4000.0)
+def _apply_route_poison(G: nx.Graph, path_nodes: List[int], factor: float = 6.0) -> nx.Graph:
+    """rod 간선의 length를 factor배로 늘려 detour를 유도."""
+    G2 = G.copy()
+    for u, v in zip(path_nodes[:-1], path_nodes[1:]):
+        if G2.has_edge(u, v):
+            for key in list(G2[u][v].keys()):
+                data = G2[u][v][key]
+                if "length" in data:
+                    data["length"] = float(data["length"]) * factor
+        if G2.has_edge(v, u):
+            for key in list(G2[v][u].keys()):
+                data = G2[v][u][key]
+                if "length" in data:
+                    data["length"] = float(data["length"]) * factor
+    return G2
 
+
+# ==========================
+# OSM 보행자 그래프 구축 (공용)
+# ==========================
+
+def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGraph:
+    """OSMnx walk 네트워크 기반 보행 가능 그래프."""
+    radius_m = min(max(800.0, km * 800.0 + 500.0), 4000.0)
     G = ox.graph_from_point(
         (lat, lng),
         dist=radius_m,
@@ -211,11 +211,9 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
         simplify=True,
         retain_all=False,
     )
-
     if not G.nodes:
         raise ValueError("OSM walk graph has no nodes in this area.")
-
-    # motorway / trunk 계열 한 번 더 제거
+    # 고속도로 계열 제거 (혹시 남아있는 경우)
     remove_edges = []
     for u, v, key, data in G.edges(keys=True, data=True):
         hwy = data.get("highway")
@@ -223,18 +221,13 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
             remove_edges.append((u, v, key))
     for u, v, key in remove_edges:
         G.remove_edge(u, v, key)
-
-    # 고립 노드 제거
     G.remove_nodes_from(list(nx.isolates(G)))
-
     if not G.nodes:
         raise ValueError("Graph became empty after filtering.")
-
     return G
 
 
 def _nodes_to_polyline(G: nx.Graph, nodes: List[int]) -> List[Tuple[float, float]]:
-    """그래프 노드 시퀀스를 (lat, lng) polyline으로 변환."""
     poly = []
     for n in nodes:
         node = G.nodes[n]
@@ -247,27 +240,21 @@ def _nodes_to_polyline(G: nx.Graph, nodes: List[int]) -> List[Tuple[float, float
 # ==========================
 # fallback: 기하학적 사각형 루프
 # ==========================
+
 def _fallback_square_loop(lat: float, lng: float, km: float):
-    """
-    모든 고급 알고리즘 실패 시 사용되는 마지막 안전 장치.
-    요청 거리 km를 대략 만족하는 사각형 루프 생성.
-    """
     target_m = km * 1000.0
-    side = target_m / 4.0  # 4변 합이 target_m
+    side = target_m / 4.0
     delta_deg_lat = side / 111000.0
     cos_lat = math.cos(math.radians(lat))
     delta_deg_lng = side / (111000.0 * cos_lat if cos_lat != 0 else 111000.0)
-
     a = (lat + delta_deg_lat, lng)
     b = (lat, lng + delta_deg_lng)
     c = (lat - delta_deg_lat, lng)
     d = (lat, lng - delta_deg_lng)
     poly = [a, b, c, d, a]
-
     center_lat = (a[0] + c[0]) / 2
     center_lng = (b[1] + d[1]) / 2
     poly = [(p[0] - center_lat + lat, p[1] - center_lng + lng) for p in poly]
-
     poly = [(float(x), float(y)) for x, y in poly]
     length = polyline_length_m(poly)
     r = polygon_roundness(poly)
@@ -275,20 +262,197 @@ def _fallback_square_loop(lat: float, lng: float, km: float):
 
 
 # ==========================
-# 메인: Cycle-Hunt 러닝 루프 생성기
+# CYCLE-HUNT 후보 생성
 # ==========================
-def generate_area_loop(lat: float, lng: float, km: float):
-    """
-    CYCLE-HUNT v1: 사이클 기반 러닝 루프 생성기.
 
-    - Rod / Poison 없이 순수 Cycle 기반
-    - 시작 노드에서 접근 가능한 서브그래프에서 사이클 탐색
-    - 한 사이클을 1~3회 반복하여 목표 거리 근처까지 확장
-    - 시작점에서 출발/복귀하는 완전 루프
-    """
+def _generate_cycle_candidates(
+    UG: nx.MultiGraph,
+    start_node: int,
+    target_m: float,
+    tolerance_m: float,
+    meta: Dict[str, Any],
+) -> list:
+    candidates = []
+    # 1) start 기준 탐색 반경
+    cutoff = min(target_m * 0.8, 2500.0)
+    try:
+        dist_map = nx.single_source_dijkstra_path_length(
+            UG, start_node, cutoff=cutoff, weight="length"
+        )
+    except Exception:
+        return candidates
+    if not dist_map:
+        return candidates
+    local_nodes = list(dist_map.keys())
+    H_multi = UG.subgraph(local_nodes).copy()
+    if H_multi.number_of_nodes() < 4:
+        return candidates
+    H_simple = nx.Graph(H_multi)
+    try:
+        cycles = nx.cycle_basis(H_simple, root=start_node)
+    except Exception:
+        cycles = nx.cycle_basis(H_simple)
+    if not cycles:
+        return candidates
+    random.shuffle(cycles)
+    cycles = cycles[:80]
+    min_cycle_len = target_m * 0.3
+    max_cycle_len = target_m * 1.8
+    for cyc in cycles:
+        if len(cyc) < 3:
+            continue
+        cyc_closed = cyc + [cyc[0]]
+        cycle_len = _path_length_on_graph(UG, cyc_closed)
+        if cycle_len <= 0:
+            continue
+        if cycle_len < min_cycle_len or cycle_len > max_cycle_len:
+            continue
+        access_candidates = [n for n in cyc if n in dist_map]
+        if not access_candidates:
+            continue
+        access_candidates.sort(key=lambda n: dist_map[n])
+        access_candidates = access_candidates[:3]
+        for a in access_candidates:
+            dist_a = dist_map[a]
+            if dist_a > target_m * 0.7:
+                continue
+            try:
+                path_to = nx.shortest_path(UG, start_node, a, weight="length")
+            except Exception:
+                continue
+            if len(path_to) < 2:
+                continue
+            if a in cyc:
+                idx = cyc.index(a)
+                cyc_rot = cyc[idx:] + cyc[:idx]
+            else:
+                cyc_rot = cyc[:]
+            cyc_closed_rot = cyc_rot + [cyc_rot[0]]
+            for rep in range(1, 4):
+                full_nodes: List[int] = []
+                full_nodes.extend(path_to)
+                for _ in range(rep):
+                    full_nodes.extend(cyc_closed_rot[1:])
+                back_path = list(reversed(path_to))
+                if len(back_path) > 1:
+                    full_nodes.extend(back_path[1:])
+                meta["routes_checked"] += 1
+                polyline = _nodes_to_polyline(UG, full_nodes)
+                length_m = polyline_length_m(polyline)
+                if length_m <= 0:
+                    continue
+                err = abs(length_m - target_m)
+                roundness = polygon_roundness(polyline)
+                overlap = _edge_overlap_fraction(full_nodes)
+                curve_penalty = _curve_penalty(full_nodes, UG)
+                length_ok = err <= tolerance_m
+                if length_ok:
+                    meta["routes_validated"] += 1
+                candidates.append(
+                    {
+                        "polyline": polyline,
+                        "nodes": full_nodes,
+                        "len": length_m,
+                        "err": err,
+                        "roundness": roundness,
+                        "overlap": overlap,
+                        "curve_penalty": curve_penalty,
+                        "length_ok": length_ok,
+                        "source": "cycle",
+                    }
+                )
+    return candidates
+
+
+# ==========================
+# ROD + DETOUR 후보 생성 (RUNAMIC 스타일)
+# ==========================
+
+def _generate_rod_candidates(
+    UG: nx.MultiGraph,
+    start_node: int,
+    target_m: float,
+    tolerance_m: float,
+    meta: Dict[str, Any],
+) -> list:
+    candidates = []
+    try:
+        dist = nx.single_source_dijkstra_path_length(
+            UG, start_node, cutoff=target_m * 0.8, weight="length"
+        )
+    except Exception:
+        return candidates
+    if not dist:
+        return candidates
+    min_leg = target_m * 0.35
+    max_leg = target_m * 0.60
+    candidate_nodes = [n for n, d in dist.items() if min_leg <= d <= max_leg and n != start_node]
+    if not candidate_nodes:
+        candidate_nodes = [n for n, d in dist.items() if d >= target_m * 0.25]
+    if not candidate_nodes:
+        return candidates
+    random.shuffle(candidate_nodes)
+    candidate_nodes = candidate_nodes[:40]
+    for endpoint in candidate_nodes:
+        try:
+            forward_nodes = nx.shortest_path(UG, start_node, endpoint, weight="length")
+        except Exception:
+            continue
+        forward_len = _path_length_on_graph(UG, forward_nodes)
+        if forward_len <= 0:
+            continue
+        poisoned = _apply_route_poison(UG, forward_nodes, factor=6.0)
+        try:
+            back_nodes = nx.shortest_path(poisoned, endpoint, start_node, weight="length")
+        except Exception:
+            continue
+        back_len = _path_length_on_graph(UG, back_nodes)
+        if back_len <= 0:
+            continue
+        full_nodes = forward_nodes + back_nodes[1:]
+        meta["routes_checked"] += 1
+        polyline = _nodes_to_polyline(UG, full_nodes)
+        length_m = polyline_length_m(polyline)
+        if length_m <= 0:
+            continue
+        err = abs(length_m - target_m)
+        roundness = polygon_roundness(polyline)
+        overlap = _edge_overlap_fraction(full_nodes)
+        curve_penalty = _curve_penalty(full_nodes, UG)
+        length_ok = err <= tolerance_m
+        if length_ok:
+            meta["routes_validated"] += 1
+        candidates.append(
+            {
+                "polyline": polyline,
+                "nodes": full_nodes,
+                "len": length_m,
+                "err": err,
+                "roundness": roundness,
+                "overlap": overlap,
+                "curve_penalty": curve_penalty,
+                "length_ok": length_ok,
+                "source": "rod",
+            }
+        )
+    return candidates
+
+
+# ==========================
+# 메인: HYBRID 러닝 루프 생성기
+# ==========================
+
+def generate_area_loop(lat: float, lng: float, km: float):
+    """CYCLE + ROD 하이브리드 러닝 루프 생성기."""
     start_time = time.time()
     target_m = km * 1000.0
-    tolerance_m = 99.0  # 길이 허용 오차
+    tolerance_m = 99.0
+
+    # 스코어링 가중치 (두 방식 공통)
+    ROUNDNESS_WEIGHT = 2.5
+    OVERLAP_PENALTY = 1.5
+    CURVE_PENALTY_WEIGHT = 0.25
+    LENGTH_PENALTY_WEIGHT = 4.0
 
     meta: Dict[str, Any] = {
         "len": None,
@@ -310,9 +474,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
         "message": "",
     }
 
-    # --------------------------
-    # 1) OSM 보행자 그래프 구축
-    # --------------------------
+    # 1) 그래프 구축 및 시작 노드 매칭
     try:
         G = _build_pedestrian_graph(lat, lng, km)
     except Exception as e:
@@ -353,22 +515,14 @@ def generate_area_loop(lat: float, lng: float, km: float):
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    # undirected MultiGraph
     UG: nx.MultiGraph = ox.utils_graph.get_undirected(G)
 
-    # --------------------------
-    # 2) start에서의 단일-출발 최단거리 (탐색 영역 제한)
-    # --------------------------
-    try:
-        # 사이클 탐색용 cutoff: target_m * 0.6 ~ 0.8 정도가 적당
-        cutoff = min(target_m * 0.8, 2500.0)
-        dist_map = nx.single_source_dijkstra_path_length(
-            UG,
-            start_node,
-            cutoff=cutoff,
-            weight="length",
-        )
-    except Exception as e:
+    # 2) 두 방식 모두에서 후보 생성
+    cycle_candidates = _generate_cycle_candidates(UG, start_node, target_m, tolerance_m, meta)
+    rod_candidates = _generate_rod_candidates(UG, start_node, target_m, tolerance_m, meta)
+    all_candidates = cycle_candidates + rod_candidates
+
+    if not all_candidates:
         poly, length, r = _fallback_square_loop(lat, lng, km)
         err = abs(length - target_m)
         meta.update(
@@ -381,246 +535,56 @@ def generate_area_loop(lat: float, lng: float, km: float):
             success=False,
             length_ok=(err <= tolerance_m),
             used_fallback=True,
-            message=f"그래프 최단거리 탐색 실패로 기하학적 사각형 루프를 사용했습니다: {e}",
+            message="CYCLE/ROD 기반 루프 생성에 모두 실패하여 기하학적 사각형 루프를 사용했습니다.",
         )
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    if not dist_map:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= tolerance_m),
-            used_fallback=True,
-            message="최단거리 결과가 비어 있어 기하학적 사각형 루프를 사용했습니다.",
-        )
-        meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
-
-    local_nodes = list(dist_map.keys())
-    H_multi = UG.subgraph(local_nodes).copy()
-    if H_multi.number_of_nodes() < 4:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= tolerance_m),
-            used_fallback=True,
-            message="주변 그래프 노드가 너무 적어 기하학적 사각형 루프를 사용했습니다.",
-        )
-        meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
-
-    # cycle_basis 는 simple Graph 기준이므로 MultiGraph → Graph 변환
-    H_simple = nx.Graph(H_multi)
-
-    # --------------------------
-    # 3) 사이클 탐색 (cycle_basis)
-    # --------------------------
-    # root를 start_node로 주면 start 주변 사이클을 우선 탐색
-    try:
-        cycles = nx.cycle_basis(H_simple, root=start_node)
-    except Exception:
-        # root가 서브그래프에 없는 경우 등 → 그냥 전체 cycle_basis
-        cycles = nx.cycle_basis(H_simple)
-
-    if not cycles:
-        # 사이클이 전혀 없는 tree 구조면 fallback
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= tolerance_m),
-            used_fallback=True,
-            message="주변 보행자 그래프에서 유의미한 사이클을 찾지 못해 기하학적 사각형 루프를 사용했습니다.",
-        )
-        meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
-
-    # 사이클 개수가 너무 많으면 랜덤 샘플링
-    random.shuffle(cycles)
-    cycles = cycles[:80]
-
-    min_cycle_len = target_m * 0.3
-    max_cycle_len = target_m * 1.8
-
+    # 3) 스코어 계산 및 best 선택
     best_score = -1e18
-    best_poly: List[Tuple[float, float]] = []
-    best_meta_local: Dict[str, Any] = {}
-    found_length_ok = False
+    best = None
+    found_length_ok = any(c["length_ok"] for c in all_candidates)
 
-    # --------------------------
-    # 4) 각 사이클 + 접근 노드 + 반복 횟수(1~3회) 조합 탐색
-    # --------------------------
-    for cyc in cycles:
-        if len(cyc) < 3:
-            continue
-
-        # 먼저 사이클 자체의 길이를 계산 (닫힌 형태)
-        cyc_closed = cyc + [cyc[0]]
-        cycle_len = _path_length_on_graph(UG, cyc_closed)
-        if cycle_len <= 0:
-            continue
-
-        if cycle_len < min_cycle_len or cycle_len > max_cycle_len:
-            # 너무 짧거나 / 너무 긴 사이클은 제외
-            continue
-
-        # 이 사이클 안에서 start로부터 접근 가능한 노드 후보 찾기
-        access_candidates = [n for n in cyc if n in dist_map]
-        if not access_candidates:
-            continue
-
-        # start에서 가까운 순으로 정렬 후 상위 몇 개만 사용
-        access_candidates.sort(key=lambda n: dist_map[n])
-        access_candidates = access_candidates[:3]
-
-        for a in access_candidates:
-            dist_a = dist_map[a]
-            # 접근 거리가 타깃의 70%를 넘으면 비효율적이므로 제외
-            if dist_a > target_m * 0.7:
-                continue
-
-            # start → a 최단 경로
-            try:
-                path_to = nx.shortest_path(
-                    UG,
-                    start_node,
-                    a,
-                    weight="length",
-                )
-            except Exception:
-                continue
-
-            if len(path_to) < 2:
-                continue
-
-            # 사이클을 a에서 시작하도록 회전
-            if a in cyc:
-                idx = cyc.index(a)
-                cyc_rot = cyc[idx:] + cyc[:idx]
-            else:
-                cyc_rot = cyc[:]  # 혹시 모를 방어
-
-            cyc_closed_rot = cyc_rot + [cyc_rot[0]]  # 닫힌 사이클
-
-            # 사이클을 1~3번 반복하며 길이 맞추기
-            for rep in range(1, 4):
-                full_nodes: List[int] = []
-
-                # start → a
-                full_nodes.extend(path_to)
-
-                # a 기준 사이클 rep회 반복
-                for _ in range(rep):
-                    # 이미 a에서 끝나 있으므로, 다음 노드부터 추가
-                    full_nodes.extend(cyc_closed_rot[1:])
-
-                # 다시 a로 돌아온 상태이므로, start로 복귀 (역방향)
-                back_path = list(reversed(path_to))
-                # 첫 노드는 a(이미 있기 때문에 제외), 나머지 추가
-                if len(back_path) > 1:
-                    full_nodes.extend(back_path[1:])
-
-                meta["routes_checked"] += 1
-
-                # 길이 및 품질 평가
-                polyline = _nodes_to_polyline(UG, full_nodes)
-                length_m = polyline_length_m(polyline)
-                if length_m <= 0:
-                    continue
-
-                err = abs(length_m - target_m)
-                roundness = polygon_roundness(polyline)
-                overlap = _edge_overlap_fraction(full_nodes)
-                curve_penalty = _curve_penalty(full_nodes, UG)
-
-                length_ok = err <= tolerance_m
-                if length_ok:
-                    found_length_ok = True
-                    meta["routes_validated"] += 1
-
-                # 길이 오차/roundness/중복/급커브를 모두 반영한 스코어
-                length_pen = err / max(target_m, 1.0)
-                score = (
-                    roundness * 2.5
-                    - overlap * 1.5
-                    - curve_penalty * 0.25
-                    - length_pen * 4.0
-                )
-
-                # 길이 만족 경로를 아직 못 찾았으면 length_ok 여부와 상관없이 best 갱신
-                # 길이 만족 경로를 이미 찾은 후에는 length_ok인 후보만 비교
-                if (not found_length_ok) or length_ok:
-                    if score > best_score:
-                        best_score = score
-                        best_poly = polyline
-                        best_meta_local = {
-                            "len": length_m,
-                            "err": err,
-                            "roundness": roundness,
-                            "overlap": overlap,
-                            "curve_penalty": curve_penalty,
-                            "score": score,
-                            "length_ok": length_ok,
-                        }
-
-    # --------------------------
-    # 5) 후보 루프가 하나도 없을 때
-    # --------------------------
-    if not best_poly:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= tolerance_m),
-            used_fallback=True,
-            message="주변 보행자 그래프에서 유의미한 사이클 기반 루프를 찾지 못해 기하학적 사각형 루프를 사용했습니다.",
+    for c in all_candidates:
+        err = c["err"]
+        length_pen = err / max(target_m, 1.0)
+        score = (
+            c["roundness"] * ROUNDNESS_WEIGHT
+            - c["overlap"] * OVERLAP_PENALTY
+            - c["curve_penalty"] * CURVE_PENALTY_WEIGHT
+            - length_pen * LENGTH_PENALTY_WEIGHT
         )
-        meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
+        c["score"] = score
+        if (not found_length_ok) or c["length_ok"]:
+            if score > best_score:
+                best_score = score
+                best = c
 
-    # --------------------------
-    # 6) 최종 meta 구성
-    # --------------------------
-    success = bool(best_meta_local.get("length_ok", False))
-    meta.update(best_meta_local)
+    if best is None:
+        c = max(all_candidates, key=lambda x: x.get("score", -1e18))
+        best = c
+        best_score = best.get("score", -1e18)
+
+    success = best["length_ok"]
+
     meta.update(
+        len=best["len"],
+        err=best["err"],
+        roundness=best["roundness"],
+        overlap=best["overlap"],
+        curve_penalty=best["curve_penalty"],
+        score=best_score,
         success=success,
+        length_ok=best["length_ok"],
         used_fallback=False,
         message=(
-            "최적의 정밀 CYCLE-HUNT 루프가 도출되었습니다."
+            f"HYBRID-{best['source'].upper()} 기반 최적 루프가 도출되었습니다."
             if success
-            else "요청 오차(±99m)를 약간 초과하지만, 가장 인접한 CYCLE-HUNT 루프를 반환합니다."
+            else f"요청 오차(±{tolerance_m}m)를 초과하지만, 가장 인접한 HYBRID-{best['source'].upper()} 루프를 반환합니다."
         ),
     )
     meta["time_s"] = time.time() - start_time
 
     safe_meta = safe_dict(meta)
-    safe_poly = safe_list(best_poly)
+    safe_poly = safe_list(best["polyline"])
     return safe_poly, safe_meta
