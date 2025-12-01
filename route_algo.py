@@ -18,6 +18,7 @@ VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) 
 
+# 카카오 API 설정 (기존 코드 활용)
 KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
 KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
@@ -29,7 +30,7 @@ MAX_BEST_ROUTES_TO_TEST = 5
 MAX_ROUTES_TO_PROCESS = 10 
 
 # -----------------------------
-# 거리 / 기하 유틸
+# 거리 / 기하 유틸 (유지)
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -93,6 +94,7 @@ def valhalla_route(
     lat1, lon1 = p1; lat2, lon2 = p2
     last_error: Optional[Exception] = None
     
+    # [논문 기반 안전성/도보 선호 Costing Options 강화]
     costing_options = {
         "pedestrian": {
             "avoid_steps": 1.0, 
@@ -100,7 +102,7 @@ def valhalla_route(
             "use_hills": 0.0,
             "use_ferry": 0.0,
             "track_type_penalty": 0, # [논문 기반] 패널티 제거 (탐색 유연화)
-            "private_road_penalty": 100000, # [논문 기반] 사유지 회피 극대화
+            "private_road_penalty": 100000, # [논문 기반 안전성] 사유지 회피 극대화
             
             "bicycle_network_preference": 0.5,
             "sidewalk_preference": 1.0, # [논문 기반 안전성] 보도 선호도 최대화
@@ -230,7 +232,7 @@ def _score_loop(
     return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
 
 def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
-    """ [핵심] 안전성 기준 복구: 좁고 급회전이 많은 골목길을 회피합니다."""
+    """ [핵심 복구] 경로의 안전성을 판단합니다. (좁고 급회전이 많은 골목길을 회피)"""
     if len(points) < 5: return True 
 
     total_len = polyline_length_m(points)
@@ -432,7 +434,7 @@ def generate_area_loop(
                 score_base, local_meta = _score_loop(total_route, target_m)
                 total_score = score_base + overlap_penalty # 최종 점수에 겹침 페널티 부과
                 
-                # [핵심] 안전성 필터 복구 및 적용: 안전하고 길이가 0m 이상일 때만 후보에 추가
+                # [핵심] 안전성만 통과하면 (현재는 항상 True), 길이와 관계없이 모든 경로 후보를 저장
                 if _is_path_safe(total_route) and polyline_length_m(total_route) > 0:
                     candidate_routes.append({
                         "route": total_route, 
