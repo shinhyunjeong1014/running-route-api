@@ -93,21 +93,19 @@ def valhalla_route(
     lat1, lon1 = p1; lat2, lon2 = p2
     last_error: Optional[Exception] = None
     
-    # [논문 기반 안전성/도보 선호 Costing Options 강화]
     costing_options = {
         "pedestrian": {
             "avoid_steps": 1.0, 
             "service_penalty": 1000, 
             "use_hills": 0.0,
             "use_ferry": 0.0,
-            "track_type_penalty": 0, # 좁은 길 패널티 제거 (탐색 유연화)
-            "private_road_penalty": 100000, # 사유지 회피 극대화
+            "track_type_penalty": 0, 
+            "private_road_penalty": 100000, 
             
-            "bicycle_network_preference": 0.5,
-            "sidewalk_preference": 1.0, # 보도 선호도 최대화
+            "sidewalk_preference": 1.0, 
             "alley_preference": -1.0, 
-            "max_road_class": 0.5, # 차도 회피
-            "length_penalty": 0.0 # 긴 경로 탐색 유도 (논문 기반)
+            "max_road_class": 0.5, 
+            "length_penalty": 0.0 
         }
     }
     
@@ -433,12 +431,8 @@ def generate_area_loop(
                 score_base, local_meta = _score_loop(total_route, target_m)
                 total_score = score_base + overlap_penalty # 최종 점수에 겹침 페널티 부과
                 
-                # [핵심] 안전성 검사 통과 여부 확인
-                if not _is_path_safe(total_route):
-                     logger.debug(f"[Safety Fail] Discarding unsafe path (Score: {total_score:.1f}, Len: {polyline_length_m(total_route):.0f})")
-                     continue
-
-                if polyline_length_m(total_route) > 0:
+                # [핵심] 안전성 필터 복구 (오직 길이/겹침만 확인)
+                if _is_path_safe(total_route) and polyline_length_m(total_route) > 0:
                     candidate_routes.append({
                         "route": total_route, 
                         "valhalla_score": total_score, # 페널티가 포함된 점수
@@ -472,7 +466,16 @@ def generate_area_loop(
                 current_route, target_m, valhalla_calls, start_time, GLOBAL_TIMEOUT_S
             )
 
-            if shrunken_route:
+            # [핵심] 단축 시도 실패 시, 강제 Trimming으로 길이 맞추기
+            if shrunken_route is None:
+                # [Trimming]
+                required_trim_m = final_len - target_m 
+                trimmed_route = _trim_path_to_length(current_route, target_m)
+                
+                if trimmed_route and abs(polyline_length_m(trimmed_route) - target_m) <= MAX_LENGTH_ERROR_M:
+                     shrunken_route = trimmed_route
+
+            if shrunken_route and abs(polyline_length_m(shrunken_route) - target_m) <= MAX_LENGTH_ERROR_M:
                 final_score = _score_loop(shrunken_route, target_m)[0]
                 final_validated_routes.append({
                     "route": shrunken_route, 
