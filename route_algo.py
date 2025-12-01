@@ -158,9 +158,12 @@ def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
         if a not in G.nodes or b not in G.nodes or c not in G.nodes:
             continue
 
-        ya, xa = G.nodes[a]["y"], G.nodes[a]["x"]
-        yb, xb = G.nodes[b]["y"], G.nodes[b]["x"]
-        yc, xc = G.nodes[c]["y"], G.nodes[c]["x"]
+        ya, xa = G.nodes[a].get("y"), G.nodes[a].get("x")
+        yb, xb = G.nodes[b].get("y"), G.nodes[b].get("x")
+        yc, xc = G.nodes[c].get("y"), G.nodes[c].get("x")
+
+        if ya is None or xa is None or yb is None or xb is None or yc is None or xc is None:
+            continue
 
         v1x = xb - xa
         v1y = yb - ya
@@ -191,16 +194,19 @@ def _path_length_on_graph(G: nx.Graph, nodes: List[int]) -> float:
         if not G.has_edge(u, v):
             continue
         data = G[u][v]
+        # MultiGraph / Graph 모두 대응
         if isinstance(data, dict) and "length" in data:
-            # simple Graph
+            # simple Graph 형태
             length += float(data.get("length", 0.0))
         else:
-            # MultiGraph 등
+            # MultiGraph 형태 (키-딕셔너리의 딕셔너리)
             try:
                 ed = min(G[u][v].values(), key=lambda d: d.get("length", 1.0))
                 length += float(ed.get("length", 0.0))
             except Exception:
                 continue
+    if math.isinf(length) or math.isnan(length):
+        return 0.0
     return length
 
 
@@ -228,10 +234,14 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
 def _to_simple_undirected(G: nx.MultiDiGraph) -> nx.Graph:
     """
     MultiDiGraph -> simple undirected Graph 로 변환.
-    각 (u, v) 간선에 대해 length가 가장 짧은 간선만 사용.
+    - 노드 속성(x, y 등)을 그대로 유지
+    - (u, v) 간선에 대해 length가 가장 짧은 간선만 사용
     """
     UG_multi: nx.MultiGraph = ox.utils_graph.get_undirected(G)
     H = nx.Graph()
+    # 노드 속성 복사 (좌표 포함)
+    H.add_nodes_from(UG_multi.nodes(data=True))
+    # 간선: 가장 짧은 length 선택
     for u, v, data in UG_multi.edges(data=True):
         length = float(data.get("length", 1.0))
         if H.has_edge(u, v):
@@ -242,14 +252,21 @@ def _to_simple_undirected(G: nx.MultiDiGraph) -> nx.Graph:
     return H
 
 
-def _nodes_to_polyline(G: nx.Graph, nodes: List[int]) -> List[Tuple[float, float]]:
-    """그래프 노드 시퀀스를 (lat, lng) polyline으로 변환."""
+def _nodes_to_polyline(G_coords: nx.Graph, nodes: List[int]) -> List[Tuple[float, float]]:
+    """
+    그래프 노드 시퀀스를 (lat, lng) polyline으로 변환.
+    좌표는 G_coords의 노드 속성(y, x)을 사용.
+    """
     poly = []
     for n in nodes:
-        node = G.nodes[n]
-        lat = float(node["y"])
-        lon = float(node["x"])
-        poly.append((lat, lon))
+        if n not in G_coords.nodes:
+            continue
+        node = G_coords.nodes[n]
+        lat = node.get("y", None)
+        lon = node.get("x", None)
+        if lat is None or lon is None:
+            continue
+        poly.append((float(lat), float(lon)))
     return poly
 
 
@@ -279,14 +296,14 @@ def _fallback_square_loop(lat: float, lng: float, km: float):
 
 
 # ==========================
-# 메인: Cycle 기반 러닝 루프 생성기 (v3)
+# 메인: Cycle 기반 러닝 루프 생성기 (v3.1)
 # ==========================
 def generate_area_loop(lat: float, lng: float, km: float):
     """
-    CYCLE-BASED v3 러닝 루프 생성기.
+    CYCLE-BASED v3.1 러닝 루프 생성기.
 
     1) OSM 보행자 그래프 구축 (network_type='walk')
-    2) simple undirected 그래프 변환
+    2) simple undirected 그래프(H) 변환 (노드 좌표 유지)
     3) cycle_basis 로 단순 사이클 후보들 추출
     4) 각 사이클을 루프 후보로 평가 (길이, roundness, overlap, curve_penalty)
     5) target_m 과 가장 잘 맞는 사이클을 선택
@@ -338,15 +355,15 @@ def generate_area_loop(lat: float, lng: float, km: float):
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    # start_node: 루프와의 거리 평가용 (polyline에는 직접 안 들어갈 수 있음)
+    # start_node: 루프와의 거리 평가용
     try:
         start_node = ox.distance.nearest_nodes(G, X=lng, Y=lat)
     except Exception:
         start_node = None
 
-    # simple undirected graph
+    # simple undirected graph (노드 좌표 포함)
     try:
-        UG = _to_simple_undirected(G)
+        H = _to_simple_undirected(G)
     except Exception as e:
         poly, length, r = _fallback_square_loop(lat, lng, km)
         err = abs(length - target_m)
@@ -369,17 +386,17 @@ def generate_area_loop(lat: float, lng: float, km: float):
     # 2) cycle_basis 를 사용한 단순 사이클 추출
     # --------------------------
     try:
-        if start_node is not None and start_node in UG:
-            cycles = nx.cycle_basis(UG, root=start_node)
+        if start_node is not None and start_node in H:
+            cycles = nx.cycle_basis(H, root=start_node)
         else:
-            cycles = nx.cycle_basis(UG)
+            cycles = nx.cycle_basis(H)
     except Exception:
         cycles = []
 
     # root 기준 cycle_basis 가 빈 경우 전체 기준으로 한 번 더 시도
     if not cycles:
         try:
-            cycles = nx.cycle_basis(UG)
+            cycles = nx.cycle_basis(H)
         except Exception:
             cycles = []
 
@@ -402,12 +419,14 @@ def generate_area_loop(lat: float, lng: float, km: float):
     # --------------------------
     for cyc in cycles:
         if len(cyc) < 4:
-            continue  # 너무 작은 사이클은 제외 (삼각형 포함)
+            # 삼각형 등 너무 작은 사이클은 제외
+            continue
+
         # 닫힌 루프로 만들기 위해 처음 노드를 끝에 한 번 더 추가
         cyc_nodes = list(cyc) + [cyc[0]]
 
         # 루프 길이 계산
-        loop_len = _path_length_on_graph(UG, cyc_nodes)
+        loop_len = _path_length_on_graph(H, cyc_nodes)
         if loop_len <= 0:
             continue
 
@@ -415,7 +434,11 @@ def generate_area_loop(lat: float, lng: float, km: float):
         if loop_len < target_m * 0.4 or loop_len > target_m * 1.8:
             continue
 
-        polyline = _nodes_to_polyline(UG, cyc_nodes)
+        # 좌표 기반 polyline 생성 (원본 좌표 그래프 G 사용)
+        polyline = _nodes_to_polyline(G, cyc_nodes)
+        if len(polyline) < 4:
+            continue
+
         length_m = polyline_length_m(polyline)
         if length_m <= 0:
             continue
@@ -423,14 +446,18 @@ def generate_area_loop(lat: float, lng: float, km: float):
         err = abs(length_m - target_m)
         roundness = polygon_roundness(polyline)
         overlap = _edge_overlap_fraction(cyc_nodes)
-        curve_penalty = _curve_penalty(cyc_nodes, UG)
+        curve_penalty = _curve_penalty(cyc_nodes, G)
 
         # 시작점과 루프 간의 거리 (루프 상에서 가장 가까운 점 기준)
-        if start_node is not None and start_node in UG:
+        if start_node is not None and start_node in G:
             min_d = 1e18
             for n in cyc_nodes:
-                nx_lat = UG.nodes[n]["y"]
-                nx_lng = UG.nodes[n]["x"]
+                if n not in G.nodes:
+                    continue
+                nx_lat = G.nodes[n].get("y", None)
+                nx_lng = G.nodes[n].get("x", None)
+                if nx_lat is None or nx_lng is None:
+                    continue
                 d = haversine(lat, lng, nx_lat, nx_lng)
                 if d < min_d:
                     min_d = d
@@ -492,10 +519,10 @@ def generate_area_loop(lat: float, lng: float, km: float):
     # --------------------------
     # 5) 최종 meta 구성
     # --------------------------
+    final_len = polyline_length_m(best_poly)
+    best_err = abs(final_len - target_m)
     length_ok = best_err <= 99.0
     success = length_ok
-
-    final_len = polyline_length_m(best_poly)
 
     meta.update(
         len=final_len,
