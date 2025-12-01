@@ -11,6 +11,32 @@ from typing import List, Tuple, Dict, Any
 import networkx as nx
 import osmnx as ox
 
+# ==========================
+# 거리 계산 (Haversine)
+# ==========================
+import math
+
+
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """두 위경도 점 사이의 대원거리 (미터)."""
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * (math.sin(dlambda / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def polyline_length_m(polyline):
+    """polyline = [(lat, lng), ...] 배열의 총 길이 계산."""
+    if not polyline or len(polyline) < 2:
+        return 0.0
+    total = 0.0
+    for (lat1, lon1), (lat2, lon2) in zip(polyline[:-1], polyline[1:]):
+        total += haversine(lat1, lon1, lat2, lon2)
+    return float(total)
 
 ############################################################
 # JSON Safe
@@ -422,3 +448,4 @@ def generate_area_loop(lat, lng, km):
     meta["time_s"] = time.time()-start_time
 
     return safe_list(best), safe_dict(meta)
+
