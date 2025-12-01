@@ -91,7 +91,7 @@ def _loop_roundness(poly):
 
 VALHALLA_URL = "http://localhost:8002/route"   # 실제 서버 주소로 바꾸면 됨
 
-def valhalla_route(start: Tuple[float, float]], dest: Tuple[float, float]]) -> List[Tuple[float, float]]:
+def valhalla_route(start: Tuple[float, float], dest: Tuple[float, float]) -> List[Tuple[float, float]]:
     """
     Valhalla 도보 경로 요청
     """
@@ -150,7 +150,7 @@ def decode_valhalla_polyline(encoded):
 # 3. Kakao 도보 경로 라우팅
 # ====================================================
 
-def kakao_walk_route(start: Tuple[float, float]], dest: Tuple[float, float]]) -> List[Tuple[float, float]]:
+def kakao_walk_route(start: Tuple[float, float], dest: Tuple[float, float]) -> List[Tuple[float, float]]:
     """
     Kakao Mobility Directions API: 보행자(Walk) 경로 요청
     """
@@ -388,3 +388,4 @@ def generate_area_loop(
     }
 
     return best["poly"], meta
+
