@@ -2,6 +2,7 @@ import math
 import os
 import time
 import logging
+import json
 from typing import List, Dict, Tuple, Optional, Any
 
 import requests
@@ -17,7 +18,8 @@ VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
 VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
 VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) 
 
-# KAKAO API 설정 및 관련 변수 제거
+KAKAO_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
+KAKAO_ROUTE_URL = "https://apis-navi.kakaomobility.com/v1/directions"
 
 RUNNING_SPEED_KMH = 8.0  
 GLOBAL_TIMEOUT_S = 10.0 
@@ -27,7 +29,7 @@ MAX_BEST_ROUTES_TO_TEST = 5
 MAX_ROUTES_TO_PROCESS = 10 
 
 # -----------------------------
-# 거리 / 기하 유틸 (유지)
+# 거리 / 기하 유틸
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -61,7 +63,7 @@ def project_point(lat: float, lon: float, distance_m: float, bearing_deg_: float
 
 
 # -----------------------------
-# Valhalla API 호출 (순수 탐색)
+# Valhalla/Kakao API 호출
 # -----------------------------
 
 def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: float = 0.00001) -> Optional[List[Tuple[float, float]]]:
@@ -91,7 +93,7 @@ def valhalla_route(
     lat1, lon1 = p1; lat2, lon2 = p2
     last_error: Optional[Exception] = None
     
-    # [논문 기반 안전성/도보 선호 Costing Options]
+    # [논문 기반 안전성/도보 선호 Costing Options 강화]
     costing_options = {
         "pedestrian": {
             "avoid_steps": 1.0, 
@@ -135,9 +137,44 @@ def valhalla_route(
     logger.error("[Valhalla] all attempts failed for %s -> %s: %s", p1, p2, last_error)
     return []
 
-# KAKAO API 관련 함수 제거 (순수 Valhalla 탐색으로 회귀)
-# def kakao_walk_route(...): ...
+def kakao_walk_route(p1: Tuple[float, float], p2: Tuple[float, float]) -> Optional[List[Tuple[float, float]]]:
+    """카카오 길찾기 API (도보)를 호출하여 경로 폴리라인을 반환"""
+    if not KAKAO_API_KEY:
+        logger.error("[Kakao API] KAKAO_API_KEY not configured.")
+        return None
+    
+    lon1, lat1 = p1[::-1]; lon2, lat2 = p2[::-1]
 
+    headers = {"Authorization": f"KakaoAK {KAKAO_API_KEY}"}
+    params = {"origin": f"{lon1},{lat1}", "destination": f"{lon2},{lat2}", "waypoints": "", "priority": "RECOMMEND", "car_model": "walk"}
+
+    try:
+        resp = requests.get(KAKAO_ROUTE_URL, params=params, headers=headers, timeout=VALHALLA_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("routes") and data["routes"][0]["result_code"] == 0:
+            coords = []
+            for route in data["routes"]:
+                for section in route["sections"]:
+                    for road in section.get("roads", []):
+                        vertices = road.get("vertexes", [])
+                        
+                        for i in range(0, len(vertices), 2): 
+                            if i + 1 < len(vertices):
+                                lon = vertices[i]
+                                lat = vertices[i+1]
+                                coords.append((lat, lon))
+            
+            if coords and len(coords) >= 2:
+                if coords[0] != p1: coords.insert(0, p1)
+                if coords[-1] != p2: coords.append(p2)
+                return coords
+        
+    except Exception as e:
+        logger.error("[Kakao API] Request failed (Parsing or Network): %s", e)
+        return None
+    return None
 
 def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
     coords: List[Tuple[float, float]] = []; lat = 0; lng = 0; idx = 0; precision = 1e6
@@ -168,7 +205,7 @@ def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
 
 
 # -----------------------------
-# 루프 품질 평가 / 최종 길이 조정 로직
+# 루프 품질 평가 / 단축 재연결 로직
 # -----------------------------
 
 def _loop_roundness(points: List[Tuple[float, float]]) -> float:
@@ -193,9 +230,101 @@ def _score_loop(
     length_ok = True 
     return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
 
+def _is_path_safe(points: List[Tuple[float, float]]) -> bool:
+    """ [핵심 복구] 경로의 안전성을 판단합니다. (좁고 급회전이 많은 골목길을 회피합니다.)"""
+    if len(points) < 5: return True 
+
+    total_len = polyline_length_m(points)
+    if total_len == 0: return False
+
+    avg_segment_len = total_len / (len(points) - 1)
+    
+    # 좁은 길(골목길) 회피
+    if avg_segment_len < 8.0:
+        return False
+        
+    # 곡률 분석 (잦은 급회전 회피)
+    turn_count = 0
+    ANGLE_TURN_THRESHOLD = 30.0 # 30도 이상 급회전
+    
+    for i in range(1, len(points) - 1):
+        lat1, lon1 = points[i-1]; lat2, lon2 = points[i]; lat3, lon3 = points[i+1]
+        
+        brng1 = math.degrees(math.atan2(lon2 - lon1, lat2 - lat1))
+        brng2 = math.degrees(math.atan2(lon3 - lon2, lat3 - lat2))
+        
+        angle_diff = abs((brng2 - brng1 + 360) % 360)
+        d = angle_diff % 360.0
+        if d > 180.0: d = 360.0 - d
+            
+        if d >= ANGLE_TURN_THRESHOLD: turn_count += 1
+            
+    if total_len > 300 and turn_count / (total_len / 100.0) > 2.0:
+        return False
+
+    return True 
+
+def _try_shrink_path_kakao(
+    current_route: List[Tuple[float, float]],
+    target_m: float,
+    valhalla_calls: int,
+    start_time: float,
+    global_timeout: float,
+) -> Tuple[Optional[List[Tuple[float, float]]], int]:
+    
+    current_len = polyline_length_m(current_route)
+    error_m = current_len - target_m
+    
+    if time.time() - start_time >= global_timeout:
+        return None, valhalla_calls
+
+    target_reduction = error_m 
+    
+    pts = current_route
+    idx_a = max(1, int(len(pts) * 0.40))
+    idx_b = min(len(pts) - 2, int(len(pts) * 0.60))
+    
+    if idx_a < idx_b:
+        p_a = pts[idx_a]; p_b = pts[idx_b]
+        
+        # [핵심] 반복 단축 시도 시작
+        MAX_SHRINK_ATTEMPTS = 3
+        route_to_shrink = current_route[:]
+        
+        for attempt in range(MAX_SHRINK_ATTEMPTS):
+            
+            current_len = polyline_length_m(route_to_shrink)
+            error_m = current_len - target_m
+            
+            if abs(error_m) <= MAX_LENGTH_ERROR_M:
+                return route_to_shrink, valhalla_calls # 목표 달성
+            if error_m < 0:
+                break 
+
+            if time.time() - start_time >= global_timeout: break
+            
+            reconnect_seg = kakao_walk_route(p_a, p_b)
+            
+            if reconnect_seg and len(reconnect_seg) >= 2:
+                seg_len_original = polyline_length_m(pts[idx_a : idx_b + 1])
+                seg_len_new = polyline_length_m(reconnect_seg)
+                reduction = seg_len_original - seg_len_new
+
+                if reduction > 0: # 단축 효과가 있다면 경로 교체
+                    new_route = pts[:idx_a] + reconnect_seg + pts[idx_b+1:]
+                    route_to_shrink = new_route[:] # 다음 반복을 위해 경로 업데이트
+                else:
+                    break # 단축 효과 없음
+
+    # 최종 검증 후, 목표 달성했으면 경로 반환, 아니면 None 반환
+    if abs(polyline_length_m(route_to_shrink) - target_m) <= MAX_LENGTH_ERROR_M:
+        return route_to_shrink, valhalla_calls
+    else:
+        return None, valhalla_calls
+
 def _calculate_overlap_penalty(seg_out: List[Tuple[float, float]], seg_back: List[Tuple[float, float]]) -> float:
     """
-    [논문 기반] 복귀 경로(seg_back)와 나가는 경로(seg_out)의 공간적 겹침 페널티.
+    복귀 경로(seg_back)가 나가는 경로(seg_out)와 공간적으로 겹치는 정도를 측정하여 페널티를 부과합니다.
     """
     if not seg_out or not seg_back: return 0.0
 
@@ -214,59 +343,9 @@ def _calculate_overlap_penalty(seg_out: List[Tuple[float, float]], seg_back: Lis
     seg_back_len = len(seg_back)
     if seg_back_len > 0 and overlap_count / seg_back_len > 0.1: # 10% 이상 겹치면 페널티
         overlap_ratio = overlap_count / seg_back_len
-        return overlap_ratio * 1000.0 # 1000m 상당의 페널티 부과 (겹침 회피 강제)
+        return overlap_ratio * 1000.0 # 1000m 상당의 페널티 부과 (최대화)
         
     return 0.0
-
-def _trim_path_to_length(route: List[Tuple[float, float]], target_m: float) -> List[Tuple[float, float]]:
-    """
-    경로가 길 때, 끝 부분을 강제로 잘라 목표 길이(±99m)에 맞춥니다. (최종 Trimming)
-    """
-    current_len = polyline_length_m(route)
-    if current_len <= target_m + MAX_LENGTH_ERROR_M:
-        return route # 이미 목표 이내
-
-    required_trim = current_len - target_m
-    
-    trimmed_route = route[:]
-    reversed_route = trimmed_route[::-1]
-    
-    current_dist_removed = 0.0
-    
-    # 마지막 지점 (Start)는 유지해야 하므로, index 1부터 순회
-    for i in range(len(reversed_route) - 1):
-        p1 = reversed_route[i] # 현재 지점
-        p2 = reversed_route[i+1] # 다음 지점
-        seg_len = haversine_m(p1[0], p1[1], p2[0], p2[1])
-        
-        if current_dist_removed + seg_len >= required_trim:
-            # 이 세그먼트 내에서 잘라낼 지점을 찾습니다.
-            remaining_trim = required_trim - current_dist_removed
-            
-            # (p2 -> p1 방향으로) 보간하여 최종 지점을 찾음
-            # p2 (원래 경로의 앞 지점)에서 p1 (원래 경로의 뒷 지점)으로
-            
-            # p2 지점까지의 경로를 유지하고, p1 지점부터는 버립니다.
-            
-            # 간단화를 위해, 현재 세그먼트 시작점(p1)을 최종 지점으로 설정하고 끝냅니다.
-            # 이 코드는 정확한 보간 대신, 노드 단위에서 끊는 방법을 사용합니다.
-            
-            # 원본 경로의 길이는 len(route)이고, 뒤집힌 경로의 인덱스 i는 제거된 세그먼트의 수입니다.
-            final_index = len(route) - (i + 1)
-            
-            # 잘라낸 경로를 생성
-            trimmed_route = route[:final_index]
-            
-            # 마지막 지점은 Start로 강제 연결
-            if trimmed_route and trimmed_route[-1] != route[0]:
-                trimmed_route.append(route[0]) # Start 지점으로 닫기
-            
-            # 복잡한 보간 대신 노드 단위 Trimming 후 반환
-            return trimmed_route
-        
-        current_dist_removed += seg_len
-        
-    return route # Trimming 실패 (경로가 너무 짧거나 오류)
 
 
 # -----------------------------
@@ -278,7 +357,7 @@ def generate_area_loop(
     lng: float,
     km: float,
 ) -> Tuple[List[Tuple[float, float]], Dict]:
-    """[최종 논문 기반] 목표 거리(km)를 위해 경로를 찾고, Trimming으로 길이 정밀도를 강제합니다."""
+    """목표 거리(km) 근처의 '닫힌 러닝 루프'를 생성한다. (전체 탐색 및 카카오 단축 적용)"""
     
     start_time = time.time()
     
@@ -344,7 +423,6 @@ def generate_area_loop(
                 # 겹침 페널티 계산 (핵심)
                 overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
                 
-                # 겹침이 심한 경로는 폐기 (페널티 > 300m 이상이면 과도한 겹침으로 간주)
                 if overlap_penalty > 300.0: continue
 
                 total_route = seg_out + seg_back[1:] 
@@ -355,6 +433,11 @@ def generate_area_loop(
                 score_base, local_meta = _score_loop(total_route, target_m)
                 total_score = score_base + overlap_penalty # 최종 점수에 겹침 페널티 부과
                 
+                # [핵심] 안전성 검사 통과 여부 확인
+                if not _is_path_safe(total_route):
+                     logger.debug(f"[Safety Fail] Discarding unsafe path (Score: {total_score:.1f}, Len: {polyline_length_m(total_route):.0f})")
+                     continue
+
                 if polyline_length_m(total_route) > 0:
                     candidate_routes.append({
                         "route": total_route, 
@@ -365,7 +448,7 @@ def generate_area_loop(
         if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
 
     # -----------------------------
-    # 4. 모든 후보 경로 후처리 (카카오 단축 시도 및 최종 Trimming)
+    # 4. 모든 후보 경로 후처리 (카카오 단축 시도)
     # -----------------------------
     
     final_validated_routes = []
@@ -388,12 +471,8 @@ def generate_area_loop(
             shrunken_route, valhalla_calls = _try_shrink_path_kakao(
                 current_route, target_m, valhalla_calls, start_time, GLOBAL_TIMEOUT_S
             )
-        
-            # [핵심] 단축 시도 실패 시, 강제 Trimming으로 길이 맞추기
-            if shrunken_route is None:
-                shrunken_route = _trim_path_to_length(current_route, target_m)
-            
-            if shrunken_route and abs(polyline_length_m(shrunken_route) - target_m) <= MAX_LENGTH_ERROR_M:
+
+            if shrunken_route:
                 final_score = _score_loop(shrunken_route, target_m)[0]
                 final_validated_routes.append({
                     "route": shrunken_route, 
