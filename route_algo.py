@@ -213,17 +213,15 @@ def _apply_route_poison(G: nx.Graph, path_nodes: List[int], factor: float = 6.0)
 
 
 # ==========================
-# OSM 보행자 그래프 구축 (V3 안정화)
+# OSM 보행자 그래프 구축 (V4 최종 안정화)
 # ==========================
 def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGraph:
     """
-    [V3 개선 적용] OSMnx의 기본 'walk' 필터만 사용하고, 불안정한 custom_filter를 제거하여 안정성을 확보합니다.
+    [V4 개선 적용] OSMnx API 부하를 낮추고 안정적인 'walk' 네트워크 타입만 사용합니다.
     """
-    # km가 커질수록 반경을 넉넉히 잡되, 너무 크게는 안 가게 제한
-    radius_m = max(800.0, km * 700.0 + 500.0)
+    # [V4 수정] API 부하를 낮추기 위해 반경을 보수적으로 조정 (이전 700m + km*700m 보다 작음)
+    radius_m = max(700.0, km * 500.0 + 700.0)
     
-    # [V3 개선] 'custom_filter' 대신 안정적인 'walk' 네트워크 타입만 사용
-    # 'walk' 타입은 footway, sidewalk, pedestrian, steps, path 등 기본 보행자 경로를 포함합니다.
     G = ox.graph_from_point(
         (lat, lng),
         dist=radius_m,
@@ -284,12 +282,12 @@ def _fallback_square_loop(lat: float, lng: float, km: float):
 # ==========================
 def generate_area_loop(lat: float, lng: float, km: float):
     """
-    PURE PEDESTRIAN 러닝 루프 생성기 (V3 안정화 버전)
+    PURE PEDESTRIAN 러닝 루프 생성기 (V4 최종 안정화 버전)
     """
     start_time = time.time()
     target_m = km * 1000.0
     
-    # [V3 개선] 스코어링 가중치 (v2의 강화된 값)
+    # [V4 유지] 스코어링 가중치 (강화된 값)
     ROUNDNESS_WEIGHT = 3.0
     OVERLAP_PENALTY = 2.0
     CURVE_PENALTY_WEIGHT = 0.3
@@ -316,7 +314,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
     }
 
     # --------------------------
-    # 1) OSM 보행자 그래프 구축 (V3 안정화 적용)
+    # 1) OSM 보행자 그래프 구축 (V4 최종 안정화 적용)
     # --------------------------
     try:
         G = _build_pedestrian_graph(lat, lng, km) 
@@ -394,7 +392,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    # [V3 개선] rod 길이 후보: 0.35 ~ 0.6 * target_m 사이 (max_leg 축소)
+    # [V4 유지] rod 길이 후보: 0.35 ~ 0.6 * target_m 사이 (max_leg 축소)
     min_leg = target_m * 0.35
     max_leg = target_m * 0.60
     candidate_nodes = [n for n, d in dist.items() if min_leg <= d <= max_leg and n != start_node]
@@ -430,7 +428,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
     best_meta_stats = {}
 
     # --------------------------
-    # 3) 각 endpoint에 대해 rod + detour 루프 생성 (V3 단일 경쟁 로직)
+    # 3) 각 endpoint에 대해 rod + detour 루프 생성 (V4 단일 경쟁 로직)
     # --------------------------
     for endpoint in candidate_nodes:
         
@@ -481,7 +479,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
         if length_ok:
             meta["routes_validated"] += 1
             
-        # [V3 개선] 스코어링 가중치 적용 (v2의 강화된 값)
+        # [V4 유지] 스코어링 가중치 적용 (v2의 강화된 값)
         length_pen = err / target_m 
         score = (
             roundness * ROUNDNESS_WEIGHT
@@ -490,7 +488,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
             - length_pen * LENGTH_PENALTY_WEIGHT
         )
         
-        # [V3 개선] 단일 경쟁 로직: 가장 높은 Score를 선택
+        # [V4 유지] 단일 경쟁 로직: 가장 높은 Score를 선택
         if score > best_score:
             best_score = score
             best_poly = polyline
