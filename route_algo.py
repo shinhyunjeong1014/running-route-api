@@ -59,7 +59,10 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * (math.sin(dlambda / 2) ** 2)
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    d = R * c
+    if math.isinf(d) or math.isnan(d):
+        return 0.0
+    return d
 
 
 def polyline_length_m(polyline: List[Tuple[float, float]]) -> float:
@@ -124,7 +127,6 @@ def polygon_roundness(polyline: List[Tuple[float, float]]) -> float:
 def _edge_overlap_fraction(node_path: List[int]) -> float:
     """
     노드 시퀀스에서 같은 간선을 여러 번 쓰는 비율.
-    (rod + detour 구조 등에서 중복을 줄이기 위해 사용)
     """
     if len(node_path) < 2:
         return 0.0
@@ -188,23 +190,18 @@ def _path_length_on_graph(G: nx.Graph, nodes: List[int]) -> float:
     for u, v in zip(nodes[:-1], nodes[1:]):
         if not G.has_edge(u, v):
             continue
-        data = min(G[u][v].values(), key=lambda d: d.get("length", 1.0))
-        length += float(data.get("length", 0.0))
+        data = G[u][v]
+        if isinstance(data, dict) and "length" in data:
+            # simple Graph
+            length += float(data.get("length", 0.0))
+        else:
+            # MultiGraph 등
+            try:
+                ed = min(G[u][v].values(), key=lambda d: d.get("length", 1.0))
+                length += float(ed.get("length", 0.0))
+            except Exception:
+                continue
     return length
-
-
-def _apply_route_poison(G: nx.Graph, path_nodes: List[int], factor: float = 5.0) -> nx.Graph:
-    """
-    RUNAMIC 스타일 route poisoning (v2에서는 사용하지 않지만 남겨둠).
-    """
-    G2 = G.copy()
-    for u, v in zip(path_nodes[:-1], path_nodes[1:]):
-        if G2.has_edge(u, v):
-            for k in G2[u][v]:
-                data = G2[u][v][k]
-                if "length" in data:
-                    data["length"] = float(data["length"]) * factor
-    return G2
 
 
 # ==========================
@@ -215,16 +212,34 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
     시작점 주변 dist(미터) 반경의 보행자용 그래프를 가져온다.
     (Overpass API 사용, network_type='walk')
     """
+    # km가 커질수록 반경을 넉넉히 잡되, 너무 크게는 안 가게 제한
     radius_m = max(800.0, km * 700.0 + 500.0)
     G = ox.graph_from_point(
         (lat, lng),
         dist=radius_m,
         network_type="walk",
-        simplify=True
+        simplify=True,
     )
     if not G.nodes:
         raise ValueError("Empty pedestrian graph from OSM.")
     return G
+
+
+def _to_simple_undirected(G: nx.MultiDiGraph) -> nx.Graph:
+    """
+    MultiDiGraph -> simple undirected Graph 로 변환.
+    각 (u, v) 간선에 대해 length가 가장 짧은 간선만 사용.
+    """
+    UG_multi: nx.MultiGraph = ox.utils_graph.get_undirected(G)
+    H = nx.Graph()
+    for u, v, data in UG_multi.edges(data=True):
+        length = float(data.get("length", 1.0))
+        if H.has_edge(u, v):
+            if length < H[u][v].get("length", 1e18):
+                H[u][v]["length"] = length
+        else:
+            H.add_edge(u, v, length=length)
+    return H
 
 
 def _nodes_to_polyline(G: nx.Graph, nodes: List[int]) -> List[Tuple[float, float]]:
@@ -264,18 +279,18 @@ def _fallback_square_loop(lat: float, lng: float, km: float):
 
 
 # ==========================
-# 메인: 러닝 루프 생성기 (PSP2 스타일)
+# 메인: Cycle 기반 러닝 루프 생성기 (v3)
 # ==========================
 def generate_area_loop(lat: float, lng: float, km: float):
     """
-    PURE PEDESTRIAN 러닝 루프 생성기 (v2: PSP2 스타일)
+    CYCLE-BASED v3 러닝 루프 생성기.
 
     1) OSM 보행자 그래프 구축 (network_type='walk')
-    2) start에서 단일-출발 최단거리 계산
-    3) u, v 후보를 거리 기반으로 샘플링
-    4) s->u, u->v, v->s 세 구간 모두 최단경로로 연결 (삼각 루프)
-    5) 길이 오차 / roundness / overlap / curve_penalty 종합 스코어로 최적 루프 선택
-    6) 실패 시 fallback 사각형 루프 사용
+    2) simple undirected 그래프 변환
+    3) cycle_basis 로 단순 사이클 후보들 추출
+    4) 각 사이클을 루프 후보로 평가 (길이, roundness, overlap, curve_penalty)
+    5) target_m 과 가장 잘 맞는 사이클을 선택
+    6) 실패 시 기하학적 사각형 루프 사용
     """
     start_time = time.time()
     target_m = km * 1000.0
@@ -301,7 +316,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
     }
 
     # --------------------------
-    # 1) OSM 보행자 그래프 구축
+    # 1) 보행자 그래프 구축
     # --------------------------
     try:
         G = _build_pedestrian_graph(lat, lng, km)
@@ -318,16 +333,20 @@ def generate_area_loop(lat: float, lng: float, km: float):
             success=False,
             length_ok=(err <= 99.0),
             used_fallback=True,
-            routes_checked=0,
-            routes_validated=0,
             message=f"OSM 보행자 그래프 생성 실패로 기하학적 사각형 루프를 사용했습니다: {e}",
         )
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    # 시작 노드 매칭
+    # start_node: 루프와의 거리 평가용 (polyline에는 직접 안 들어갈 수 있음)
     try:
         start_node = ox.distance.nearest_nodes(G, X=lng, Y=lat)
+    except Exception:
+        start_node = None
+
+    # simple undirected graph
+    try:
+        UG = _to_simple_undirected(G)
     except Exception as e:
         poly, length, r = _fallback_square_loop(lat, lng, km)
         err = abs(length - target_m)
@@ -341,110 +360,31 @@ def generate_area_loop(lat: float, lng: float, km: float):
             success=False,
             length_ok=(err <= 99.0),
             used_fallback=True,
-            routes_checked=0,
-            routes_validated=0,
-            message=f"시작 노드 매칭 실패로 기하학적 사각형 루프를 사용했습니다: {e}",
+            message=f"보행자 그래프 변환 실패로 기하학적 사각형 루프를 사용했습니다: {e}",
         )
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    undirected: nx.MultiGraph = ox.utils_graph.get_undirected(G)
-
     # --------------------------
-    # 2) start에서의 단일-출발 최단거리
+    # 2) cycle_basis 를 사용한 단순 사이클 추출
     # --------------------------
     try:
-        dist_s = nx.single_source_dijkstra_path_length(
-            undirected,
-            start_node,
-            cutoff=target_m * 0.9,
-            weight="length",
-        )
-    except Exception as e:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= 99.0),
-            used_fallback=True,
-            routes_checked=0,
-            routes_validated=0,
-            message=f"그래프 최단거리 탐색 실패로 기하학적 사각형 루프를 사용했습니다: {e}",
-        )
-        meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
+        if start_node is not None and start_node in UG:
+            cycles = nx.cycle_basis(UG, root=start_node)
+        else:
+            cycles = nx.cycle_basis(UG)
+    except Exception:
+        cycles = []
 
-    if len(dist_s) <= 1:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= 99.0),
-            used_fallback=True,
-            routes_checked=0,
-            routes_validated=0,
-            message="유효한 보행자 노드가 부족하여 기하학적 사각형 루프를 사용했습니다.",
-        )
-        meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
+    # root 기준 cycle_basis 가 빈 경우 전체 기준으로 한 번 더 시도
+    if not cycles:
+        try:
+            cycles = nx.cycle_basis(UG)
+        except Exception:
+            cycles = []
 
-    # --------------------------
-    # 3) u, v 후보 선정 (거리 기반 ring)
-    # --------------------------
-    # u: 0.2L ~ 0.6L, v: 0.4L ~ 0.9L
-    u_min = target_m * 0.2
-    u_max = target_m * 0.6
-    v_min = target_m * 0.4
-    v_max = target_m * 0.9
-
-    u_nodes = [n for n, d in dist_s.items() if n != start_node and u_min <= d <= u_max]
-    v_nodes = [n for n, d in dist_s.items() if n != start_node and v_min <= d <= v_max]
-
-    # 후보가 없으면 조건 완화
-    if not u_nodes:
-        u_nodes = [n for n, d in dist_s.items() if n != start_node and d >= target_m * 0.15]
-    if not v_nodes:
-        v_nodes = [n for n, d in dist_s.items() if n != start_node and d >= target_m * 0.3]
-
-    if not u_nodes or not v_nodes:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= 99.0),
-            used_fallback=True,
-            routes_checked=0,
-            routes_validated=0,
-            message="PSP2용 u,v 후보를 찾지 못해 기하학적 사각형 루프를 사용했습니다.",
-        )
-        meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
-
-    random.shuffle(u_nodes)
-    random.shuffle(v_nodes)
-    u_nodes = u_nodes[:30]
-    v_nodes = v_nodes[:30]
-
-    best_score = -1e18
     best_poly = None
+    best_score = -1e18
     best_round = 0.0
     best_overlap = 0.0
     best_curve_penalty = 0.0
@@ -452,54 +392,69 @@ def generate_area_loop(lat: float, lng: float, km: float):
     routes_checked = 0
     routes_validated = 0
 
-    MAX_TRIALS = 80
-    trials = 0
+    # 사이클이 너무 많을 경우를 대비해 샘플링
+    random.shuffle(cycles)
+    MAX_CYCLES = 200
+    cycles = cycles[:MAX_CYCLES]
 
     # --------------------------
-    # 4) PSP2 스타일: s→u→v→s 루프 후보 탐색
+    # 3) 각 사이클을 후보 러닝 루프로 평가
     # --------------------------
-    while trials < MAX_TRIALS:
-        trials += 1
-        u = random.choice(u_nodes)
-        v = random.choice(v_nodes)
-        if u == v or u == start_node or v == start_node:
-            continue
+    for cyc in cycles:
+        if len(cyc) < 4:
+            continue  # 너무 작은 사이클은 제외 (삼각형 포함)
+        # 닫힌 루프로 만들기 위해 처음 노드를 끝에 한 번 더 추가
+        cyc_nodes = list(cyc) + [cyc[0]]
 
-        try:
-            path_su = nx.shortest_path(undirected, start_node, u, weight="length")
-            path_uv = nx.shortest_path(undirected, u, v, weight="length")
-            path_vs = nx.shortest_path(undirected, v, start_node, weight="length")
-        except Exception:
-            continue
-
-        full_nodes = list(path_su) + list(path_uv)[1:] + list(path_vs)[1:]
-        if len(full_nodes) < 4:
-            continue
-
-        routes_checked += 1
-
-        loop_len = _path_length_on_graph(undirected, full_nodes)
+        # 루프 길이 계산
+        loop_len = _path_length_on_graph(UG, cyc_nodes)
         if loop_len <= 0:
             continue
 
-        polyline = _nodes_to_polyline(undirected, full_nodes)
+        # 요청 거리 대비 너무 짧거나 너무 긴 경우는 제외
+        if loop_len < target_m * 0.4 or loop_len > target_m * 1.8:
+            continue
+
+        polyline = _nodes_to_polyline(UG, cyc_nodes)
         length_m = polyline_length_m(polyline)
         if length_m <= 0:
             continue
 
         err = abs(length_m - target_m)
         roundness = polygon_roundness(polyline)
-        overlap = _edge_overlap_fraction(full_nodes)
-        curve_penalty = _curve_penalty(full_nodes, undirected)
+        overlap = _edge_overlap_fraction(cyc_nodes)
+        curve_penalty = _curve_penalty(cyc_nodes, UG)
+
+        # 시작점과 루프 간의 거리 (루프 상에서 가장 가까운 점 기준)
+        if start_node is not None and start_node in UG:
+            min_d = 1e18
+            for n in cyc_nodes:
+                nx_lat = UG.nodes[n]["y"]
+                nx_lng = UG.nodes[n]["x"]
+                d = haversine(lat, lng, nx_lat, nx_lng)
+                if d < min_d:
+                    min_d = d
+        else:
+            min_d = 0.0
+
+        # 시작점과 너무 멀리 떨어진 사이클은 제외
+        max_center_dist = max(300.0, target_m * 0.5)
+        if min_d > max_center_dist:
+            continue
 
         length_pen = err / max(target_m, 1.0)
+        start_dist_pen = min_d / max(target_m, 1.0)
+
+        # 스코어: roundness 높을수록, overlap/curve_penalty/length_pen/start_dist_pen 낮을수록 좋음
         score = (
             roundness * 3.0
             - overlap * 2.0
             - curve_penalty * 0.3
-            - length_pen * 6.0
+            - length_pen * 5.0
+            - start_dist_pen * 2.0
         )
 
+        routes_checked += 1
         if err <= 99.0:
             routes_validated += 1
 
@@ -512,7 +467,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
             best_err = err
 
     # --------------------------
-    # 5) 후보 루프가 하나도 없을 때
+    # 4) 사이클 기반 후보가 없을 때
     # --------------------------
     if best_poly is None:
         poly, length, r = _fallback_square_loop(lat, lng, km)
@@ -529,20 +484,21 @@ def generate_area_loop(lat: float, lng: float, km: float):
             used_fallback=True,
             routes_checked=routes_checked,
             routes_validated=routes_validated,
-            message="PSP2 기반 루프 생성에 실패하여 기하학적 사각형 루프를 사용했습니다.",
+            message="CYCLE 기반 루프 생성에 실패하여 기하학적 사각형 루프를 사용했습니다.",
         )
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
     # --------------------------
-    # 6) 최종 meta 구성
+    # 5) 최종 meta 구성
     # --------------------------
-    used_fallback = False
     length_ok = best_err <= 99.0
     success = length_ok
 
+    final_len = polyline_length_m(best_poly)
+
     meta.update(
-        len=polyline_length_m(best_poly),
+        len=final_len,
         err=best_err,
         roundness=best_round,
         overlap=best_overlap,
@@ -550,13 +506,13 @@ def generate_area_loop(lat: float, lng: float, km: float):
         score=best_score,
         success=success,
         length_ok=length_ok,
-        used_fallback=used_fallback,
+        used_fallback=False,
         routes_checked=routes_checked,
         routes_validated=routes_validated,
         message=(
-            "PSP2 스타일 OSM 보행자 그래프에서 러닝 루프를 생성했습니다."
+            "CYCLE 기반 OSM 보행자 그래프에서 러닝 루프를 생성했습니다."
             if success
-            else "요청 오차(±99m)를 초과하지만, 가장 인접한 PSP2 루프를 반환합니다."
+            else "요청 오차(±99m)를 초과하지만, 가장 인접한 CYCLE 루프를 반환합니다."
         ),
     )
     meta["time_s"] = time.time() - start_time
