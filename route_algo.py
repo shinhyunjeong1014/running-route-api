@@ -1,437 +1,689 @@
+# route_algo.py (A-1 연구용 Full 버전)
+#
+# 완전 논문 기반 러닝/워킹 루프 생성 모듈
+#
+# 사용 개념:
+# - Random and shortest path generation for running or walking purposes
+#   · OSM 보행 그래프 + 최단경로(Dijkstra)
+#   · 목표 거리와 오차를 최소화하는 랜덤 왕복 루트
+# - RUNAMIC
+#   · 시작점 주변 anchor(rod endpoint) 노드 여러 개 선택
+#   · start → A → B → C → start 형태의 사이클 생성
+# - WSRP24 cycle algorithms
+#   · roundness(4πA/P²), self-intersection, edge reuse를 품질 지표로 사용
+# - path_traverser
+#   · “거리 오차 + 품질 페널티”를 하나의 score로 만들어 최적 루프 선택
+#
+# 외부 인터페이스 (app.py에서 사용):
+#   polyline_tuples, meta = generate_area_loop(lat, lng, km)
+#
+# polyline_tuples: [(lat, lng), ...]
+# meta: {
+#   "len": 전체 길이(m),
+#   "err": |len - target_m|,
+#   "roundness": 0~1,
+#   "success": (err <= 99m),
+#   "used_fallback": 항상 False (이 버전은 사각형 fallback 사용 X),
+#   "valhalla_calls": 0,
+#   "kakao_calls": 0,
+#   "routes_checked": 시도한 루프 개수,
+#   "routes_validated": 실제로 계산된 루프 개수,
+#   "km_requested": 요청 km,
+#   "target_m": 목표 거리(m),
+#   "time_s": 전체 실행 시간,
+#   "message": 상태 메시지 문자열
+# }
+
+from __future__ import annotations
+
 import math
-import os
+import random
 import time
-import logging
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Tuple, Dict, Any, Optional
+import heapq
 
 import requests
 
-logger = logging.getLogger("route_algo")
-logger.setLevel(logging.INFO)
+EARTH_RADIUS_M = 6371000.0
 
 # -----------------------------
-# 기본 설정 (강화)
-# -----------------------------
-
-VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002/route")
-VALHALLA_TIMEOUT = float(os.environ.get("VALHALLA_TIMEOUT", "2.5"))
-VALHALLA_MAX_RETRY = int(os.environ.get("VALHALLA_MAX_RETRY", "2")) 
-
-# KAKAO API 관련 변수 및 URL 삭제
-
-RUNNING_SPEED_KMH = 8.0  
-GLOBAL_TIMEOUT_S = 10.0 
-MAX_TOTAL_CALLS = 30 
-MAX_LENGTH_ERROR_M = 99.0
-MAX_BEST_ROUTES_TO_TEST = 5 
-MAX_ROUTES_TO_PROCESS = 10 
-
-# -----------------------------
-# 거리 / 기하 유틸
+# 기본 지오메트리 유틸
 # -----------------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """두 위경도 사이의 대략적인 거리(m)."""
-    R = 6371000.0
-    p1 = math.radians(lat1); p2 = math.radians(lat2)
-    dphi = p2 - p1; dl = math.radians(lon2 - lon1)
-    a = (math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    """두 위경도 점 사이의 거리(m)."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return EARTH_RADIUS_M * c
+
 
 def polyline_length_m(points: List[Tuple[float, float]]) -> float:
-    if len(points) < 2: return 0.0
+    """폴리라인의 총 길이(m)."""
+    if len(points) < 2:
+        return 0.0
     total = 0.0
     for (lat1, lon1), (lat2, lon2) in zip(points, points[1:]):
         total += haversine_m(lat1, lon1, lat2, lon2)
     return total
 
-def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    p1 = math.radians(lat1); p2 = math.radians(lat2)
-    dl = math.radians(lon2 - lon1)
-    x = math.sin(dl) * math.cos(p2); y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+
+def project_to_local_xy(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """
+    작은 영역(수 km 이내)에서 lat/lon을 평면(m 단위)으로 투영.
+    equirectangular projection 사용.
+    """
+    if not points:
+        return []
+    lat0 = math.radians(points[0][0])
+    lon0 = math.radians(points[0][1])
+    out: List[Tuple[float, float]] = []
+    for lat, lon in points:
+        lat_r = math.radians(lat)
+        lon_r = math.radians(lon)
+        x = EARTH_RADIUS_M * (lon_r - lon0) * math.cos(lat0)
+        y = EARTH_RADIUS_M * (lat_r - lat0)
+        out.append((x, y))
+    return out
+
+
+def polygon_area_and_perimeter(points: List[Tuple[float, float]]) -> Tuple[float, float]:
+    """
+    points가 만드는 폐곡선의 면적과 둘레를 근사 계산.
+    시작/끝이 같지 않아도 자동으로 닫아서 계산.
+    """
+    if len(points) < 3:
+        return 0.0, 0.0
+    xy = project_to_local_xy(points)
+    if not xy:
+        return 0.0, 0.0
+    xys = xy + [xy[0]]
+    area = 0.0
+    for (x1, y1), (x2, y2) in zip(xys, xys[1:]):
+        area += x1 * y2 - x2 * y1
+    area = abs(area) / 2.0
+    perim = 0.0
+    for (x1, y1), (x2, y2) in zip(xys, xys[1:]):
+        dx = x2 - x1
+        dy = y2 - y1
+        perim += math.hypot(dx, dy)
+    return area, perim
+
+
+def roundness_index(points: List[Tuple[float, float]]) -> float:
+    """
+    원형에 얼마나 가까운지 지표: 4πA / P² (원 = 1, 선에 가까울수록 0).
+    """
+    area, perim = polygon_area_and_perimeter(points)
+    if perim <= 0.0:
+        return 0.0
+    return 4.0 * math.pi * area / (perim * perim)
+
+
+# -----------------------------
+# Turn 탐지 (음성 안내용)
+# -----------------------------
+
+TURN_ANGLE_THRESHOLD_DEG = 35.0
+UTURN_ANGLE_THRESHOLD_DEG = 150.0
+
+def _segment_bearing_deg(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+    """두 점 사이 방위각 (북 기준, 시계 방향) deg."""
+    lat1, lon1 = map(math.radians, p1)
+    lat2, lon2 = map(math.radians, p2)
+    dl = lon2 - lon1
+    x = math.sin(dl) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dl)
     brng = math.degrees(math.atan2(x, y))
     return (brng + 360.0) % 360.0
 
-def project_point(lat: float, lon: float, distance_m: float, bearing_deg_: float) -> Tuple[float, float]:
-    R = 6371000.0; br = math.radians(bearing_deg_)
-    phi1 = math.radians(lat); lam1 = math.radians(lon)
-    phi2 = math.asin(math.sin(phi1) * math.cos(distance_m / R) + math.cos(phi1) * math.sin(distance_m / R) * math.cos(br))
-    lam2 = lam1 + math.atan2(math.sin(br) * math.sin(distance_m / R) * math.cos(phi1), math.cos(distance_m / R) - math.sin(phi1) * math.sin(phi2))
-    return (math.degrees(phi2), (math.degrees(lam2) + 540.0) % 360.0 - 180.0)
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    """두 방위각 차이 [-180, 180]."""
+    diff = (b - a + 180.0) % 360.0 - 180.0
+    return diff
 
 
-# -----------------------------
-# Valhalla API 호출 (순수 탐색)
-# -----------------------------
-
-def _get_bounding_box_polygon(points: List[Tuple[float, float]], buffer_deg: float = 0.00001) -> Optional[List[Tuple[float, float]]]:
-    """경로 중복 회피용 Bounding Box Polygon을 생성합니다."""
-    if not points: return None
-        
-    min_lat = min(p[0] for p in points); max_lat = max(p[0] for p in points)
-    min_lon = min(p[1] for p in points); max_lon = max(p[1] for p in points)
-    
-    if haversine_m(min_lat, min_lon, max_lat, max_lon) < 20: return None 
-        
-    buf = buffer_deg
-
-    return [
-        (min_lat - buf, min_lon - buf), (max_lat + buf, min_lon - buf),
-        (max_lat + buf, max_lon + buf), (min_lat - buf, max_lon + buf),
-        (min_lat - buf, min_lon - buf),
-    ]
-
-
-def valhalla_route(
-    p1: Tuple[float, float],
-    p2: Tuple[float, float],
-    avoid_polygons: Optional[List[List[Tuple[float, float]]]] = None,
-    is_shrink_attempt: bool = False
-) -> List[Tuple[float, float]]:
-    lat1, lon1 = p1; lat2, lon2 = p2
-    last_error: Optional[Exception] = None
-    
-    costing_options = {
-        "pedestrian": {
-            "avoid_steps": 1.0, 
-            "service_penalty": 1000, 
-            "use_hills": 0.0,
-            "use_ferry": 0.0,
-            "track_type_penalty": 0, # 좁은 길 패널티 제거 (탐색 유연화)
-            "private_road_penalty": 100000, # 사유지 회피 극대화
-            
-            "bicycle_network_preference": 0.5,
-            "sidewalk_preference": 1.0, # 보도 선호도 최대화
-            "alley_preference": -1.0, 
-            "max_road_class": 0.5, # 차도 회피
-            "length_penalty": 0.0 # 긴 경로 탐색 유도 (논문 기반)
-        }
-    }
-    
-    for attempt in range(VALHALLA_MAX_RETRY):
-        try:
-            payload = {
-                "locations": [{"lat": lat1, "lon": lon1, "type": "break"}, {"lat": lat2, "lon": lon2, "type": "break"}],
-                "costing": "pedestrian",
-                "costing_options": costing_options
-            }
-            if avoid_polygons:
-                valhalla_polys = []
-                for poly in avoid_polygons:
-                    valhalla_polys.append([[lon, lat] for lat, lon in poly])
-                
-                payload["avoid_polygons"] = valhalla_polys
-
-            resp = requests.post(VALHALLA_URL, json=payload, timeout=VALHALLA_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            shape = data["trip"]["legs"][0]["shape"]
-            return _decode_polyline(shape)
-        except Exception as e:
-            last_error = e
-            logger.warning("[Valhalla] attempt %d failed for %s -> %s: %s", attempt + 1, p1, p2, e)
-
-    logger.error("[Valhalla] all attempts failed for %s -> %s: %s", p1, p2, last_error)
-    return []
-
-# 카카오 API 관련 함수 제거 (순수 Valhalla 탐색)
-# def kakao_walk_route(...): ...
-
-def _decode_polyline(shape: str) -> List[Tuple[float, float]]:
-    coords: List[Tuple[float, float]] = []; lat = 0; lng = 0; idx = 0; precision = 1e6
-
-    try:
-        while idx < len(shape):
-            shift = 0; result = 0
-            while True:
-                b = ord(shape[idx]) - 63; idx += 1; result |= (b & 0x1F) << shift; shift += 5
-                if b < 0x20: break
-            dlat = ~(result >> 1) if (result & 1) else (result >> 1); lat += dlat
-
-            shift = 0; result = 0
-            while True:
-                b = ord(shape[idx]) - 63; idx += 1; result |= (b & 0x1F) << shift; shift += 5
-                if b < 0x20: break
-            dlng = ~(result >> 1) if (result & 1) else (result >> 1); lng += dlng
-
-            current_lat = lat / precision; current_lng = lng / precision
-            if not (-90.0 <= current_lat <= 90.0 and -180.0 <= current_lng <= 180.0):
-                logger.error(f"[Valhalla Decode] Sanity check failed: ({current_lat}, {current_lng})")
-                return []
-            coords.append((current_lat, current_lng))
-    except IndexError:
-        logger.error("[Valhalla Decode] Unexpected end of polyline string.")
-        return []
-    return coords
-
-
-# -----------------------------
-# 루프 품질 평가 / 최종 길이 조정 로직
-# -----------------------------
-
-def _loop_roundness(points: List[Tuple[float, float]]) -> float:
-    if len(points) < 4: return 0.0
-    xs = [p[1] for p in points]; ys = [p[0] for p in points]
-    cx = sum(xs) / len(xs); cy = sum(ys) / len(ys)
-    dists = [haversine_m(cy, cx, lat, lon) for lat, lon in points]
-    mean_r = sum(dists) / len(dists)
-    if mean_r <= 0: return 0.0
-    var = sum((d - mean_r) ** 2 for d in dists) / len(dists)
-    score = 1.0 / (1.0 + var / (mean_r * mean_r + 1e-6))
-    return max(0.0, min(1.0, score))
-
-def _score_loop(
-    points: List[Tuple[float, float]], target_m: float
-) -> Tuple[float, Dict]:
-    length_m = polyline_length_m(points)
-    if length_m <= 0.0:
-        return float("inf"), {"len": 0.0, "err": target_m, "roundness": 0.0, "score": float("inf")}
-    err = abs(length_m - target_m); roundness = _loop_roundness(points)
-    score = err + (1.0 - roundness) * 0.3 * target_m
-    length_ok = True 
-    return score, {"len": length_m, "err": err, "roundness": roundness, "score": score, "length_ok": length_ok}
-
-def _calculate_overlap_penalty(seg_out: List[Tuple[float, float]], seg_back: List[Tuple[float, float]]) -> float:
+def extract_turns(polyline: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
     """
-    [논문 기반] 복귀 경로(seg_back)가 나가는 경로(seg_out)와 공간적으로 겹치는 정도를 측정하여 페널티를 부과합니다.
+    polyline에서 의미 있는 회전 지점을 추출.
     """
-    if not seg_out or not seg_back: return 0.0
+    turns: List[Dict[str, Any]] = []
+    n = len(polyline)
+    if n < 3:
+        return turns
 
-    overlap_count = 0
-    OVERLAP_THRESHOLD_DEG = 0.0002 # 약 20m 근접성
-    
-    for lat_c, lon_c in seg_back:
-        is_close = False
-        for lat_a, lon_a in seg_out:
-            if abs(lat_c - lat_a) < OVERLAP_THRESHOLD_DEG and abs(lon_c - lon_a) < OVERLAP_THRESHOLD_DEG:
-                is_close = True
-                break
-        if is_close:
-            overlap_count += 1
+    # 누적 거리
+    cum = [0.0]
+    for i in range(1, n):
+        d = haversine_m(*polyline[i - 1], *polyline[i])
+        cum.append(cum[-1] + d)
 
-    seg_back_len = len(seg_back)
-    if seg_back_len > 0 and overlap_count / seg_back_len > 0.1: # 10% 이상 겹치면 페널티
-        overlap_ratio = overlap_count / seg_back_len
-        return overlap_ratio * 1000.0 # 1000m 상당의 페널티 부과 (겹침 회피 강제)
-        
-    return 0.0
+    for i in range(1, n - 1):
+        p_prev = polyline[i - 1]
+        p_curr = polyline[i]
+        p_next = polyline[i + 1]
 
-def _trim_path_to_length(route: List[Tuple[float, float]], target_m: float) -> List[Tuple[float, float]]:
-    """
-    경로가 길 때, 끝 부분을 강제로 잘라 목표 길이(±99m)에 맞춥니다. (최종 Trimming)
-    """
-    current_len = polyline_length_m(route)
-    if current_len <= target_m + MAX_LENGTH_ERROR_M:
-        return route # 이미 목표 이내
+        b1 = _segment_bearing_deg(p_prev, p_curr)
+        b2 = _segment_bearing_deg(p_curr, p_next)
+        diff = _angle_diff_deg(b1, b2)
+        ad = abs(diff)
 
-    required_trim = current_len - target_m
-    
-    trimmed_route = route[:]
-    reversed_route = trimmed_route[::-1]
-    
-    current_dist_removed = 0.0
-    
-    for i in range(len(reversed_route) - 1):
-        p1 = reversed_route[i] 
-        p2 = reversed_route[i+1] 
-        seg_len = haversine_m(p1[0], p1[1], p2[0], p2[1])
-        
-        if current_dist_removed + seg_len >= required_trim:
-            
-            final_index = len(route) - (i + 1)
-            trimmed_route = route[:final_index]
-            
-            if trimmed_route and trimmed_route[-1] != route[0]:
-                trimmed_route.append(route[0]) # Start 지점으로 닫기
-            
-            return trimmed_route
-        
-        current_dist_removed += seg_len
-        
-    return route 
-
-
-# -----------------------------
-# Area Loop 생성 (Two-Segment Hybrid)
-# -----------------------------
-
-def generate_area_loop(
-    lat: float,
-    lng: float,
-    km: float,
-) -> Tuple[List[Tuple[float, float]], Dict]:
-    """목표 거리(km) 근처의 '닫힌 러닝 루프'를 생성한다. (순수 Valhalla 탐색 + 강제 Trimming)"""
-    
-    start_time = time.time()
-    
-    target_m = max(300.0, km * 1000.0) 
-    km_requested = km
-    start = (lat, lng)
-
-    if time.time() - start_time >= GLOBAL_TIMEOUT_S:
-         return [start], {"len": 0.0, "err": target_m, "success": False, "used_fallback": False, "valhalla_calls": 0, "time_s": 0.0, "message": "경로 생성 요청이 시작하자마자 시간 제한(10초)을 초과했습니다."}
-
-    SEGMENT_LEN = target_m / 2.0 
-    R_ideal = target_m / (2.0 * math.pi)
-    
-    # R 제약 완화 (100m까지 낮춰 탐색 공간 최대화)
-    R_MIN = max(100.0, min(R_ideal * 0.3, 200.0))
-    R_SMALL = max(200.0, min(R_ideal * 0.6, 400.0))
-    R_MEDIUM = max(400.0, min(R_ideal * 1.0, 700.0))
-    R_LARGE = max(700.0, min(R_ideal * 1.3, 1100.0))
-    R_XLARGE = max(1100.0, min(R_ideal * 1.6, 1800.0))
-    
-    radii = list(sorted(list(set([R_MIN, R_SMALL, R_MEDIUM, R_LARGE, R_XLARGE]))))
-    bearings = [0, 45, 90, 135, 180, 225, 270, 315] 
-
-    candidate_routes = []
-    valhalla_calls = 0
-    total_routes_checked = 0
-
-    # 1. Valhalla 탐색 (전수 조사)
-    for R in radii:
-        if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
-        if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
-
-        for br in bearings:
-            if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
-            if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
-
-            via_a = project_point(lat, lng, R, br)
-            
-            # 1) Seg A: 출발 → Via A (Out Segment)
-            seg_out = valhalla_route(start, via_a); valhalla_calls += 1
-            if not seg_out or len(seg_out) < 2: continue
-            
-            comback_point = seg_out[-1]
-            
-            # 2. 2차 경로 생성 후보 확보 (Comeback → Start)
-            
-            back_segments = []
-            
-            # 2.1 Valhalla 복귀 경로 (2회 시도)
-            if valhalla_calls + 1 <= MAX_TOTAL_CALLS:
-                seg_back_v = valhalla_route(comback_point, start)
-                valhalla_calls += 1
-                if seg_back_v and len(seg_back_v) >= 2: back_segments.append({"seg": seg_back_v, "source": "Valhalla"})
-            
-            # 2.2 카카오 복귀 경로는 제거됨 (순수 Valhalla)
-            # seg_back_k = kakao_walk_route(comback_point, start)
-            # if seg_back_k and len(seg_back_k) >= 2: back_segments.append({"seg": seg_back_k, "source": "Kakao"})
-
-
-            # 3. 최종 루프 구성 및 페널티 적용
-            for back_seg_data in back_segments:
-                seg_back = back_seg_data["seg"]
-                
-                # 겹침 페널티 계산 (핵심)
-                overlap_penalty = _calculate_overlap_penalty(seg_out, seg_back)
-                
-                if overlap_penalty > 300.0: continue
-
-                total_route = seg_out + seg_back[1:] 
-                if total_route and total_route[0] != start: total_route.insert(0, start)
-                if total_route and total_route[-1] != start: total_route.append(start)
-                temp_pts = [total_route[0]]; [temp_pts.append(p) for p in total_route[1:] if p != temp_pts[-1]]; total_route = temp_pts
-                
-                score_base, local_meta = _score_loop(total_route, target_m)
-                total_score = score_base + overlap_penalty # 최종 점수에 겹침 페널티 부과
-                
-                # [핵심] 안전성 필터 복구 (도보가 아닌 길/골목길을 거름)
-                if _is_path_safe(total_route) and polyline_length_m(total_route) > 0:
-                    candidate_routes.append({
-                        "route": total_route, 
-                        "valhalla_score": total_score, # 페널티가 포함된 점수
-                    })
-                    total_routes_checked += 1
-
-        if valhalla_calls + 2 > MAX_TOTAL_CALLS: break
-
-    # -----------------------------
-    # 4. 모든 후보 경로 후처리 (최종 Trimming)
-    # -----------------------------
-    
-    final_validated_routes = []
-    candidate_routes.sort(key=lambda x: x["valhalla_score"])
-    
-    # [핵심] 정밀도 보정을 위해 카카오 API가 아닌, Trimming 로직만 남김
-    for i, candidate in enumerate(candidate_routes): 
-        
-        if time.time() - start_time >= GLOBAL_TIMEOUT_S: break
-
-        current_route = candidate['route']
-        final_len = polyline_length_m(current_route)
-        
-        # 1. 이미 ±99m 이내인 경우
-        if abs(final_len - target_m) <= MAX_LENGTH_ERROR_M:
-            final_validated_routes.append({"route": current_route, "score": _score_loop(current_route, target_m)[0]})
+        if ad < TURN_ANGLE_THRESHOLD_DEG:
             continue
-            
-        # 2. 길이가 99m 초과하면 강제 Trimming 적용
-        if final_len > target_m + MAX_LENGTH_ERROR_M:
-            
-            trimmed_route = _trim_path_to_length(current_route, target_m)
-            
-            if trimmed_route and abs(polyline_length_m(trimmed_route) - target_m) <= MAX_LENGTH_ERROR_M:
-                final_score = _score_loop(trimmed_route, target_m)[0]
-                final_validated_routes.append({
-                    "route": trimmed_route, 
-                    "score": final_score
-                })
 
-    # -----------------------------
-    # 5. 최종 베스트 경로 선택 (절대 반환 보장)
-    # -----------------------------
-    
-    best_final_route = None
-    
-    if final_validated_routes:
-        final_validated_routes.sort(key=lambda x: x["score"])
-        best_final_route = final_validated_routes[0]["route"]
-        
-    elif candidate_routes:
-        # B. ±99m를 만족하는 경로가 없으면, 모든 원본 후보 중 '가장 인접한' 경로를 선택
-        min_error = float("inf")
-        most_adjacent_route = None
+        if ad >= UTURN_ANGLE_THRESHOLD_DEG:
+            t_type = "uturn"
+        elif diff > 0:
+            t_type = "right"
+        else:
+            t_type = "left"
 
-        for candidate in candidate_routes:
-            length = polyline_length_m(candidate["route"])
-            error = abs(length - target_m)
-            
-            if error < min_error:
-                min_error = error
-                most_adjacent_route = candidate["route"]
-                
-        best_final_route = most_adjacent_route
-    
-    # -----------------------------
-    # 6. 결과 반환 (성공/최인접 경로 반환 보장)
-    # -----------------------------
-    
-    if best_final_route:
-        final_len = polyline_length_m(best_final_route)
-        is_perfect = abs(final_len - target_m) <= MAX_LENGTH_ERROR_M
-        
+        at = cum[i]
+        inst = f"{int(round(at))}m 앞에서 " + (
+            "U턴" if t_type == "uturn" else ("우회전" if t_type == "right" else "좌회전")
+        )
+
+        turns.append(
+            {
+                "type": t_type,
+                "lat": p_curr[0],
+                "lng": p_curr[1],
+                "at_dist_m": at,
+                "instruction": inst,
+            }
+        )
+
+    return turns
+
+
+# -----------------------------
+# OSM 그래프 구축 (Overpass API)
+# -----------------------------
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+# 보행에 사용할 highway 타입
+OSM_HIGHWAY_FILTER = [
+    "footway", "path", "cycleway", "pedestrian", "living_street",
+    "residential", "track", "service", "steps", "unclassified", "tertiary",
+]
+
+
+class OSMGraph:
+    def __init__(self) -> None:
+        self.nodes: Dict[int, Tuple[float, float]] = {}
+        self.adj: Dict[int, List[Tuple[int, float]]] = {}
+
+    def add_node(self, node_id: int, lat: float, lon: float) -> None:
+        if node_id not in self.nodes:
+            self.nodes[node_id] = (lat, lon)
+            self.adj[node_id] = []
+
+    def add_edge(self, u: int, v: int) -> None:
+        if u not in self.nodes or v not in self.nodes:
+            return
+        lat1, lon1 = self.nodes[u]
+        lat2, lon2 = self.nodes[v]
+        w = haversine_m(lat1, lon1, lat2, lon2)
+        if w <= 0:
+            return
+        # 무향 그래프 (양방향 보행 가능 가정)
+        self.adj[u].append((v, w))
+        self.adj[v].append((u, w))
+
+
+def _meters_to_latlon_delta(lat: float, meters: float) -> Tuple[float, float]:
+    """
+    주어진 위도에서 meter를 degree 단위 (dlat, dlon)로 변환.
+    """
+    dlat = meters / 111320.0
+    lat_rad = math.radians(lat)
+    dlon = meters / (111320.0 * max(math.cos(lat_rad), 1e-6))
+    return dlat, dlon
+
+
+def fetch_osm_pedestrian_graph(
+    center_lat: float,
+    center_lon: float,
+    radius_m: float,
+    timeout: float = 60.0,
+) -> OSMGraph:
+    """
+    Overpass API를 사용하여 center 주변 radius_m 이내 보행 네트워크를 그래프로 구축.
+    """
+    dlat, dlon = _meters_to_latlon_delta(center_lat, radius_m)
+    south = center_lat - dlat
+    north = center_lat + dlat
+    west = center_lon - dlon
+    east = center_lon + dlon
+
+    highway_regex = "|".join(OSM_HIGHWAY_FILTER)
+    query = f"""
+    [out:json][timeout:60];
+    (
+      way["highway"~"{highway_regex}"]({south},{west},{north},{east});
+    );
+    (._;>;);
+    out body;
+    """
+
+    resp = requests.post(OVERPASS_URL, data=query.encode("utf-8"), timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+
+    graph = OSMGraph()
+    nodes_tmp: Dict[int, Tuple[float, float]] = {}
+
+    # 노드 임시 저장
+    for el in data.get("elements", []):
+        if el.get("type") == "node":
+            nid = int(el["id"])
+            nodes_tmp[nid] = (el["lat"], el["lon"])
+
+    # way를 순회하며 보행 가능한 highway만 그래프에 추가
+    for el in data.get("elements", []):
+        if el.get("type") != "way":
+            continue
+        tags = el.get("tags", {})
+        hw = tags.get("highway")
+        if not hw or hw not in OSM_HIGHWAY_FILTER:
+            continue
+        node_ids = el.get("nodes", [])
+
+        # nodes 추가
+        for nid in node_ids:
+            if nid in nodes_tmp:
+                lat, lon = nodes_tmp[nid]
+                graph.add_node(nid, lat, lon)
+
+        # 인접 edge 추가
+        for u, v in zip(node_ids, node_ids[1:]):
+            if u in graph.nodes and v in graph.nodes:
+                graph.add_edge(u, v)
+
+    return graph
+
+
+def _nearest_node(graph: OSMGraph, lat: float, lon: float) -> Optional[int]:
+    """
+    (lat, lon)에 가장 가까운 그래프 노드 찾기.
+    """
+    best_id = None
+    best_d = float("inf")
+    for nid, (nlat, nlon) in graph.nodes.items():
+        d = haversine_m(lat, lon, nlat, nlon)
+        if d < best_d:
+            best_d = d
+            best_id = nid
+    return best_id
+
+
+# -----------------------------
+# 최단경로 (Dijkstra)
+# -----------------------------
+
+def shortest_path(
+    graph: OSMGraph,
+    src: int,
+    dst: int,
+    max_dist: Optional[float] = None,
+) -> Optional[List[int]]:
+    """
+    Dijkstra 최단경로.
+    max_dist가 주어지면 그 이상 뻗는 경로는 탐색 중단.
+    """
+    if src == dst:
+        return [src]
+
+    dist: Dict[int, float] = {src: 0.0}
+    prev: Dict[int, Optional[int]] = {src: None}
+    pq: List[Tuple[float, int]] = [(0.0, src)]
+    visited: set[int] = set()
+
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u in visited:
+            continue
+        visited.add(u)
+
+        if max_dist is not None and d > max_dist:
+            continue
+        if u == dst:
+            break
+
+        for v, w in graph.adj.get(u, []):
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(pq, (nd, v))
+
+    if dst not in dist:
+        return None
+
+    # 경로 복원
+    path: List[int] = []
+    cur: Optional[int] = dst
+    while cur is not None:
+        path.append(cur)
+        cur = prev.get(cur)
+    path.reverse()
+    return path
+
+
+def nodes_to_polyline(graph: OSMGraph, path: List[int]) -> List[Tuple[float, float]]:
+    return [graph.nodes[nid] for nid in path]
+
+
+# -----------------------------
+# 품질 지표: self-intersection, edge reuse
+# -----------------------------
+
+def _segments(points: List[Tuple[float, float]]) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    return list(zip(points, points[1:]))
+
+
+def _ccw(a, b, c) -> bool:
+    return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _segment_intersect(p1, p2, p3, p4) -> bool:
+    # 인접/공유 점은 intersection으로 보지 않음
+    if p1 == p3 or p1 == p4 or p2 == p3 or p2 == p4:
+        return False
+    return _ccw(p1, p3, p4) != _ccw(p2, p3, p4) and _ccw(p1, p2, p3) != _ccw(p1, p2, p4)
+
+
+def count_self_intersections(points: List[Tuple[float, float]]) -> int:
+    segs = _segments(points)
+    n = len(segs)
+    cnt = 0
+    for i in range(n):
+        for j in range(i + 2, n):
+            if j == i + 1:
+                continue
+            if _segment_intersect(segs[i][0], segs[i][1], segs[j][0], segs[j][1]):
+                cnt += 1
+    return cnt
+
+
+def edge_reuse_ratio(points: List[Tuple[float, float]]) -> float:
+    segs = _segments(points)
+    if not segs:
+        return 0.0
+    edge_counts: Dict[Tuple[Tuple[float, float], Tuple[float, float]], int] = {}
+    for a, b in segs:
+        key = (a, b) if a <= b else (b, a)
+        edge_counts[key] = edge_counts.get(key, 0) + 1
+    reused = sum(c - 1 for c in edge_counts.values() if c > 1)
+    return reused / float(len(segs))
+
+
+# -----------------------------
+# 루프 후보 생성 (RUNAMIC/Random 스타일)
+# -----------------------------
+
+MIN_RADIUS_M = 150.0
+MAX_RADIUS_M = 1500.0
+MAX_LOOP_CANDIDATES = 40    # 생성해볼 루프 수
+
+
+def _estimate_radius(target_m: float) -> float:
+    """
+    target_m 기준 대략적인 루프 반경 추정 (원 둘레 2πR ≈ target_m).
+    """
+    R = target_m / (2.0 * math.pi)
+    R = max(MIN_RADIUS_M, min(MAX_RADIUS_M, R))
+    return R
+
+
+def select_anchor_candidates(
+    graph: OSMGraph,
+    start_lat: float,
+    start_lon: float,
+    target_m: float,
+    max_candidates: int = 40,
+) -> List[int]:
+    """
+    RUNAMIC/WSRP 스타일 anchor 후보 노드 선택.
+    - start에서 일정 반경(R) 근처에 있는 노드들을 ring에서 뽑음.
+    - 부족하면 전체에서 가까운 순으로 보충.
+    """
+    R = _estimate_radius(target_m)
+    min_r = 0.5 * R
+    max_r = 1.2 * R
+
+    nodes_in_ring: List[Tuple[int, float]] = []
+    for nid, (lat, lon) in graph.nodes.items():
+        d = haversine_m(start_lat, start_lon, lat, lon)
+        if min_r <= d <= max_r:
+            nodes_in_ring.append((nid, d))
+
+    # ring 안 노드가 너무 적으면 전체 중 가까운 노드 사용
+    if len(nodes_in_ring) < 10:
+        tmp: List[Tuple[int, float]] = []
+        for nid, (lat, lon) in graph.nodes.items():
+            d = haversine_m(start_lat, start_lon, lat, lon)
+            tmp.append((nid, d))
+        tmp.sort(key=lambda x: x[1])
+        nodes_in_ring = tmp[:max_candidates]
+
+    random.shuffle(nodes_in_ring)
+    return [nid for nid, _ in nodes_in_ring[:max_candidates]]
+
+
+def _concat_polylines(polys: List[List[Tuple[float, float]]]) -> List[Tuple[float, float]]:
+    """여러 polyline을 이어붙이되, 경계점 중복 제거."""
+    out: List[Tuple[float, float]] = []
+    for poly in polys:
+        if not poly:
+            continue
+        if not out:
+            out.extend(poly)
+        else:
+            if out[-1] == poly[0]:
+                out.extend(poly[1:])
+            else:
+                out.extend(poly)
+    return out
+
+
+# -----------------------------
+# 메인 함수
+# -----------------------------
+
+def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
+    """
+    연구용 Full 버전 루프 생성.
+    - OSM 보행 그래프 + Dijkstra + 랜덤 anchor 사이클
+    - 여러 루프 후보를 만들어 score가 가장 좋은 루프를 반환
+    """
+    start_time = time.time()
+    target_m = float(km) * 1000.0
+
+    # 1. OSM 그래프 로드 (너무 넓지 않게 radius 제한)
+    radius_for_osm = max(800.0, min(3000.0, target_m))
+    try:
+        graph = fetch_osm_pedestrian_graph(lat, lng, radius_for_osm)
+    except Exception as e:
+        elapsed = time.time() - start_time
         meta = {
-            "len": final_len, "err": abs(final_len - target_m), "roundness": _loop_roundness(best_final_route), 
-            "success": is_perfect,
-            "used_fallback": False, 
-            "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2),
-            "message": "최적의 경로가 도출되었습니다." if is_perfect else "요청 오차(±99m)를 초과하지만, 가장 인접한 경로를 반환합니다.",
-            "length_ok": is_perfect,
-            "routes_checked": total_routes_checked,
-            "routes_processed": len(candidate_routes),
-            "routes_validated": len(final_validated_routes)
+            "len": 0.0,
+            "err": float("inf"),
+            "roundness": 0.0,
+            "success": False,
+            "used_fallback": False,
+            "valhalla_calls": 0,
+            "kakao_calls": 0,
+            "routes_checked": 0,
+            "routes_validated": 0,
+            "km_requested": float(km),
+            "target_m": float(target_m),
+            "time_s": float(elapsed),
+            "message": f"OSM 그래프 로드 실패: {e}",
         }
-        
-        return best_final_route, meta
+        return [], meta
 
-    # -----------------------------
-    # 7. 최종 실패 (경로 후보가 0개)
-    # -----------------------------
-    return [start], {
-        "len": 0.0, "err": target_m, "success": False, "used_fallback": False, 
-        "valhalla_calls": valhalla_calls, "time_s": round(time.time() - start_time, 2),
-        "message": f"탐색 결과, 유효한 경로 후보를 찾을 수 없습니다. (Valhalla 통신 불가 또는 지리적 단절)",
-        "routes_checked": total_routes_checked,
+    if not graph.nodes:
+        elapsed = time.time() - start_time
+        meta = {
+            "len": 0.0,
+            "err": float("inf"),
+            "roundness": 0.0,
+            "success": False,
+            "used_fallback": False,
+            "valhalla_calls": 0,
+            "kakao_calls": 0,
+            "routes_checked": 0,
+            "routes_validated": 0,
+            "km_requested": float(km),
+            "target_m": float(target_m),
+            "time_s": float(elapsed),
+            "message": "OSM 보행 네트워크에 노드가 없습니다.",
+        }
+        return [], meta
+
+    start_nid = _nearest_node(graph, lat, lng)
+    if start_nid is None:
+        elapsed = time.time() - start_time
+        meta = {
+            "len": 0.0,
+            "err": float("inf"),
+            "roundness": 0.0,
+            "success": False,
+            "used_fallback": False,
+            "valhalla_calls": 0,
+            "kakao_calls": 0,
+            "routes_checked": 0,
+            "routes_validated": 0,
+            "km_requested": float(km),
+            "target_m": float(target_m),
+            "time_s": float(elapsed),
+            "message": "시작점 근처에 보행 가능한 노드를 찾지 못했습니다.",
+        }
+        return [], meta
+
+    start_lat, start_lon = graph.nodes[start_nid]
+
+    # 2. Anchor 후보 선택
+    anchor_candidates = select_anchor_candidates(graph, start_lat, start_lon, target_m, max_candidates=50)
+    if len(anchor_candidates) < 2:
+        elapsed = time.time() - start_time
+        meta = {
+            "len": 0.0,
+            "err": float("inf"),
+            "roundness": 0.0,
+            "success": False,
+            "used_fallback": False,
+            "valhalla_calls": 0,
+            "kakao_calls": 0,
+            "routes_checked": 0,
+            "routes_validated": 0,
+            "km_requested": float(km),
+            "target_m": float(target_m),
+            "time_s": float(elapsed),
+            "message": "루프 생성을 위한 anchor 후보 노드가 충분하지 않습니다.",
+        }
+        return [], meta
+
+    best_polyline: List[Tuple[float, float]] = []
+    best_score = float("inf")
+    best_err = float("inf")
+    best_roundness = 0.0
+    routes_checked = 0
+    routes_validated = 0
+
+    # 3. 여러 랜덤 루프 후보 생성
+    for _ in range(MAX_LOOP_CANDIDATES):
+        # anchor 개수: 2 또는 3
+        num_anchor = 3 if len(anchor_candidates) >= 3 else 2
+        anchors = random.sample(anchor_candidates, num_anchor)
+        seq = [start_nid] + anchors + [start_nid]
+
+        legs_nodes: List[List[int]] = []
+        failed = False
+        for a, b in zip(seq, seq[1:]):
+            path = shortest_path(graph, a, b)
+            if path is None or len(path) < 2:
+                failed = True
+                break
+            legs_nodes.append(path)
+        if failed:
+            continue
+
+        legs_polys = [nodes_to_polyline(graph, p) for p in legs_nodes]
+        polyline = _concat_polylines(legs_polys)
+        if len(polyline) < 4:
+            continue
+
+        length_m = polyline_length_m(polyline)
+        if length_m <= 0.0:
+            continue
+
+        routes_checked += 1
+        routes_validated += 1
+
+        # 품질 계산
+        err = abs(length_m - target_m)
+        err_norm = err / max(target_m, 1.0)
+        rnd = roundness_index(polyline)
+        self_int = count_self_intersections(polyline)
+        reuse = edge_reuse_ratio(polyline)
+
+        # score: 작을수록 좋은 루프
+        score = (
+            5.0 * err_norm +      # 거리 오차 비중 크게
+            1.5 * (1.0 - rnd) +   # 원형에 더 가깝게
+            1.0 * self_int +      # self-intersection 적게
+            2.0 * reuse           # 같은 edge 재사용 적게
+        )
+
+        if score < best_score:
+            best_score = score
+            best_err = err
+            best_roundness = rnd
+            best_polyline = polyline
+
+    elapsed = time.time() - start_time
+
+    if not best_polyline:
+        meta = {
+            "len": 0.0,
+            "err": float("inf"),
+            "roundness": 0.0,
+            "success": False,
+            "used_fallback": False,
+            "valhalla_calls": 0,
+            "kakao_calls": 0,
+            "routes_checked": int(routes_checked),
+            "routes_validated": int(routes_validated),
+            "km_requested": float(km),
+            "target_m": float(target_m),
+            "time_s": float(elapsed),
+            "message": "그래프 기반 루프 생성에 실패했습니다.",
+        }
+        return [], meta
+
+    success = best_err <= 99.0
+    meta = {
+        "len": float(polyline_length_m(best_polyline)),
+        "err": float(best_err),
+        "roundness": float(best_roundness),
+        "success": bool(success),
+        "used_fallback": False,
+        "valhalla_calls": 0,
+        "kakao_calls": 0,
+        "routes_checked": int(routes_checked),
+        "routes_validated": int(routes_validated),
+        "km_requested": float(km),
+        "target_m": float(target_m),
+        "time_s": float(elapsed),
+        "message": "허용 오차(±99m) 내 루프" if success else "허용 오차(±99m)를 만족하지 못했지만 최선의 루프를 반환합니다.",
     }
+
+    return best_polyline, meta
