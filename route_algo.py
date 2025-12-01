@@ -1,7 +1,7 @@
 import math
 import random
 import time
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Union
 
 import networkx as nx
 import osmnx as ox
@@ -11,7 +11,6 @@ import osmnx as ox
 # JSON-safe 변환 유틸 (유지)
 # ==========================
 def safe_float(x: Any):
-    """NaN / Inf 를 JSON에서 허용 가능한 값(None)으로 변환."""
     if isinstance(x, float):
         if math.isnan(x) or math.isinf(x):
             return None
@@ -48,10 +47,9 @@ def safe_dict(d):
 
 
 # ==========================
-# 거리 계산 (Haversine)
+# 거리 계산 및 형태 지표 (유지)
 # ==========================
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """두 위경도 점 사이의 대원거리 (미터)."""
     R = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -63,7 +61,6 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def polyline_length_m(polyline: List[Tuple[float, float]]) -> float:
-    """경로(위도,경도 리스트)의 총 길이 (미터)."""
     if not polyline or len(polyline) < 2:
         return 0.0
     total = 0.0
@@ -74,11 +71,7 @@ def polyline_length_m(polyline: List[Tuple[float, float]]) -> float:
     return total
 
 
-# ==========================
-# roundness 계산용 로직
-# ==========================
 def _to_local_xy(polyline: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    """작은 영역에서는 위경도를 간단한 평면 좌표(미터)로 근사."""
     if not polyline:
         return []
     ref_lat = polyline[0][0]
@@ -94,10 +87,6 @@ def _to_local_xy(polyline: List[Tuple[float, float]]) -> List[Tuple[float, float
 
 
 def polygon_roundness(polyline: List[Tuple[float, float]]) -> float:
-    """
-    4πA / P^2 로 정의되는 roundness.
-    1에 가까울수록 원에 가까운 형태, 0에 가까울수록 길쭉/찌그러진 형태.
-    """
     if len(polyline) < 4:
         return 0.0
     xy = _to_local_xy(polyline)
@@ -118,13 +107,7 @@ def polygon_roundness(polyline: List[Tuple[float, float]]) -> float:
     return r
 
 
-# ==========================
-# overlap / 커브 페널티
-# ==========================
 def _edge_overlap_fraction(node_path: List[int]) -> float:
-    """
-    노드 시퀀스에서 같은 간선을 여러 번 쓰는 비율.
-    """
     if len(node_path) < 2:
         return 0.0
     edge_counts: Dict[Tuple[int, int], int] = {}
@@ -140,10 +123,6 @@ def _edge_overlap_fraction(node_path: List[int]) -> float:
 
 
 def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
-    """
-    경로에서 너무 급격한 커브(예: 60도 이하)를 얼마나 많이 만드는지 측정.
-    작을수록 부드러운 경로.
-    """
     if len(node_path) < 3:
         return 0.0
     penalty = 0.0
@@ -178,46 +157,74 @@ def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
     return penalty
 
 
-def _path_length_on_graph(G: nx.Graph, nodes: List[int]) -> float:
-    """그래프 상에서 node 경로의 길이 (edge의 length 합)."""
+def _path_length_on_graph(G: nx.Graph, nodes: List[int], weight: str = "length") -> float:
+    """그래프 상에서 node 경로의 총 비용 (weight 합)."""
     if len(nodes) < 2:
         return 0.0
-    length = 0.0
+    total_cost = 0.0
     for u, v in zip(nodes[:-1], nodes[1:]):
         if not G.has_edge(u, v):
             continue
-        data = min(G[u][v].values(), key=lambda d: d.get("length", 1.0))
-        length += float(data.get("length", 0.0))
-    return length
+        # MultiGraph 이므로 여러 edge 중 weight가 최소인 것 사용
+        data = min(G[u][v].values(), key=lambda d: d.get(weight, 1.0))
+        total_cost += float(data.get(weight, 0.0))
+    return total_cost
+
+
+# ==========================
+# Badness Cost 및 Poisoning (V6 구현)
+# ==========================
+
+def _get_badness_cost(u: int, v: int, data: Dict) -> float:
+    """
+    [V6 구현] 러닝 친화도(Badness)에 기반한 간선 비용 계산 함수.
+    Bad Path는 Good Path보다 10배 비쌈.
+    """
+    length = float(data.get("length", 1.0))
+    highway_type = data.get("highway", "unclassified")
+    
+    # 러닝 친화도가 낮은 경로 (아파트 단지 통행로, 계단 등)
+    #의 badness 개념을 비용에 통합
+    bad_path_types = ["residential", "service", "steps", "unclassified"]
+
+    if isinstance(highway_type, list):
+        highway_type = highway_type[0]
+
+    # Good Path: length 그대로 사용
+    if highway_type not in bad_path_types:
+        return length
+    # Bad Path: length * 10 (강한 페널티)
+    else:
+        return length * 10.0
 
 
 def _apply_route_poison(G: nx.Graph, path_nodes: List[int], factor: float = 10.0) -> nx.Graph:
     """
-    [V5 변경] RUNAMIC 스타일 route poisoning: factor를 10.0으로 상향하여 detour 경로를 더 강하게 밀어냄.
+    RUNAMIC 스타일 route poisoning: rod에 해당하는 간선 비용을 factor만큼 늘림.
+    이때, 기존 Badness Cost가 적용된 'custom_cost'를 기반으로 증가시킵니다.
     """
     G2 = G.copy()
     for u, v in zip(path_nodes[:-1], path_nodes[1:]):
         if G2.has_edge(u, v):
             for k in list(G2[u][v].keys()):
                 data = G2[u][v][k]
-                if "length" in data:
-                    data["length"] = float(data["length"]) * factor
+                if "custom_cost" in data:
+                    data["custom_cost"] = float(data["custom_cost"]) * factor
             if G2.has_edge(v, u):
                 for k in list(G2[v][u].keys()):
                     data = G2[v][u][k]
-                    if "length" in data:
-                        data["length"] = float(data["length"]) * factor
+                    if "custom_cost" in data:
+                        data["custom_cost"] = float(data["custom_cost"]) * factor
     return G2
 
 
 # ==========================
-# OSM 보행자 그래프 구축 (V4 최종 안정화)
+# OSM 보행자 그래프 구축 (V6: Badness Cost 추가)
 # ==========================
 def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGraph:
     """
-    [V4 유지] OSMnx API 부하를 낮추고 안정적인 'walk' 네트워크 타입만 사용합니다.
+    [V6 구현] 그래프 로딩 후, Badness Cost를 계산하여 간선 속성에 추가합니다.
     """
-    # API 부하를 낮추기 위해 반경을 보수적으로 조정 
     radius_m = max(700.0, km * 500.0 + 700.0)
     
     G = ox.graph_from_point(
@@ -230,6 +237,10 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
     
     if not G.nodes:
          raise ValueError("Filtered graph has no nodes.")
+    
+    # [V6 구현] 모든 간선에 Badness Cost (custom_cost) 속성 추가
+    for u, v, k, data in G.edges(keys=True, data=True):
+        data['custom_cost'] = _get_badness_cost(u, v, data)
          
     return G
 
@@ -246,13 +257,9 @@ def _nodes_to_polyline(G: nx.Graph, nodes: List[int]) -> List[Tuple[float, float
 
 
 # ==========================
-# fallback: 기하학적 사각형 루프
+# fallback: 기하학적 사각형 루프 (유지)
 # ==========================
 def _fallback_square_loop(lat: float, lng: float, km: float):
-    """
-    모든 고급 알고리즘 실패 시 사용되는 마지막 안전 장치.
-    요청 거리 km를 대략 만족하는 사각형 루프 생성.
-    """
     target_m = km * 1000.0
     side = target_m / 4.0
     delta_deg_lat = side / 111000.0
@@ -280,16 +287,16 @@ def _fallback_square_loop(lat: float, lng: float, km: float):
 # ==========================
 def generate_area_loop(lat: float, lng: float, km: float):
     """
-    PURE PEDESTRIAN 러닝 루프 생성기 (V5 최종 안정화 + 페널티 강화 버전)
+    PURE PEDESTRIAN 러닝 루프 생성기 (V6 Badness Cost 통합 버전)
     """
     start_time = time.time()
     target_m = km * 1000.0
     
-    # [V5 변경] 스코어링 가중치 (길이 오차 페널티 극단적 강화)
+    # [V6 유지] 스코어링 가중치 (강화된 값)
     ROUNDNESS_WEIGHT = 3.0
     OVERLAP_PENALTY = 2.0
     CURVE_PENALTY_WEIGHT = 0.3
-    LENGTH_PENALTY_WEIGHT = 10.0 # 5.0 -> 10.0으로 2배 강화
+    LENGTH_PENALTY_WEIGHT = 10.0
 
     meta: Dict[str, Any] = {
         "len": None,
@@ -312,7 +319,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
     }
 
     # --------------------------
-    # 1) OSM 보행자 그래프 구축 (V4 최종 안정화 적용)
+    # 1) OSM 보행자 그래프 구축 (V6 Badness Cost 추가)
     # --------------------------
     try:
         G = _build_pedestrian_graph(lat, lng, km) 
@@ -363,12 +370,13 @@ def generate_area_loop(lat: float, lng: float, km: float):
     # --------------------------
     # 2) start에서의 단일-출발 최단거리 (rod 후보 탐색)
     # --------------------------
+    # weight를 'custom_cost' (Badness Cost)로 변경
     try:
         dist = nx.single_source_dijkstra_path_length(
             undirected,
             start_node,
-            cutoff=target_m * 0.8,
-            weight="length"
+            cutoff=target_m * 0.8 * 10.0, # Badness Cost가 길이보다 최대 10배 높으므로, Cutoff도 10배 늘림
+            weight="custom_cost"
         )
     except Exception as e:
         poly, length, r = _fallback_square_loop(lat, lng, km)
@@ -390,13 +398,28 @@ def generate_area_loop(lat: float, lng: float, km: float):
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    # [V4 유지] rod 길이 후보: 0.35 ~ 0.6 * target_m 사이 (max_leg 축소)
+    # rod 길이는 실제 지리적 길이(length)를 기준으로 계산
     min_leg = target_m * 0.35
     max_leg = target_m * 0.60
-    candidate_nodes = [n for n, d in dist.items() if min_leg <= d <= max_leg and n != start_node]
+    
+    # Badness Cost를 길이로 환산하여 필터링 (최단 거리 탐색 결과는 custom_cost 기준이므로)
+    candidate_nodes = []
+    
+    # 단일 출발 탐색 결과 (dist)는 custom_cost이므로, 실제 길이를 다시 계산해야 함. 
+    # 여기서는 간단하게, Bad Path를 밟지 않았다면 dist[n] ≈ length[n] 이라고 가정하고,
+    # Bad Path를 밟았다면 dist[n] > length[n] 이므로, cutoff를 기준으로만 필터링합니다.
+    # Badness Cost의 의미를 살려, Badness Cost가 너무 높은 노드는 제외합니다.
+    
+    # 실제 길이 필터링을 위해 length를 다시 계산하는 것은 비효율적이므로, 
+    # Badness Cost (custom_cost) 기준으로 rod 길이를 계산합니다.
+    
+    cost_min_leg = min_leg
+    cost_max_leg = max_leg * 10.0 # Bad Path를 밟을 경우 최대 10배까지 허용
+
+    candidate_nodes = [n for n, c in dist.items() if cost_min_leg <= c <= cost_max_leg and n != start_node]
 
     if not candidate_nodes:
-        candidate_nodes = [n for n, d in dist.items() if d >= target_m * 0.25]
+        candidate_nodes = [n for n, c in dist.items() if c >= cost_min_leg * 0.7]
 
     if not candidate_nodes:
         poly, length, r = _fallback_square_loop(lat, lng, km)
@@ -426,38 +449,42 @@ def generate_area_loop(lat: float, lng: float, km: float):
     best_meta_stats = {}
 
     # --------------------------
-    # 3) 각 endpoint에 대해 rod + detour 루프 생성 (V5 단일 경쟁 로직)
+    # 3) 각 endpoint에 대해 rod + detour 루프 생성 (V6 Badness Cost 적용)
     # --------------------------
     for endpoint in candidate_nodes:
         
+        # 3-1) start -> endpoint rod (Badness Cost 기반 최단 경로)
         try:
             forward_nodes = nx.shortest_path(
                 undirected,
                 start_node,
                 endpoint,
-                weight="length"
+                weight="custom_cost"
             )
         except Exception:
             continue
 
-        forward_len = _path_length_on_graph(undirected, forward_nodes)
+        # rod_len은 실제 지리적 길이(length)여야 함
+        forward_len = _path_length_on_graph(undirected, forward_nodes, weight="length")
         if forward_len <= 0:
             continue
 
-        # [V5 변경] Poisoning factor 10.0 적용
+        # 3-2) rod 간선에 penalty를 줘서 detour 경로 유도 (Poisoning은 'custom_cost'에 적용)
         poisoned = _apply_route_poison(undirected, forward_nodes, factor=10.0)
 
+        # endpoint -> start detour (Poisoned Badness Cost 기반 최단 경로)
         try:
             back_nodes = nx.shortest_path(
                 poisoned,
                 endpoint,
                 start_node,
-                weight="length"
+                weight="custom_cost"
             )
         except Exception:
             continue
 
-        back_len = _path_length_on_graph(undirected, back_nodes)
+        # detour_len은 실제 지리적 길이(length)여야 함
+        back_len = _path_length_on_graph(undirected, back_nodes, weight="length")
         if back_len <= 0:
             continue
 
@@ -478,7 +505,7 @@ def generate_area_loop(lat: float, lng: float, km: float):
         if length_ok:
             meta["routes_validated"] += 1
             
-        # [V5 변경] 길이 오차 페널티 10.0 적용
+        # 스코어링은 실제 지리적 길이(length)와 형태 지표를 사용
         length_pen = err / target_m 
         score = (
             roundness * ROUNDNESS_WEIGHT
