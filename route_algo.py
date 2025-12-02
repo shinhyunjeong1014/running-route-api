@@ -9,7 +9,7 @@ import networkx as nx
 
 try:
     import osmnx as ox
-except Exception:
+except Exception:  # 배포 환경에서 import 실패 대비
     ox = None
 
 LatLng = Tuple[float, float]
@@ -21,6 +21,9 @@ Polyline = List[LatLng]
 # ============================================================
 
 def haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """
+    위도/경도 두 점 사이의 거리를 미터 단위로 계산.
+    """
     R = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -32,6 +35,10 @@ def haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 
 def polyline_length_m(polyline: Polyline) -> float:
+    """
+    polyline의 총 길이(미터).
+    app.py에서 불러 사용하는 함수이므로 반드시 유지.
+    """
     if not polyline or len(polyline) < 2:
         return 0.0
     length = 0.0
@@ -64,6 +71,9 @@ def safe_dict(d: Any) -> Dict:
 # ------------------------------------------------------------
 
 def _to_local_xy(lat: float, lng: float, center_lat: float, center_lng: float) -> Tuple[float, float]:
+    """
+    위경도를 중심점 기준 로컬 x,y로 변환 (m 단위 근사).
+    """
     dx = haversine(center_lat, center_lng, center_lat, lng)
     dy = haversine(center_lat, center_lng, lat, center_lng)
     if lng < center_lng:
@@ -74,6 +84,10 @@ def _to_local_xy(lat: float, lng: float, center_lat: float, center_lng: float) -
 
 
 def polygon_roundness(poly: Polyline) -> float:
+    """
+    다각형의 '둥근 정도'를 0~1 사이 값으로 근사.
+    1에 가까울수록 타원/원에 가깝고, 0에 가까우면 가늘고 긴 형태.
+    """
     if len(poly) < 3:
         return 0.0
 
@@ -101,24 +115,30 @@ def polygon_roundness(poly: Polyline) -> float:
 
     var = sum((r - r_mean) ** 2 for r in rs) / len(rs)
     std = math.sqrt(var)
+    # 표준편차가 작을수록 원에 가까우므로 roundness를 높게
     roundness = max(0.0, 1.0 - std / (r_mean + 1e-6))
     return float(roundness)
 
 
 def _edge_overlap_fraction(poly: Polyline) -> float:
+    """
+    경로 겹침 정도(0~1). 재방문하는 구간이 많을수록 값 증가.
+    """
     if len(poly) < 3:
         return 0.0
 
+    # 선분 단위로 좌표를 양자화해서 겹침을 세는 방식
     seen = {}
     total = 0
     overlap = 0
 
     def quantize(x: float) -> int:
-        return int(round(x * 10))
+        return int(round(x * 10))  # 0.1m 정도 단위
 
     for (lat1, lng1), (lat2, lng2) in zip(poly[:-1], poly[1:]):
+        # 짧은 선분을 여러 작은 조각으로 나누어 샘플링
         seg_len = haversine(lat1, lng1, lat2, lng2)
-        steps = max(1, int(seg_len / 3.0))
+        steps = max(1, int(seg_len / 3.0))  # 3m 간격 정도로 샘플링
         for i in range(steps + 1):
             t = i / max(1, steps)
             lat = lat1 + (lat2 - lat1) * t
@@ -136,11 +156,16 @@ def _edge_overlap_fraction(poly: Polyline) -> float:
 
 
 def _curve_penalty(poly: Polyline) -> float:
+    """
+    급격한 커브(꺾이는 각도)에 대한 패널티.
+    값이 클수록 '꺾이는' 지점이 많다는 뜻.
+    """
     if len(poly) < 3:
         return 0.0
 
     penalty = 0.0
     for (lat0, lng0), (lat1, lng1), (lat2, lng2) in zip(poly[:-2], poly[1:-1], poly[2:]):
+        # 벡터 v1 = p1 - p0, v2 = p2 - p1
         x0, y0 = _to_local_xy(lat0, lng0, lat1, lng1)
         x2, y2 = _to_local_xy(lat2, lng2, lat1, lng1)
         dot = x0 * x2 + y0 * y2
@@ -150,6 +175,7 @@ def _curve_penalty(poly: Polyline) -> float:
             continue
         cos_theta = max(-1.0, min(1.0, dot / (norm1 * norm2)))
         angle = math.degrees(math.acos(cos_theta))
+        # 180º 직진일수록 패널티 0, 90º 꺾이면 패널티↑
         penalty += max(0.0, (180.0 - angle) / 90.0)
 
     return float(penalty / (len(poly) - 2))
@@ -165,103 +191,80 @@ def _graph_path_length(G: nx.Graph, path: List[int]) -> float:
     length = 0.0
     for u, v in zip(path[:-1], path[1:]):
         data = G[u][v]
+        # MultiGraph인 경우: key -> attr dict
         if hasattr(data, "values"):
             edge_datas = list(data.values())
             if edge_datas and isinstance(edge_datas[0], dict):
                 best = min(edge_datas, key=lambda x: x.get("length", 1.0))
                 length += float(best.get("length", 0.0))
             else:
+                # 단일 dict인 경우
                 length += float(data.get("length", 0.0))
         else:
+            # 혹시라도 dict가 아닌 타입이면 길이 0으로 취급
             length += 0.0
     return float(length)
 
 
-def _apply_route_poison(G: nx.MultiDiGraph, path_nodes: List[int], factor: float = 10.0) -> nx.MultiDiGraph:
-    """
-    [V4-C 유지] Poisoning factor를 10.0으로 설정.
-    """
-    G2 = G.copy()
-    for u, v in zip(path_nodes[:-1], path_nodes[1:]):
-        if G2.has_edge(u, v):
-            for k in list(G2[u][v].keys()):
-                data = G2[u][v][k]
-                if "length" in data:
-                    data["length"] = float(data["length"]) * factor
-            if G2.has_edge(v, u):
-                for k in list(G2[v][u].keys()):
-                    data = G2[v][u][k]
-                    if "length" in data:
-                        data["length"] = float(data["length"]) * factor
-    return G2
+# ============================================================
+# 2. Fallback 사각형 루프 (요청 거리 근사)
+# ============================================================
 
-# [V4-C 추가] Route Smoothing (Equidistant Rule 응용)
-def _smooth_polyline_equidistant(poly: Polyline, num_points: int = 100) -> Polyline:
+def _fallback_square_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, float, float]:
     """
-   의 Equidistant Rule을 응용하여
-    전체 경로 길이를 num_points 간격으로 샘플링하여 시각적 부드러움을 높임.
+    네트워크 기반 루프를 만들지 못했을 때 사용하는 기하학적 사각형 루프.
+    중심은 요청 좌표, 한 변 길이는 대략 요청 거리의 1/4~1/3.
     """
-    total_length = polyline_length_m(poly)
-    if total_length == 0 or len(poly) < 3:
-        return poly
-    
-    if num_points <= 2:
-        return poly
-        
-    step_length = total_length / (num_points - 1)
-    
-    smoothed_poly = [poly[0]]
-    current_length = 0.0
-    target_length = step_length
-    
-    idx = 0
-    while len(smoothed_poly) < num_points and idx < len(poly) - 1:
-        (lat1, lng1) = poly[idx]
-        (lat2, lng2) = poly[idx + 1]
-        segment_length = haversine(lat1, lng1, lat2, lng2)
-        
-        while current_length + segment_length >= target_length and len(smoothed_poly) < num_points:
-            remaining_segment_length = target_length - current_length
-            ratio = remaining_segment_length / segment_length
-            
-            new_lat = lat1 + (lat2 - lat1) * ratio
-            new_lng = lng1 + (lng2 - lng1) * ratio
-            smoothed_poly.append((new_lat, new_lng))
-            
-            target_length += step_length
-        
-        current_length += segment_length
-        idx += 1
-        
-    # 마지막 점이 포함되지 않았을 경우 추가
-    if not smoothed_poly or smoothed_poly[-1] != poly[-1]:
-        smoothed_poly.append(poly[-1])
-        
-    return smoothed_poly
+    target_m = km * 1000.0
+    side_m = target_m / 4.0  # 4변 합치면 대략 target_m
+
+    # 대략적인 위도/경도 변환 (대략적인 값)
+    delta_deg_lat = side_m / 111_000.0
+    delta_deg_lng = side_m / (111_000.0 * math.cos(math.radians(lat)) + 1e-6)
+
+    a = (lat + delta_deg_lat, lng)
+    b = (lat, lng + delta_deg_lng)
+    c = (lat - delta_deg_lat, lng)
+    d = (lat, lng - delta_deg_lng)
+    poly = [a, b, c, d, a]
+
+    # 중심 재보정
+    center_lat = (a[0] + c[0]) / 2.0
+    center_lng = (b[1] + d[1]) / 2.0
+    poly = [(p[0] - center_lat + lat, p[1] - center_lng + lng) for p in poly]
+
+    poly = [(float(x), float(y)) for x, y in poly]
+    length = polyline_length_m(poly)
+    r = polygon_roundness(poly)
+    return poly, length, r
 
 
 # ============================================================
-# 3. OSMnx 보행자 그래프 구성 (V3-C 유지)
+# 3. OSMnx 보행자 그래프 구성
 # ============================================================
 
 def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGraph:
     """
-    [V3-C 유지] 아파트 단지 진입 및 부적합 경로를 차단하는 엄격한 필터 적용.
+    [Option B] OSMnx 'walk' 네트워크에 추가 보행자 전용 필터를 적용.
+    자동차 전용 도로(motorway, trunk 등)는 제외하고,
+    보행 가능한 도로 유형만 남긴다.
     """
     if ox is None:
         raise RuntimeError("osmnx가 설치되어 있지 않습니다.")
 
+    # API 부하를 줄이면서도 충분한 범위를 덮도록 반경 설정
     radius_m = max(700.0, km * 500.0 + 700.0)
 
-    # 보행자 전용 및 친화 경로만 포함 (residential, service, steps, motorway 등 제외)
-    custom_filter = ('["highway"~"footway|path|pedestrian|track|cycleway|sidewalk"]') + \
-                    '["access"!~"private"]'
+    # 보행자 친화 도로 타입만 포함하는 커스텀 필터
+    custom_filter = (
+        '["highway"~"footway|path|sidewalk|cycleway|steps|pedestrian|track|service|residential|living_street|unclassified|tertiary|secondary|alley"]'
+    )
 
     G = ox.graph_from_point(
         (lat, lng),
         dist=radius_m,
+        network_type="walk",
         custom_filter=custom_filter,
-        network_type="all_private",
         simplify=True,
         retain_all=False,
     )
@@ -286,52 +289,22 @@ def _nodes_to_polyline(G: nx.MultiDiGraph, nodes: List[int]) -> Polyline:
 
 
 # ============================================================
-# 4. Fallback 사각형 루프 (유지)
-# ============================================================
-
-def _fallback_square_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, float, float]:
-    """
-    네트워크 기반 루프를 만들지 못했을 때 사용하는 기하학적 사각형 루프.
-    """
-    target_m = km * 1000.0
-    side_m = target_m / 4.0
-
-    delta_deg_lat = side_m / 111_000.0
-    delta_deg_lng = side_m / (111_000.0 * math.cos(math.radians(lat)) + 1e-6)
-
-    a = (lat + delta_deg_lat, lng)
-    b = (lat, lng + delta_deg_lng)
-    c = (lat - delta_deg_lat, lng)
-    d = (lat, lng - delta_deg_lng)
-    poly = [a, b, c, d, a]
-
-    center_lat = (a[0] + c[0]) / 2.0
-    center_lng = (b[1] + d[1]) / 2.0
-    poly = [(p[0] - center_lat + lat, p[1] - center_lng + lng) for p in poly]
-
-    poly = [(float(x), float(y)) for x, y in poly]
-    length = polyline_length_m(poly)
-    r = polygon_roundness(poly)
-    return poly, length, r
-
-
-# ============================================================
-# 5. 메인 루프 생성 함수
+# 4. 메인 루프 생성 함수
 # ============================================================
 
 def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
     """
-    V4-C (PSP 형태의 Rod 선정 + Detour 제약 완화 + Smoothing)
+    요청 좌표(lat, lng)와 목표 거리(km)를 기반으로
+    보행자용 러닝 루프를 생성한다.
+
+    Option B 특징:
+      - OSMnx walk + custom_filter 기반 보행자 그래프 사용
+      - rod 기반 왕복 + detour 조합으로 루프 구성
+      - 길이 오차 ±5% 이내만 length_ok=True 로 인정
+      - 최종 polyline 앞/뒤에 요청 start 좌표를 앵커링
     """
     start_time = time.time()
     target_m = km * 1000.0
-
-    # 스코어링 가중치 (Overlap Penalty 극단적 강화)
-    ROUNDNESS_WEIGHT = 3.0
-    OVERLAP_PENALTY = 20.0
-    CURVE_PENALTY_WEIGHT = 2.0 # Curve Penalty 강화
-    LENGTH_PENALTY_WEIGHT = 10.0
-    LENGTH_TOL_FRAC = 0.05  # 허용거리 오차 비율 (±5%)
 
     meta: Dict[str, Any] = {
         "len": 0.0,
@@ -353,12 +326,20 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         "message": "",
     }
 
+    # 스코어링 가중치
+    ROUNDNESS_WEIGHT = 1.2
+    OVERLAP_PENALTY = 2.0
+    CURVE_PENALTY_WEIGHT = 0.3
+    LENGTH_PENALTY_WEIGHT = 10.0  # 5.0 -> 10.0으로 2배 강화
+    LENGTH_TOL_FRAC = 0.05        # 허용거리 오차 비율 (±5%)
+
     # --------------------------------------------------------
     # 1) 보행자 그래프 로딩
     # --------------------------------------------------------
     try:
         G = _build_pedestrian_graph(lat, lng, km)
     except Exception as e:
+        # 그래프 생성에 실패하면 바로 fallback 사각형 루프
         poly, length, r = _fallback_square_loop(lat, lng, km)
         err = abs(length - target_m)
         meta.update(
@@ -376,10 +357,11 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    UG: nx.MultiDiGraph = G
+    # undirected 그래프 (길이 계산에 사용)
+    UG: nx.Graph = G.to_undirected()
 
     # --------------------------------------------------------
-    # 2) 시작 노드 스냅 및 Rod 후보 탐색
+    # 2) 시작 노드 스냅
     # --------------------------------------------------------
     try:
         start_node = ox.distance.nearest_nodes(G, lng, lat)
@@ -401,21 +383,28 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
+    # --------------------------------------------------------
+    # 3) rod 기반 endpoint 후보 탐색
+    #   - 목표: start_node에서 일정 거리 떨어진 노드를 rod 끝점으로 선택
+    # --------------------------------------------------------
+    rod_target = target_m / 2.0  # 왕복 기준 rod 길이 목표
+    rod_min = rod_target * 0.6
+    rod_max = rod_target * 1.4
+
+    # start_node를 기준으로 모든 노드에 대한 최단거리(길이) 계산
     try:
         lengths = nx.single_source_dijkstra_path_length(UG, start_node, weight="length")
     except Exception:
         lengths = {}
 
-    # [V4-C 변경] Rod 후보 넓은 범위 허용 (PSP 원칙)
-    min_leg = target_m * 0.30  # 30%까지 허용
-    max_leg = target_m * 0.70  # 70%까지 허용
-
+    # rod 후보 노드들 (목표 거리 근처)
     candidate_nodes: List[int] = []
     for nid, dist_m in lengths.items():
-        if min_leg <= dist_m <= max_leg and dist_m >= 0.0 and nid != start_node:
+        if rod_min <= dist_m <= rod_max:
             candidate_nodes.append(nid)
 
     if not candidate_nodes:
+        # rod 후보가 하나도 없으면 fallback 사각형
         poly, length, r = _fallback_square_loop(lat, lng, km)
         err = abs(length - target_m)
         meta.update(
@@ -428,13 +417,13 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             success=False,
             length_ok=(err <= target_m * LENGTH_TOL_FRAC),
             used_fallback=True,
-            message="적절한 rod endpoint 후보를 찾지 못해 기하학적 사각형 루프를 사용했습니다.",
+            message="rod endpoint 후보를 찾지 못해 기하학적 사각형 루프를 사용했습니다.",
         )
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
     # --------------------------------------------------------
-    # 3) 각 endpoint 후보에 대해 루프 구성 및 스코어링
+    # 4) 각 endpoint 후보에 대해 루프 구성 및 스코어링
     # --------------------------------------------------------
     best_score = -1e9
     best_poly: Optional[Polyline] = None
@@ -448,29 +437,29 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         "length_ok": False,
     }
 
+    # 후보 개수가 많을 때는 최대 250개 정도만 샘플링
     random.shuffle(candidate_nodes)
     candidate_nodes = candidate_nodes[:250]
 
     for endpoint in candidate_nodes:
         meta["routes_checked"] += 1
         try:
-            # 3-1. Rod (Start -> End)
+            # start -> endpoint 로 가는 rod
             path_out: List[int] = nx.shortest_path(UG, start_node, endpoint, weight="length")
             dist_out = _graph_path_length(UG, path_out)
 
-            # 3-2. Detour를 위한 Poisoning 적용
-            poisoned_G = _apply_route_poison(UG, path_out, factor=10.0) 
-
-            # 3-3. Detour (End -> Start)
-            path_back: List[int] = nx.shortest_path(poisoned_G, endpoint, start_node, weight="length")
+            # endpoint -> start 로 돌아오는 path (보통 같은 길이지만, 그래프 특성상 다를 수도 있음)
+            path_back: List[int] = nx.shortest_path(UG, endpoint, start_node, weight="length")
             dist_back = _graph_path_length(UG, path_back)
 
-            # 3-4. Detour 길이 제약
-            if dist_back < dist_out * 0.9 or dist_back > dist_out * 1.1:
+            # 왕복 rod 경로
+            full_nodes = path_out + path_back[1:]  # start 중복 제거
+            rod_len = dist_out + dist_back
+
+            # 길이가 너무 짧거나 너무 긴 경우는 버림
+            if rod_len < target_m * 0.4 or rod_len > target_m * 1.6:
                 continue
 
-            # 3-5. 왕복 루프 구성 및 검증
-            full_nodes = path_out + path_back[1:]
             poly = _nodes_to_polyline(G, full_nodes)
 
             L = polyline_length_m(poly)
@@ -493,7 +482,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
 
             is_length_ok = err <= target_m * LENGTH_TOL_FRAC
 
-            # 최종 점수 경쟁
+            # 우선 길이 오차가 작은 것 + 점수 높은 것 우선
             if score > best_score:
                 best_score = score
                 best_poly = poly
@@ -512,42 +501,35 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             continue
 
     # --------------------------------------------------------
-    # 4) 최종 유효성 검사 및 Fallback
+    # 5) 후보 루프가 하나도 없으면 fallback 사각형
     # --------------------------------------------------------
-    if best_poly is None or not best_meta_stats.get("length_ok", False):
+    if best_poly is None:
         poly, length, r = _fallback_square_loop(lat, lng, km)
         err = abs(length - target_m)
-        final_length_ok = err <= target_m * LENGTH_TOL_FRAC
-        
-        meta_fallback = {
-            "len": length,
-            "err": err,
-            "roundness": r,
-            "overlap": 0.0,
-            "curve_penalty": 0.0,
-            "score": r,
-            "success": final_length_ok,
-            "length_ok": final_length_ok,
-            "used_fallback": True,
-            "message": f"요청 거리 ({km}km)의 ±5% 내에 적합한 OSM 경로를 찾지 못하여 Fallback 루프를 사용했습니다."
-        }
-        
-        meta.update(meta_fallback)
+        meta.update(
+            len=length,
+            err=err,
+            roundness=r,
+            overlap=0.0,
+            curve_penalty=0.0,
+            score=r,
+            success=False,
+            length_ok=(err <= target_m * LENGTH_TOL_FRAC),
+            used_fallback=True,
+            routes_checked=meta["routes_checked"],
+            routes_validated=meta["routes_validated"],
+            message="논문 기반 OSM 루프 생성에 실패하여 기하학적 사각형 루프를 사용했습니다.",
+        )
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-
     # --------------------------------------------------------
-    # 5) 최종 meta 구성 + 시작 좌표 앵커링 및 Smoothing
+    # 6) 최종 meta 구성 + 시작 좌표 앵커링
     # --------------------------------------------------------
     used_fallback = False
-    success = best_meta_stats["length_ok"]
 
+    # 시작 좌표(요청 파라미터)를 polyline의 처음/끝에 앵커링
     if best_poly:
-        # [V4-C 추가] Smoothing 적용: 100개 포인트를 샘플링하여 시각적 부드러움 확보
-        best_poly = _smooth_polyline_equidistant(best_poly, num_points=100)
-        
-        # 시작/끝 좌표 앵커링 (V1-A 로직 유지)
         first_lat, first_lng = best_poly[0]
         if haversine(lat, lng, first_lat, first_lng) > 1.0:
             best_poly.insert(0, (lat, lng))
@@ -555,7 +537,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         last_lat, last_lng = best_poly[-1]
         if haversine(lat, lng, last_lat, last_lng) > 1.0:
             best_poly.append((lat, lng))
-            
+
+        # 앵커링 후 길이/오차를 다시 계산
         length_m2 = polyline_length_m(best_poly)
         err2 = abs(length_m2 - target_m)
         length_ok2 = err2 <= target_m * LENGTH_TOL_FRAC
@@ -563,8 +546,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         best_meta_stats["len"] = length_m2
         best_meta_stats["err"] = err2
         best_meta_stats["length_ok"] = length_ok2
-        success = length_ok2
 
+    success = best_meta_stats["length_ok"]
 
     meta.update(best_meta_stats)
     meta.update(
@@ -580,4 +563,6 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     )
     meta["time_s"] = time.time() - start_time
 
-    return safe_list(best_poly), safe_dict(meta)
+    safe_meta = safe_dict(meta)
+    safe_poly = safe_list(best_poly)
+    return safe_poly, safe_meta
