@@ -17,7 +17,7 @@ Polyline = List[LatLng]
 
 
 # ============================================================
-# 1. 기본 유틸 함수들 (유지)
+# 1. 기본 유틸 함수들
 # ============================================================
 
 def haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -150,7 +150,7 @@ def _curve_penalty(poly: Polyline) -> float:
             continue
         cos_theta = max(-1.0, min(1.0, dot / (norm1 * norm2)))
         angle = math.degrees(math.acos(cos_theta))
-        penalty += max(0.0, (180.0 - angle) / 90.0) # 패널티 가중치 1.0 적용됨
+        penalty += max(0.0, (180.0 - angle) / 90.0)
 
     return float(penalty / (len(poly) - 2))
 
@@ -177,22 +177,76 @@ def _graph_path_length(G: nx.Graph, path: List[int]) -> float:
     return float(length)
 
 
-def _apply_route_poison(G: nx.MultiDiGraph, path_nodes: List[int], factor: float = 1.0) -> nx.MultiDiGraph:
+def _apply_route_poison(G: nx.MultiDiGraph, path_nodes: List[int], factor: float = 10.0) -> nx.MultiDiGraph:
     """
-    [V5-C 변경] Poisoning 제거 (factor=1.0) - 단순 복사 기능으로만 사용.
+    [V4-C 유지] Poisoning factor를 10.0으로 설정.
     """
     G2 = G.copy()
-    # Poisoning 로직은 제거 (factor=1.0)
+    for u, v in zip(path_nodes[:-1], path_nodes[1:]):
+        if G2.has_edge(u, v):
+            for k in list(G2[u][v].keys()):
+                data = G2[u][v][k]
+                if "length" in data:
+                    data["length"] = float(data["length"]) * factor
+            if G2.has_edge(v, u):
+                for k in list(G2[v][u].keys()):
+                    data = G2[v][u][k]
+                    if "length" in data:
+                        data["length"] = float(data["length"]) * factor
     return G2
+
+# [V4-C 추가] Route Smoothing (Equidistant Rule 응용)
+def _smooth_polyline_equidistant(poly: Polyline, num_points: int = 100) -> Polyline:
+    """
+   의 Equidistant Rule을 응용하여
+    전체 경로 길이를 num_points 간격으로 샘플링하여 시각적 부드러움을 높임.
+    """
+    total_length = polyline_length_m(poly)
+    if total_length == 0 or len(poly) < 3:
+        return poly
+    
+    if num_points <= 2:
+        return poly
+        
+    step_length = total_length / (num_points - 1)
+    
+    smoothed_poly = [poly[0]]
+    current_length = 0.0
+    target_length = step_length
+    
+    idx = 0
+    while len(smoothed_poly) < num_points and idx < len(poly) - 1:
+        (lat1, lng1) = poly[idx]
+        (lat2, lng2) = poly[idx + 1]
+        segment_length = haversine(lat1, lng1, lat2, lng2)
+        
+        while current_length + segment_length >= target_length and len(smoothed_poly) < num_points:
+            remaining_segment_length = target_length - current_length
+            ratio = remaining_segment_length / segment_length
+            
+            new_lat = lat1 + (lat2 - lat1) * ratio
+            new_lng = lng1 + (lng2 - lng1) * ratio
+            smoothed_poly.append((new_lat, new_lng))
+            
+            target_length += step_length
+        
+        current_length += segment_length
+        idx += 1
+        
+    # 마지막 점이 포함되지 않았을 경우 추가
+    if not smoothed_poly or smoothed_poly[-1] != poly[-1]:
+        smoothed_poly.append(poly[-1])
+        
+    return smoothed_poly
 
 
 # ============================================================
-# 3. OSMnx 보행자 그래프 구성 (V5-C 유지)
+# 3. OSMnx 보행자 그래프 구성 (V3-C 유지)
 # ============================================================
 
 def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGraph:
     """
-    [V5-C 유지] 아파트 단지 진입 및 부적합 경로를 차단하는 엄격한 필터 적용.
+    [V3-C 유지] 아파트 단지 진입 및 부적합 경로를 차단하는 엄격한 필터 적용.
     """
     if ox is None:
         raise RuntimeError("osmnx가 설치되어 있지 않습니다.")
@@ -267,15 +321,15 @@ def _fallback_square_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, 
 
 def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
     """
-    V5-C (Poisoning 제거 및 단순 왕복 경로 복원)
+    V4-C (PSP 형태의 Rod 선정 + Detour 제약 완화 + Smoothing)
     """
     start_time = time.time()
     target_m = km * 1000.0
 
-    # 스코어링 가중치 (Overlap Penalty 대폭 하향, Roundness/Curve 강화)
+    # 스코어링 가중치 (Overlap Penalty 극단적 강화)
     ROUNDNESS_WEIGHT = 3.0
-    OVERLAP_PENALTY = 2.0 # 20.0 -> 2.0으로 복원
-    CURVE_PENALTY_WEIGHT = 2.0 # 0.3 -> 2.0으로 강화
+    OVERLAP_PENALTY = 20.0
+    CURVE_PENALTY_WEIGHT = 2.0 # Curve Penalty 강화
     LENGTH_PENALTY_WEIGHT = 10.0
     LENGTH_TOL_FRAC = 0.05  # 허용거리 오차 비율 (±5%)
 
@@ -352,14 +406,13 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     except Exception:
         lengths = {}
 
-    # Rod 후보 넓은 범위 허용
-    rod_target = target_m / 2.0
-    rod_min = target_m * 0.30
-    rod_max = target_m * 0.70
+    # [V4-C 변경] Rod 후보 넓은 범위 허용 (PSP 원칙)
+    min_leg = target_m * 0.30  # 30%까지 허용
+    max_leg = target_m * 0.70  # 70%까지 허용
 
     candidate_nodes: List[int] = []
     for nid, dist_m in lengths.items():
-        if rod_min <= dist_m <= rod_max:
+        if min_leg <= dist_m <= max_leg and dist_m >= 0.0 and nid != start_node:
             candidate_nodes.append(nid)
 
     if not candidate_nodes:
@@ -405,16 +458,16 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             path_out: List[int] = nx.shortest_path(UG, start_node, endpoint, weight="length")
             dist_out = _graph_path_length(UG, path_out)
 
-            # 3-2. Poisoning 제거 (단순 복사)
-            poisoned_G = _apply_route_poison(UG, path_out, factor=1.0) 
+            # 3-2. Detour를 위한 Poisoning 적용
+            poisoned_G = _apply_route_poison(UG, path_out, factor=10.0) 
 
-            # 3-3. Detour (End -> Start) - 단순 최단 경로 복귀
+            # 3-3. Detour (End -> Start)
             path_back: List[int] = nx.shortest_path(poisoned_G, endpoint, start_node, weight="length")
             dist_back = _graph_path_length(UG, path_back)
 
-            # 3-4. 길이 제약 (Detour가 Rod 길이와 크게 다르지 않아야 함)
-            if dist_back < dist_out * 0.9 or dist_back > dist_out * 1.1: 
-                 continue
+            # 3-4. Detour 길이 제약
+            if dist_back < dist_out * 0.9 or dist_back > dist_out * 1.1:
+                continue
 
             # 3-5. 왕복 루프 구성 및 검증
             full_nodes = path_out + path_back[1:]
@@ -424,7 +477,6 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             if L <= 0.0:
                 continue
 
-            # 3-6. 스코어링
             r = polygon_roundness(poly)
             ov = _edge_overlap_fraction(poly)
             cp = _curve_penalty(poly)
@@ -435,7 +487,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             score = (
                 ROUNDNESS_WEIGHT * r
                 - OVERLAP_PENALTY * ov
-                - CURVE_PENALTY_WEIGHT * cp # Curve Penalty 강화 (x2.0)
+                - CURVE_PENALTY_WEIGHT * cp
                 - LENGTH_PENALTY_WEIGHT * length_pen
             )
 
@@ -486,12 +538,15 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
 
 
     # --------------------------------------------------------
-    # 5) 최종 meta 구성 + 시작 좌표 앵커링
+    # 5) 최종 meta 구성 + 시작 좌표 앵커링 및 Smoothing
     # --------------------------------------------------------
     used_fallback = False
     success = best_meta_stats["length_ok"]
 
     if best_poly:
+        # [V4-C 추가] Smoothing 적용: 100개 포인트를 샘플링하여 시각적 부드러움 확보
+        best_poly = _smooth_polyline_equidistant(best_poly, num_points=100)
+        
         # 시작/끝 좌표 앵커링 (V1-A 로직 유지)
         first_lat, first_lng = best_poly[0]
         if haversine(lat, lng, first_lat, first_lng) > 1.0:
