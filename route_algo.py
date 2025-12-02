@@ -99,13 +99,9 @@ def _build_pedestrian_graph(
     - network_type = 'walk'
     - custom_filter 로 보행/생활도로만 남기고, 자동차 전용/고속도로 등은 제외.
     """
-    # 러닝 거리의 1.5배 ~ 2배 정도를 커버하는 bounding radius (m)
-    # 너무 작으면 후보 경로가 부족, 너무 크면 연산량 폭증
+
     radius_m = max(500, int(km * 800))
 
-    # OSMnx용 custom_filter
-    #  - 포함: footway, path, pedestrian, living_street, residential, service, track, steps, sidewalk, cycleway, alley
-    #  - 제외: motorway, trunk, primary 등 자동차 전용/고속도로
     custom_filter = (
         '["highway"~"footway|path|pedestrian|living_street|residential|service|track|steps|sidewalk|cycleway|alley"]'
         '["area"!~"yes"]["motor_vehicle"!~"no"]["service"!~"parking|driveway|private"]'
@@ -119,10 +115,13 @@ def _build_pedestrian_graph(
         simplify=True,
     )
 
-    # edge length 보정 (없으면 osmnx 쪽에서 이미 length를 계산해주지만, 안전하게 한 번 더)
-    G = ox.add_edge_lengths(G)
-    return G
+    # 최신 osmnx는 add_edge_lengths가 없으므로 distance 모듈 사용
+    try:
+        G = ox.distance.add_edge_lengths(G)
+    except Exception:
+        pass  # 그래프에 이미 length가 있는 경우
 
+    return G
 
 def _nearest_node(G: nx.MultiDiGraph, lat: float, lng: float) -> int:
     """주어진 위경도와 가장 가까운 노드 id."""
@@ -558,3 +557,4 @@ def _square_fallback_loop(
     p4 = (lat, lng + dlng)
 
     return [p1, p2, p3, p4, p1]
+
