@@ -112,7 +112,7 @@ def _snap_to_road(lat: float, lon: float) -> Tuple[float, float]:
         resp = requests.post(
             VALHALLA_LOCATE_URL,
             json={"locations": [{"lat": lat, "lon": lon}]},
-            timeout=1.2
+            timeout=1.5
         )
     except Exception:
         return (lat, lon)
@@ -127,13 +127,28 @@ def _snap_to_road(lat: float, lon: float) -> Tuple[float, float]:
 
     if not isinstance(j, list) or not j:
         return (lat, lon)
-    if "nodes" not in j[0] or not j[0]["nodes"]:
-        return (lat, lon)
 
-    node = j[0]["nodes"][0]
-    snapped = (node["lat"], node["lon"])
-    return snapped
+    obj = j[0]
 
+    # ⭐ edges 기반 스냅 (현재 Valhalla의 기본 반환)
+    edges = obj.get("edges", [])
+    if edges:
+        e = edges[0]
+        return (
+            e.get("correlated_lat", lat),
+            e.get("correlated_lon", lon)
+        )
+
+    # ⭐ nodes 기반 (fallback)
+    nodes = obj.get("nodes", [])
+    if nodes:
+        n = nodes[0]
+        return (
+            n.get("lat", lat),
+            n.get("lon", lon)
+        )
+
+    return (lat, lon)
 
 # -----------------------------------
 # Valhalla /route 요청
