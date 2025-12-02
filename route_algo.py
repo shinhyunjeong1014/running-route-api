@@ -12,131 +12,79 @@ try:
 except Exception:
     ox = None
 
-# ─────────────────────────────────────────
-# 🔥 Redzone (아파트/주거지) 회피용: shapely + STRtree(R-tree)
-# ─────────────────────────────────────────
-try:
-    from shapely.geometry import Polygon, Point
-    try:
-        from shapely.strtree import STRtree
-    except Exception:
-        STRtree = None  # shapely 버전에 따라 없을 수 있음
-except Exception:
-    Polygon = None
-    Point = None
-    STRtree = None
-
+# -----------------------------
+# 🔥 Redzone + R-tree (STRtree)
+# -----------------------------
+from shapely.geometry import Polygon, Point
+from shapely.strtree import STRtree
 import json
 
 LatLng = Tuple[float, float]
 Polyline = List[LatLng]
 
 
-# ============================================================
-# 0) Red Zone Loader + R-tree 인덱스
-# ============================================================
-
-REDZONE_POLYGONS: List[Any] = []
-REDZONE_INDEX: Optional[Any] = None  # STRtree or None
-
-
-def _init_redzones(path: str = "redzones.geojson") -> None:
-    """
-    Overpass로 생성한 redzones.geojson을 읽어
-    Polygon 목록과 STRtree(R-tree) 인덱스를 준비한다.
-    """
-    global REDZONE_POLYGONS, REDZONE_INDEX
-
-    if Polygon is None:
-        print("[INFO] shapely 설치 안 됨 → redzone 기능 비활성화")
-        REDZONE_POLYGONS = []
-        REDZONE_INDEX = None
-        return
-
+# ==========================================
+# 0) RedZone Loader (polygon + STRtree)
+# ==========================================
+def load_redzones_rtree(path: str = "redzones.geojson"):
+    """geojson 로드 → polygon 목록 + STRtree 공간 인덱스 반환"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"[WARN] redzones.geojson 로딩 실패: {e} → redzone 기능 비활성화")
-        REDZONE_POLYGONS = []
-        REDZONE_INDEX = None
-        return
+        print(f"[WARN] redzones.geojson 로딩 실패: {e}")
+        return [], None
 
-    polys: List[Any] = []
+    polys = []
     for elm in data.get("elements", []):
         geom = elm.get("geometry")
         if not geom:
             continue
-        # Overpass "out geom" 형식: [{"lat":..., "lon":...}, ...]
-        coords = [(g["lon"], g["lat"]) for g in geom]
-        if len(coords) < 3:
-            continue
-        try:
-            polys.append(Polygon(coords))
-        except Exception:
-            continue
+        coords = [(p["lon"], p["lat"]) for p in geom]  # (x, y) = (lon, lat)
+        if len(coords) >= 3:
+            try:
+                polys.append(Polygon(coords))
+            except Exception:
+                continue
 
-    REDZONE_POLYGONS = polys
-    if polys and STRtree is not None:
-        REDZONE_INDEX = STRtree(polys)
-        print(f"[INFO] Redzone polygons: {len(polys)}개, STRtree 인덱스 생성 완료")
-    else:
-        REDZONE_INDEX = None
-        print(f"[INFO] Redzone polygons: {len(polys)}개, STRtree 사용 불가 (shapely 버전/설치 확인 필요)")
+    if not polys:
+        print("[WARN] Redzone polygons 없음")
+        return [], None
+
+    tree = STRtree(polys)
+    print(f"[INFO] Loaded {len(polys)} redzone polygons with STRtree index.")
+    return polys, tree
+
+
+REDZONE_POLYS, REDZONE_TREE = load_redzones_rtree()
 
 
 def is_in_redzone(lat: float, lon: float) -> bool:
-    """
-    주어진 위경도 좌표가 redzone polygon 안에 있으면 True.
-    STRtree(R-tree) 인덱스를 사용해 빠르게 검사한다.
-    """
-    if not REDZONE_POLYGONS or Point is None:
+    """R-tree 로 빠르게 후보 polygon 탐색 후 정확한 검사"""
+    if REDZONE_TREE is None:
         return False
-
-    pt = Point(lon, lat)
-
-    # 인덱스 있으면 후보만 조회
-    if REDZONE_INDEX is not None:
-        candidates = REDZONE_INDEX.query(pt)
-    else:
-        # 최악의 경우: 선형 스캔 (성능 저하 있지만 fallback)
-        candidates = REDZONE_POLYGONS
-
+    pt = Point(lon, lat)  # shapely = (x=lon, y=lat)
+    # 1) R-tree 후보 조회
+    candidates = REDZONE_TREE.query(pt)
+    # 2) 실제 polygon.contains 검사
     for poly in candidates:
-        try:
-            if poly.contains(pt):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def polyline_hits_redzone(poly: Polyline, sample_step: int = 3) -> bool:
-    """
-    polyline이 redzone과 교차하는지 간단히 검사.
-    - 모든 점을 다 검사하지 않고 sample_step 간격으로 샘플링.
-    - 시작점/끝점은 항상 검사.
-    """
-    if not REDZONE_POLYGONS or not poly:
-        return False
-
-    n = len(poly)
-    for i, (lat, lon) in enumerate(poly):
-        if i not in (0, n - 1) and (i % sample_step != 0):
-            continue
-        if is_in_redzone(lat, lon):
+        if poly.contains(pt):
             return True
     return False
 
 
-# 모듈 import 시점에 한 번만 초기화
-_init_redzones()
+def polyline_hits_redzone(poly: Polyline) -> bool:
+    """polyline 전체 중 하나라도 redzone에 있으면 True"""
+    for la, lo in poly:
+        if is_in_redzone(la, lo):
+            return True
+    return False
 
 
-# ============================================================
+# ==========================================
 # JSON-safe 변환
-# ============================================================
-def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+# ==========================================
+def safe_float(x: Any, default=None):
     if isinstance(x, float):
         if math.isinf(x) or math.isnan(x):
             return default
@@ -169,11 +117,9 @@ def safe_dict(d: Any) -> dict:
         else:
             out[k] = safe_float(v, v)
     return out
-
-
-# ============================================================
-# 거리 / 길이
-# ============================================================
+# ==========================================
+# 거리 / 길이 유틸
+# ==========================================
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """두 위경도 사이의 거리 (meter)."""
     R = 6371000.0
@@ -190,6 +136,7 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def polyline_length_m(polyline: Polyline) -> float:
+    """폴리라인 전체 길이(m) 계산."""
     if not polyline or len(polyline) < 2:
         return 0.0
     total = 0.0
@@ -200,9 +147,9 @@ def polyline_length_m(polyline: Polyline) -> float:
     return total
 
 
-# ============================================================
+# ==========================================
 # roundness / overlap / 곡률 페널티
-# ============================================================
+# ==========================================
 def _to_local_xy(polyline: Polyline) -> List[Tuple[float, float]]:
     """위경도를 평면 좌표계로 근사 변환."""
     if not polyline:
@@ -276,6 +223,7 @@ def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
     if len(node_path) < 3:
         return 0.0
 
+    # node -> (lat, lng)
     coords: Dict[int, Tuple[float, float]] = {}
     for n in node_path:
         if n in coords:
@@ -284,8 +232,6 @@ def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
         coords[n] = (float(node.get("y")), float(node.get("x")))
 
     penalty = 0.0
-    R = 6371000.0
-
     for i in range(1, len(node_path) - 1):
         a = node_path[i - 1]
         b = node_path[i]
@@ -293,6 +239,9 @@ def _curve_penalty(node_path: List[int], G: nx.Graph) -> float:
         lat_a, lng_a = coords[a]
         lat_b, lng_b = coords[b]
         lat_c, lng_c = coords[c]
+
+        # 벡터 AB, BC를 평면 상에서 근사
+        R = 6371000.0
 
         def _to_xy(lat, lng, lat0, lng0):
             d_lat = math.radians(lat - lat0)
@@ -329,12 +278,17 @@ def _path_length_on_graph(G: nx.Graph, nodes: List[int]) -> float:
     for u, v in zip(nodes[:-1], nodes[1:]):
         if not G.has_edge(u, v):
             return 0.0
+        # 멀티엣지 중 첫 번째 length 사용
         data = next(iter(G[u][v].values()))
         total += float(data.get("length", 0.0))
     return total
 
 
-def _apply_route_poison(G: nx.MultiGraph, path_nodes: List[int], factor: float = 8.0) -> nx.MultiGraph:
+def _apply_route_poison(
+    G: nx.MultiGraph,
+    path_nodes: List[int],
+    factor: float = 8.0,
+) -> nx.MultiGraph:
     """
     forward 경로의 엣지 length를 늘려서
     되돌아올 때는 가급적 다른 길을 쓰도록 유도.
@@ -356,9 +310,9 @@ def _apply_route_poison(G: nx.MultiGraph, path_nodes: List[int], factor: float =
     return G2
 
 
-# ============================================================
-# OSM 보행자 그래프 구축
-# ============================================================
+# ==========================================
+# OSM 보행자 그래프 구축 / 변환
+# ==========================================
 def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGraph:
     """
     OSMnx 'walk' 네트워크 타입만 사용하여
@@ -367,8 +321,11 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
     if ox is None:
         raise RuntimeError("osmnx가 설치되어 있지 않습니다.")
 
-    # API 부하와 커버리지를 고려한 반경 (meter)
-    radius_m = max(700.0, km * 500.0 + 700.0)
+    # ✅ 거리 짧을수록 반경을 조금 줄여서 효율 확보
+    if km <= 1.8:
+        radius_m = max(500.0, km * 600.0 + 400.0)
+    else:
+        radius_m = max(700.0, km * 500.0 + 700.0)
 
     G = ox.graph_from_point(
         (lat, lng),
@@ -392,9 +349,9 @@ def _nodes_to_polyline(G: nx.MultiDiGraph, nodes: List[int]) -> Polyline:
     return poly
 
 
-# ============================================================
+# ==========================================
 # fallback: 기하학적 사각형 루프
-# ============================================================
+# ==========================================
 def _fallback_square_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, float, float]:
     """
     OSM/그래프를 전혀 쓰지 못할 때 사용하는 매우 단순한 정사각형 루프.
@@ -417,21 +374,314 @@ def _fallback_square_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, 
     length = polyline_length_m(poly)
     r = polygon_roundness(poly)
     return poly, length, r
-
-
 # ============================================================
-# 메인: 러닝 루프 생성기 (레드존 회피 + R-tree)
+# 1.8km 이하 전용 Local Loop Builder
 # ============================================================
+
+def _generate_local_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
+    """
+    1.8km 이하 요청 시 사용하는 '근거리 루프 생성기'.
+    - rod/poisoning 사용 안함
+    - 반경 r 내의 subgraph에서 모든 노드-노드 루프 탐색
+    - roundness / overlap / curve_penalty 기반 최적 루프 선택
+    - redzone 완전 회피
+    """
+
+    start_time = time.time()
+    target_m = max(300.0, km * 1000.0)
+
+    # -----------------------------------------
+    # 스코어링 파라미터
+    # -----------------------------------------
+    ROUNDNESS_WEIGHT = 2.5
+    OVERLAP_PENALTY  = 2.0
+    CURVE_WEIGHT     = 0.3
+    LENGTH_TOL_FRAC  = 0.05   # ±5%
+    HARD_ERR_FRAC    = 0.25   # ±25%는 폐기
+    LEN_PEN_WEIGHT   = 7.0
+
+    meta = dict(
+        len=0, err=0, roundness=0, overlap=0, curve_penalty=0,
+        score=-1e18, success=False, length_ok=False, used_fallback=False,
+        routes_checked=0, routes_validated=0,
+        km_requested=km, target_m=target_m,
+        time_s=0.0, message=""
+    )
+
+    # -----------------------------------------
+    # 1) 보행자 그래프 로딩 (근거리 반경)
+    # -----------------------------------------
+    try:
+        # radius = max(300 m, km*600 + 300)
+        radius_m = max(300.0, km * 600.0 + 300.0)
+        G = ox.graph_from_point(
+            (lat, lng),
+            dist=radius_m,
+            network_type="walk",
+            simplify=True,
+            retain_all=False,
+        )
+    except Exception as e:
+        # fallback
+        poly, length, r = _fallback_square_loop(lat, lng, km)
+        meta.update(
+            len=length, err=abs(length-target_m),
+            roundness=r, overlap=0, curve_penalty=0,
+            score=r, used_fallback=True,
+            message=f"local graph load 실패: {e}"
+        )
+        meta["time_s"] = time.time()-start_time
+        return safe_list(poly), safe_dict(meta)
+
+    if not G.nodes:
+        poly, length, r = _fallback_square_loop(lat, lng, km)
+        meta.update(
+            len=length, err=abs(length-target_m),
+            roundness=r, overlap=0, curve_penalty=0,
+            score=r, used_fallback=True,
+            message="local graph empty"
+        )
+        meta["time_s"] = time.time()-start_time
+        return safe_list(poly), safe_dict(meta)
+
+    # undirected
+    try:
+        UG = ox.utils_graph.get_undirected(G)
+    except Exception:
+        UG = G.to_undirected()
+
+    # start node 찾기
+    try:
+        start_node = ox.distance.nearest_nodes(G, X=lng, Y=lat)
+    except Exception as e:
+        poly, length, r = _fallback_square_loop(lat, lng, km)
+        meta.update(
+            len=length, err=abs(length-target_m),
+            roundness=r, overlap=0, curve_penalty=0,
+            score=r, used_fallback=True,
+            message=f"local start snap 실패: {e}"
+        )
+        meta["time_s"] = time.time()-start_time
+        return safe_list(poly), safe_dict(meta)
+
+    # -----------------------------------------
+    # 2) start에서 Dijkstra로 400~800m 탐색
+    # -----------------------------------------
+    try:
+        dist_map = nx.single_source_dijkstra_path_length(
+            UG, start_node,
+            cutoff=max(300.0, target_m*0.8),
+            weight="length"
+        )
+    except:
+        dist_map = {}
+
+    if not dist_map:
+        poly, length, r = _fallback_square_loop(lat, lng, km)
+        meta.update(
+            len=length, err=abs(length-target_m),
+            roundness=r, overlap=0, curve_penalty=0,
+            score=r, used_fallback=True,
+            message="local dijkstra empty"
+        )
+        meta["time_s"] = time.time()-start_time
+        return safe_list(poly), safe_dict(meta)
+
+    # -----------------------------------------
+    # 3) 루프 endpoint 후보 추출
+    #    목표는: start → u → ... → v → start
+    #    대략 loop length ≈ 1000m ~ 1800m 범위
+    # -----------------------------------------
+    min_forward = target_m * 0.3
+    max_forward = target_m * 1.0
+
+    endpoints = [n for n, d in dist_map.items()
+                 if min_forward <= d <= max_forward]
+
+    # redzone 제거
+    filtered = []
+    for n in endpoints:
+        lat_n = float(UG.nodes[n]["y"])
+        lon_n = float(UG.nodes[n]["x"])
+        if not is_in_redzone(lat_n, lon_n):
+            filtered.append(n)
+    endpoints = filtered
+
+    if len(endpoints) == 0:
+        # fallback
+        poly, length, r = _fallback_square_loop(lat, lng, km)
+        meta.update(
+            len=length, err=abs(length-target_m),
+            roundness=r, overlap=0, curve_penalty=0,
+            score=r, used_fallback=True,
+            message="local endpoints 없음"
+        )
+        meta["time_s"] = time.time()-start_time
+        return safe_list(poly), safe_dict(meta)
+
+    # 너무 많으면 샘플링
+    random.shuffle(endpoints)
+    endpoints = endpoints[:80]
+
+    best_poly = None
+    best_score = -1e18
+    best_stats = {}
+
+    # -----------------------------------------
+    # 4) 모든 endpoint u,v 쌍 탐색
+    # -----------------------------------------
+    for u in endpoints:
+        # 4-1) start→u path
+        try:
+            path1 = nx.shortest_path(UG, start_node, u, weight="length")
+        except:
+            continue
+
+        # redzone check
+        skip = False
+        for n in path1:
+            la_n = float(UG.nodes[n]["y"])
+            lo_n = float(UG.nodes[n]["x"])
+            if is_in_redzone(la_n, lo_n):
+                skip = True
+                break
+        if skip:
+            continue
+
+        path1_len = _path_length_on_graph(UG, path1)
+        if path1_len <= 0:
+            continue
+
+        # u 기준 다시 도달 가능한 endpoint v들
+        for v in endpoints:
+            if u == v:
+                continue
+
+            # u→v
+            try:
+                path2 = nx.shortest_path(UG, u, v, weight="length")
+            except:
+                continue
+
+            # v→start
+            try:
+                path3 = nx.shortest_path(UG, v, start_node, weight="length")
+            except:
+                continue
+
+            full_nodes = path1 + path2[1:] + path3[1:]
+            meta["routes_checked"] += 1
+
+            # polyline 변환
+            poly = _nodes_to_polyline(UG, full_nodes)
+            length_m = polyline_length_m(poly)
+            if length_m <= 0:
+                continue
+
+            # redzone 검사
+            if polyline_hits_redzone(poly):
+                continue
+
+            # 거리 오차 너무 큰 것은 제외
+            err = abs(length_m - target_m)
+            if err > target_m * HARD_ERR_FRAC:
+                continue
+
+            r = polygon_roundness(poly)
+            ov = _edge_overlap_fraction(full_nodes)
+            cp = _curve_penalty(full_nodes, UG)
+
+            length_pen = err / (max(1.0, target_m * LENGTH_TOL_FRAC))
+            score = (
+                ROUNDNESS_WEIGHT*r
+                - OVERLAP_PENALTY*ov
+                - CURVE_WEIGHT*cp
+                - LEN_PEN_WEIGHT*length_pen
+            )
+
+            length_ok = (err <= target_m * LENGTH_TOL_FRAC)
+            if length_ok:
+                meta["routes_validated"] += 1
+
+            if score > best_score:
+                best_score = score
+                best_poly  = poly
+                best_stats = dict(
+                    len=length_m, err=err, roundness=r,
+                    overlap=ov, curve_penalty=cp,
+                    score=score, length_ok=length_ok
+                )
+
+    # -----------------------------------------
+    # 5) fallback
+    # -----------------------------------------
+    if best_poly is None:
+        poly, length, r = _fallback_square_loop(lat, lng, km)
+        best_stats = dict(
+            len=length, err=abs(length-target_m),
+            roundness=r, overlap=0, curve_penalty=0,
+            score=r, length_ok=False
+        )
+        meta.update(best_stats)
+        meta["used_fallback"] = True
+        meta["message"] = "local loop 생성 실패(fallback)"
+        meta["time_s"] = time.time()-start_time
+        return safe_list(poly), safe_dict(meta)
+
+    # -----------------------------------------
+    # 6) 시작점 앵커링
+    # -----------------------------------------
+    first_la, first_lo = best_poly[0]
+    if haversine(lat, lng, first_la, first_lo) > 1.0:
+        best_poly.insert(0, (lat, lng))
+
+    last_la, last_lo = best_poly[-1]
+    if haversine(lat, lng, last_la, last_lo) > 1.0:
+        best_poly.append((lat, lng))
+
+    # 거리 업데이트
+    length2 = polyline_length_m(best_poly)
+    err2 = abs(length2 - target_m)
+    best_stats["len"] = length2
+    best_stats["err"] = err2
+    best_stats["length_ok"] = (err2 <= target_m * LENGTH_TOL_FRAC)
+
+    meta.update(best_stats)
+    meta["success"] = best_stats["length_ok"]
+    meta["message"] = "근거리 최적 루프 생성 완료"
+    meta["time_s"] = time.time() - start_time
+
+    return safe_list(best_poly), safe_dict(meta)
+# ============================================================
+# 메인: 러닝 루프 생성기 (통합 버전)
+# ============================================================
+
 def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
     """
     요청 좌표(lat, lng)와 목표 거리(km)를 기반으로
     '요청거리 정확도'와 '루프 모양'을 동시에 고려한 러닝 루프를 생성한다.
 
-    - OSM walk 그래프 + rod + poisoning 기반
-    - Redzone(아파트/주거지) 회피: endpoint, forward, full polyline에 모두 적용
+    - km <= 1.8  : 근거리 Local Loop Builder (_generate_local_loop)
+    - km >  1.8  : 기존 rod + poisoning 기반 루프 (모양/길이 최적화)
+    - redzones.geojson 에 정의된 아파트 단지 등은 절대 진입하지 않음
     """
     start_time = time.time()
     target_m = max(200.0, km * 1000.0)
+
+    # --------------------------------------------------------
+    # km <= 1.8km : 근거리 전용 알고리즘 사용
+    # --------------------------------------------------------
+    if km <= 1.8:
+        poly, meta = _generate_local_loop(lat, lng, km)
+
+        # poly는 tuple 리스트 그대로, meta만 JSON-safe 처리
+        meta = safe_dict(meta)
+        meta["time_s"] = time.time() - start_time
+        return poly, meta
+
+    # --------------------------------------------------------
+    # km > 1.8km : 기존 rod + poisoning 루프 생성
+    # --------------------------------------------------------
 
     # 스코어링 가중치
     ROUNDNESS_WEIGHT = 2.5
@@ -471,23 +721,6 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     except Exception as e:
         # 그래프 생성 자체가 안 되면 바로 기하학적 사각형 루프 사용
         poly, length, r = _fallback_square_loop(lat, lng, km)
-        # fallback도 레드존 검사
-        if polyline_hits_redzone(poly):
-            meta.update(
-                len=0.0,
-                err=0.0,
-                roundness=0.0,
-                overlap=0.0,
-                curve_penalty=0.0,
-                score=-1e18,
-                success=False,
-                length_ok=False,
-                used_fallback=True,
-                message=f"그래프 생성 실패 + 레드존 충돌로 경로 생성 불가: {e}",
-            )
-            meta["time_s"] = time.time() - start_time
-            return [], safe_dict(meta)
-
         err = abs(length - target_m)
         meta.update(
             len=length,
@@ -502,7 +735,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             message=f"OSM 보행자 그래프 생성 실패로 사각형 루프를 사용했습니다: {e}",
         )
         meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
+        return poly, safe_dict(meta)
 
     # undirected 그래프
     try:
@@ -511,30 +744,43 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         undirected = G.to_undirected()
 
     # --------------------------------------------------------
+    # 1-1) redzone 노드 제거 (아파트 단지 등)
+    # --------------------------------------------------------
+    # 노드 좌표가 redzone 안에 있으면 해당 노드 삭제
+    remove_nodes = []
+    for n, data in list(undirected.nodes(data=True)):
+        la = float(data.get("y"))
+        lo = float(data.get("x"))
+        if is_in_redzone(la, lo):
+            remove_nodes.append(n)
+    if remove_nodes:
+        undirected.remove_nodes_from(remove_nodes)
+
+    if undirected.number_of_nodes() == 0:
+        poly, length, r = _fallback_square_loop(lat, lng, km)
+        err = abs(length - target_m)
+        meta.update(
+            len=length,
+            err=err,
+            roundness=r,
+            overlap=0.0,
+            curve_penalty=0.0,
+            score=r,
+            success=False,
+            length_ok=(err <= target_m * LENGTH_TOL_FRAC),
+            used_fallback=True,
+            message="redzone 필터링 후 사용 가능한 노드가 없어 사각형 루프를 사용했습니다.",
+        )
+        meta["time_s"] = time.time() - start_time
+        return poly, safe_dict(meta)
+
+    # --------------------------------------------------------
     # 2) 시작 노드 스냅
     # --------------------------------------------------------
     try:
-        start_node = ox.distance.nearest_nodes(G, X=lng, Y=lat) if ox is not None else None
-        if start_node is None:
-            raise RuntimeError("nearest_nodes 실패")
+        start_node = ox.distance.nearest_nodes(undirected, X=lng, Y=lat)
     except Exception as e:
         poly, length, r = _fallback_square_loop(lat, lng, km)
-        if polyline_hits_redzone(poly):
-            meta.update(
-                len=0.0,
-                err=0.0,
-                roundness=0.0,
-                overlap=0.0,
-                curve_penalty=0.0,
-                score=-1e18,
-                success=False,
-                length_ok=False,
-                used_fallback=True,
-                message=f"시작 좌표 스냅 실패 + 레드존 충돌로 경로 생성 불가: {e}",
-            )
-            meta["time_s"] = time.time() - start_time
-            return [], safe_dict(meta)
-
         err = abs(length - target_m)
         meta.update(
             len=length,
@@ -549,10 +795,11 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             message=f"시작 좌표를 그래프에 스냅하지 못해 사각형 루프를 사용했습니다: {e}",
         )
         meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
+        return poly, safe_dict(meta)
 
     # --------------------------------------------------------
-    # 3) start에서 단일-출발 최단거리
+    # 3) start에서 단일-출발 최단거리 (rod 후보 탐색)
+    #    - target/2 근처 노드를 rod endpoint 후보로 사용
     # --------------------------------------------------------
     try:
         dist_from_start: Dict[int, float] = nx.single_source_dijkstra_path_length(
@@ -563,22 +810,6 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         )
     except Exception as e:
         poly, length, r = _fallback_square_loop(lat, lng, km)
-        if polyline_hits_redzone(poly):
-            meta.update(
-                len=0.0,
-                err=0.0,
-                roundness=0.0,
-                overlap=0.0,
-                curve_penalty=0.0,
-                score=-1e18,
-                success=False,
-                length_ok=False,
-                used_fallback=True,
-                message=f"그래프 최단거리 탐색 실패 + 레드존 충돌로 경로 생성 불가: {e}",
-            )
-            meta["time_s"] = time.time() - start_time
-            return [], safe_dict(meta)
-
         err = abs(length - target_m)
         meta.update(
             len=length,
@@ -593,57 +824,28 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             message=f"그래프 최단거리 탐색 실패로 사각형 루프를 사용했습니다: {e}",
         )
         meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
+        return poly, safe_dict(meta)
 
     rod_target = target_m / 2.0
     rod_min = rod_target * 0.6   # ≈ 0.3 * target
     rod_max = rod_target * 1.4   # ≈ 0.7 * target
 
-    candidate_nodes: List[int] = []
+    candidate_nodes = [
+        n for n, d in dist_from_start.items()
+        if rod_min <= d <= rod_max and n != start_node
+    ]
 
-    # rod 범위 내 + 레드존이 아닌 노드를 endpoint 후보로 사용
-    for n, d in dist_from_start.items():
-        if n == start_node:
-            continue
-        if rod_min <= d <= rod_max:
-            node = undirected.nodes[n]
-            lat_n = float(node.get("y"))
-            lng_n = float(node.get("x"))
-            if not is_in_redzone(lat_n, lng_n):
-                candidate_nodes.append(n)
-
-    # 후보가 너무 적으면 조건 완화
+    # 후보가 너무 적으면 조건을 조금 완화
     if len(candidate_nodes) < 5:
         lo = target_m * 0.25
         hi = target_m * 0.75
-        for n, d in dist_from_start.items():
-            if n == start_node:
-                continue
-            if lo <= d <= hi:
-                node = undirected.nodes[n]
-                lat_n = float(node.get("y"))
-                lng_n = float(node.get("x"))
-                if not is_in_redzone(lat_n, lng_n):
-                    candidate_nodes.append(n)
+        candidate_nodes = [
+            n for n, d in dist_from_start.items()
+            if lo <= d <= hi and n != start_node
+        ]
 
     if not candidate_nodes:
         poly, length, r = _fallback_square_loop(lat, lng, km)
-        if polyline_hits_redzone(poly):
-            meta.update(
-                len=0.0,
-                err=0.0,
-                roundness=0.0,
-                overlap=0.0,
-                curve_penalty=0.0,
-                score=-1e18,
-                success=False,
-                length_ok=False,
-                used_fallback=True,
-                message="rod endpoint 후보 없음 + 레드존 충돌로 경로 생성 불가",
-            )
-            meta["time_s"] = time.time() - start_time
-            return [], safe_dict(meta)
-
         err = abs(length - target_m)
         meta.update(
             len=length,
@@ -658,7 +860,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             message="적절한 rod endpoint 후보를 찾지 못해 사각형 루프를 사용했습니다.",
         )
         meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
+        return poly, safe_dict(meta)
 
     # 너무 많으면 샘플링
     random.shuffle(candidate_nodes)
@@ -691,11 +893,6 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         if forward_len < target_m * 0.25 or forward_len > target_m * 0.8:
             continue
 
-        # 🔥 forward 경로가 레드존을 지나면 제외
-        forward_poly = _nodes_to_polyline(undirected, forward_nodes)
-        if polyline_hits_redzone(forward_poly):
-            continue
-
         # 4-2. forward poisoning 적용
         poisoned = _apply_route_poison(undirected, forward_nodes, factor=8.0)
 
@@ -723,7 +920,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         if length_m <= 0.0:
             continue
 
-        # 🔥 전체 루프가 레드존을 침범하면 후보 제외
+        # 🔴 redzone을 한 번이라도 지나면 버림
         if polyline_hits_redzone(poly):
             continue
 
@@ -769,24 +966,6 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     # --------------------------------------------------------
     if best_poly is None:
         poly, length, r = _fallback_square_loop(lat, lng, km)
-
-        # fallback도 레드존 검사
-        if polyline_hits_redzone(poly):
-            meta.update(
-                len=0.0,
-                err=0.0,
-                roundness=0.0,
-                overlap=0.0,
-                curve_penalty=0.0,
-                score=-1e18,
-                success=False,
-                length_ok=False,
-                used_fallback=True,
-                message="논문 기반 OSM 루프 + fallback 모두 레드존과 충돌하여 경로 생성 불가",
-            )
-            meta["time_s"] = time.time() - start_time
-            return [], safe_dict(meta)
-
         err = abs(length - target_m)
         meta.update(
             len=length,
@@ -801,7 +980,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             message="논문 기반 OSM 루프 생성에 실패하여 사각형 루프를 사용했습니다.",
         )
         meta["time_s"] = time.time() - start_time
-        return safe_list(poly), safe_dict(meta)
+        return poly, safe_dict(meta)
 
     # --------------------------------------------------------
     # 6) 시작 좌표 앵커링 + 길이/오차 재계산
@@ -843,4 +1022,4 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     )
     meta["time_s"] = time.time() - start_time
 
-    return safe_list(best_poly), safe_dict(meta)
+    return best_poly, safe_dict(meta)
