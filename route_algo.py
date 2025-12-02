@@ -3,8 +3,12 @@ from __future__ import annotations
 import math
 import random
 import time
+import os
+import logging
+import json
 from typing import List, Tuple, Dict, Any, Optional
 
+import requests
 import networkx as nx
 
 try:
@@ -14,11 +18,21 @@ except Exception:
 
 from shapely.geometry import shape, Point
 from shapely.strtree import STRtree
-import json
-import os
 
+# ==========================
+# 공통 타입 정의
+# ==========================
 LatLng = Tuple[float, float]
 Polyline = List[LatLng]
+EARTH_RADIUS_M = 6371000.0
+
+# Valhalla 설정
+VALHALLA_ROUTE_URL = os.getenv("VALHALLA_ROUTE_URL", "http://localhost:8002/route")
+VALHALLA_LOCATE_URL = os.getenv("VALHALLA_LOCATE_URL", "http://localhost:8002/locate")
+DEFAULT_COSTING = "pedestrian"
+
+logger = logging.getLogger("route_algo")
+logger.setLevel(logging.INFO)
 
 
 # ==========================
@@ -61,7 +75,7 @@ def safe_dict(d: Any) -> dict:
 
 
 # ==========================
-# 거리 / 길이 유틸
+# 거리 / 길이 유틸 (공통)
 # ==========================
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """두 위경도 사이의 거리 (meter)."""
@@ -89,8 +103,30 @@ def polyline_length_m(polyline: Polyline) -> float:
     return total
 
 
+def _haversine_m(lat1, lon1, lat2, lon2) -> float:
+    """Valhalla 쪽에서 쓰는 버전 (동일 로직)."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = phi2 - phi1
+    dlam = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * (math.sin(dlam / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return EARTH_RADIUS_M * c
+
+
+def _polyline_length_m_val(poly: List[LatLng]) -> float:
+    """Valhalla 쪽에서 쓰는 length (중복 피하려고 이름만 다르게)."""
+    if len(poly) < 2:
+        return 0.0
+    d = 0.0
+    for i in range(len(poly) - 1):
+        d += _haversine_m(poly[i][0], poly[i][1], poly[i + 1][0], poly[i + 1][1])
+    return d
+
+
 # ==========================
-# roundness / overlap / 곡률 페널티
+# 평면 근사 변환 (공통)
 # ==========================
 def _to_local_xy(polyline: Polyline) -> List[Tuple[float, float]]:
     """위경도를 평면 좌표계로 근사 변환."""
@@ -111,6 +147,9 @@ def _to_local_xy(polyline: Polyline) -> List[Tuple[float, float]]:
     return res
 
 
+# ==========================
+# roundness / overlap / 곡률 페널티
+# ==========================
 def polygon_roundness(polyline: Polyline) -> float:
     """
     isoperimetric quotient 기반 원형도: 4πA / P^2
@@ -304,7 +343,6 @@ def is_in_redzone(lat: float, lon: float) -> bool:
         return False
     pt = Point(lon, lat)  # (x, y) = (lon, lat)
 
-    # R-tree로 후보 좁히기
     if REDZONE_TREE is not None:
         try:
             candidates = REDZONE_TREE.query(pt)
@@ -314,7 +352,6 @@ def is_in_redzone(lat: float, lon: float) -> bool:
         candidates = REDZONE_POLYGONS
 
     for poly in candidates:
-        # 방어적 체크: poly가 Polygon 객체인지 확인
         if hasattr(poly, "contains") and poly.contains(pt):
             return True
     return False
@@ -334,7 +371,6 @@ def polyline_hits_redzone(poly: Polyline) -> bool:
         if is_in_redzone(lat, lon):
             return True
 
-    # 마지막 점도 한 번 더 확인
     lat, lon = poly[-1]
     if is_in_redzone(lat, lon):
         return True
@@ -403,11 +439,11 @@ def _fallback_square_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, 
 
 
 # ============================================================
-# 1.8km 이하 전용 Local Loop Builder
+# 2km 미만 전용 Local Loop Builder (OSMnx 기반)
 # ============================================================
 def _generate_local_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
     """
-    1.8km 이하 요청 시 사용하는 '근거리 루프 생성기'.
+    2km 미만 요청 시 사용하는 '근거리 루프 생성기'.
     - rod/poisoning 사용 안함
     - 반경 r 내의 subgraph에서 모든 노드-노드 루프 탐색
     - roundness / overlap / curve_penalty 기반 최적 루프 선택
@@ -649,328 +685,485 @@ def _generate_local_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, D
 
 
 # ============================================================
-# 메인: 러닝 루프 생성기 (1.8km 이하 / 이상 통합)
+# 2km 이상 Valhalla 기반 루프 + 레드존 회피
+# (기존 pivot 알고리즘을 meta 형태로 래핑)
 # ============================================================
-def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
-    """
-    요청 좌표(lat, lng)와 목표 거리(km)를 기반으로
-    '요청거리 정확도'와 '루프 모양'을 동시에 고려한 러닝 루프를 생성한다.
 
-    - km <= 1.8  : 근거리 Local Loop Builder (_generate_local_loop)
-    - km >  1.8  : rod + poisoning 기반 루프
-    """
+# polyline6 디코딩
+def _decode_polyline6(encoded: str) -> List[LatLng]:
+    if not encoded:
+        return []
+    coords: List[LatLng] = []
+    index = 0
+    lat = 0
+    lng = 0
+    L = len(encoded)
 
+    while index < L:
+        result = 0
+        shift = 0
+        while True:
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += dlat
+
+        result = 0
+        shift = 0
+        while True:
+            b = ord(encoded[index]) - 63
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlng = ~(result >> 1) if (result & 1) else (result >> 1)
+        lng += dlng
+
+        coords.append((lat / 1e6, lng / 1e6))
+
+    return coords
+
+
+# /locate 기반 스냅
+def _snap_to_road(lat: float, lon: float) -> LatLng:
+    try:
+        resp = requests.post(
+            VALHALLA_LOCATE_URL,
+            json={"locations": [{"lat": lat, "lon": lon}]},
+            timeout=1.5,
+        )
+    except Exception:
+        return (lat, lon)
+
+    if not resp.ok:
+        return (lat, lon)
+
+    try:
+        j = resp.json()
+    except Exception:
+        return (lat, lon)
+
+    if not isinstance(j, list) or not j:
+        return (lat, lon)
+
+    obj = j[0]
+
+    edges = obj.get("edges", [])
+    if edges:
+        e = edges[0]
+        return (
+            e.get("correlated_lat", lat),
+            e.get("correlated_lon", lon),
+        )
+
+    nodes = obj.get("nodes", [])
+    if nodes:
+        n = nodes[0]
+        return (
+            n.get("lat", lat),
+            n.get("lon", lon),
+        )
+
+    return (lat, lon)
+
+
+# Valhalla /route 호출
+def _call_valhalla_route(start: LatLng, end: LatLng, costing: str = DEFAULT_COSTING) -> Optional[List[LatLng]]:
+    payload = {
+        "locations": [
+            {"lat": start[0], "lon": start[1]},
+            {"lat": end[0], "lon": end[1]},
+        ],
+        "costing": costing,
+        "directions_options": {"units": "kilometers"},
+    }
+
+    try:
+        resp = requests.post(VALHALLA_ROUTE_URL, json=payload, timeout=8.0)
+    except Exception as e:
+        logger.warning(f"Valhalla request exception: {e}")
+        return None
+
+    if not resp.ok:
+        return None
+
+    try:
+        j = resp.json()
+    except Exception:
+        return None
+
+    trip = j.get("trip")
+    if not trip:
+        return None
+
+    shape_str = trip.get("shape")
+    if isinstance(shape_str, str):
+        poly = _decode_polyline6(shape_str)
+    elif isinstance(shape_str, list):
+        poly = [(p["lat"], p["lon"]) for p in shape_str]
+    else:
+        poly = []
+
+    if not poly:
+        return None
+
+    return poly
+
+
+def _merge_out_and_back(out_poly: List[LatLng], back_poly: List[LatLng]) -> List[LatLng]:
+    if not out_poly:
+        return back_poly[:] if back_poly else []
+    if not back_poly:
+        return out_poly[:]
+    merged = out_poly[:]
+    if merged[-1] == back_poly[0]:
+        merged.extend(back_poly[1:])
+    else:
+        merged.extend(back_poly)
+    return merged
+
+
+# pivot 후보 생성
+def _generate_pivot_candidates(
+    start: LatLng,
+    target_m: float,
+    n_rings: int = 4,
+    n_bearings: int = 16,
+) -> List[LatLng]:
+    lat0, lon0 = start
+    lat0r = math.radians(lat0)
+    base_r = max(target_m * 0.45, 200.0)
+
+    pivots: List[LatLng] = []
+
+    for ring in range(n_rings):
+        radius = base_r * (0.70 + 0.20 * ring)
+        for k in range(n_bearings):
+            theta = 2 * math.pi * (k / n_bearings)
+            dlat = (radius / EARTH_RADIUS_M) * math.cos(theta)
+            dlon = (radius / (EARTH_RADIUS_M * math.cos(lat0r))) * math.sin(theta)
+
+            plat = lat0 + math.degrees(dlat)
+            plon = lon0 + math.degrees(dlon)
+
+            snapped = _snap_to_road(plat, plon)
+
+            # start → pivot 경로가 실제로 존재하는 pivot만 사용
+            test = _call_valhalla_route(start, snapped)
+            if test is None:
+                continue
+
+            pivots.append(snapped)
+
+    return pivots
+
+
+# 루프 품질 점수
+def _compute_shape_jaggedness(poly: List[LatLng]) -> float:
+    if len(poly) < 3:
+        return 0.0
+
+    xy = _to_local_xy(poly)
+    total_angle = 0.0
+    count = 0
+
+    for i in range(1, len(poly) - 1):
+        x0, y0 = xy[i - 1]
+        x1, y1 = xy[i]
+        x2, y2 = xy[i + 1]
+
+        v1 = (x0 - x1, y0 - y1)
+        v2 = (x2 - x1, y2 - y1)
+        n1 = math.hypot(*v1)
+        n2 = math.hypot(*v2)
+
+        if n1 < 1e-6 or n2 < 1e-6:
+            continue
+
+        dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+        dot = max(-1.0, min(1.0, dot))
+        ang = math.degrees(math.acos(dot))
+
+        total_angle += ang
+        count += 1
+
+    if count == 0:
+        return 0.0
+
+    avg = total_angle / count
+    return min(1.0, avg / 180.0)
+
+
+def _score_loop_val(poly: List[LatLng], target_m: float) -> float:
+    if not poly:
+        return -1e9
+
+    length_m = _polyline_length_m_val(poly)
+    dist_err = abs(length_m - target_m) / max(target_m, 1.0)
+    dist_score = 1.0 - min(dist_err, 1.0)
+
+    jag = _compute_shape_jaggedness(poly)
+    shape_score = 1.0 - jag
+
+    return 0.7 * dist_score + 0.3 * shape_score
+
+
+# pivot 기반 루프
+def _build_loop_via_pivot(start: LatLng, pivot: LatLng) -> Optional[List[LatLng]]:
+    outp = _call_valhalla_route(start, pivot)
+    if not outp:
+        return None
+
+    backp = _call_valhalla_route(pivot, start)
+    if not backp:
+        return None
+
+    return _merge_out_and_back(outp, backp)
+
+
+def _search_best_loop(
+    start: LatLng,
+    target_m: float,
+    quality_first: bool = True,
+) -> Optional[List[LatLng]]:
+    n_rings = 4 if quality_first else 2
+    n_bearings = 16 if quality_first else 10
+
+    pivots = _generate_pivot_candidates(start, target_m, n_rings, n_bearings)
+    if not pivots:
+        return None
+
+    best_poly: Optional[List[LatLng]] = None
+    best_score = -1e9
+
+    for pivot in pivots:
+        loop = _build_loop_via_pivot(start, pivot)
+        if not loop:
+            continue
+
+        # 레드존 통과 루프는 버림
+        if polyline_hits_redzone(loop):
+            continue
+
+        score = _score_loop_val(loop, target_m)
+        if score > best_score:
+            best_score = score
+            best_poly = loop
+
+    return best_poly
+
+
+# 단순 out-and-back fallback (Valhalla 버전)
+def _build_simple_out_and_back(start: LatLng, target_m: float) -> Optional[List[LatLng]]:
+    lat0, lon0 = start
+    lat0r = math.radians(lat0)
+
+    base_r = max(target_m * 0.5, 300.0)
+    candidates: List[Tuple[List[LatLng], float]] = []
+    n_bearings = 12
+
+    for k in range(n_bearings):
+        theta = 2 * math.pi * (k / n_bearings)
+        dlat = (base_r / EARTH_RADIUS_M) * math.cos(theta)
+        dlon = (base_r / (EARTH_RADIUS_M * math.cos(lat0r))) * math.sin(theta)
+
+        plat = lat0 + math.degrees(dlat)
+        plon = lon0 + math.degrees(dlon)
+
+        snapped = _snap_to_road(plat, plon)
+        outp = _call_valhalla_route(start, snapped)
+        if not outp:
+            continue
+
+        length_m = _polyline_length_m_val(outp)
+        if length_m < target_m * 0.25:
+            continue
+
+        candidates.append((outp, length_m))
+
+    if not candidates:
+        return None
+
+    best_out, _ = min(
+        candidates,
+        key=lambda t: abs(t[1] - target_m * 0.5),
+    )
+
+    back = list(reversed(best_out[:-1]))
+    loop = best_out + back
+
+    # 레드존 통과하면 무효
+    if polyline_hits_redzone(loop):
+        return None
+
+    return loop
+
+
+# 스파이크 제거
+def _remove_spikes(
+    poly: List[LatLng],
+    angle_thresh_deg: float = 150.0,
+    dist_thresh_m: float = 50.0,
+) -> List[LatLng]:
+    if len(poly) < 5:
+        return poly
+
+    pts = poly[:]
+    changed = True
+
+    while changed:
+        changed = False
+        new_pts: List[LatLng] = [pts[0]]
+
+        for i in range(1, len(pts) - 1):
+            p0 = new_pts[-1]
+            p1 = pts[i]
+            p2 = pts[i + 1]
+
+            a = _haversine_m(p1[0], p1[1], p0[0], p0[1])
+            b = _haversine_m(p1[0], p1[1], p2[0], p2[1])
+
+            if a < 1e-3 or b < 1e-3:
+                new_pts.append(p1)
+                continue
+
+            xy = _to_local_xy([p0, p1, p2])
+            (x0, y0), (x1, y1), (x2, y2) = xy
+            v1 = (x0 - x1, y0 - y1)
+            v2 = (x2 - x1, y2 - y1)
+            n1 = math.hypot(*v1)
+            n2 = math.hypot(*v2)
+
+            if n1 < 1e-6 or n2 < 1e-6:
+                new_pts.append(p1)
+                continue
+
+            dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+            dot = max(-1.0, min(1.0, dot))
+            angle = math.degrees(math.acos(dot))
+
+            if angle > angle_thresh_deg and (a + b) < dist_thresh_m:
+                changed = True
+            else:
+                new_pts.append(p1)
+
+        new_pts.append(pts[-1])
+        pts = new_pts
+
+    return pts
+
+
+def _generate_valhalla_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
+    """
+    2km 이상에서 사용하는 Valhalla 기반 루프 생성기.
+    - pivot 기반 고품질 루프
+    - 실패 시 out-and-back
+    - 레드존 회피
+    """
     start_time = time.time()
-    target_m = max(200.0, km * 1000.0)
-
-    # 1.8km 이하: 근거리 루프 전용
-    if km <= 1.8:
-        poly, meta = _generate_local_loop(lat, lng, km)
-        meta["time_s"] = time.time() - start_time
-        return poly, safe_dict(meta)
-
-    # 1.8km 초과: 기존 알고리즘
-    ROUNDNESS_WEIGHT = 2.5
-    OVERLAP_PENALTY = 2.0
-    CURVE_PENALTY_WEIGHT = 0.3
-
-    LENGTH_TOL_FRAC = 0.05
-    HARD_ERR_FRAC = 0.30
-    LENGTH_PENALTY_WEIGHT = 8.0
+    start = (float(lat), float(lng))
+    target_m = max(float(km), 0.5) * 1000.0
 
     meta: Dict[str, Any] = {
         "len": 0.0,
         "err": 0.0,
         "roundness": 0.0,
-        "overlap": 0.0,
-        "curve_penalty": 0.0,
         "score": -1e18,
         "success": False,
         "length_ok": False,
         "used_fallback": False,
-        "valhalla_calls": 0,
-        "kakao_calls": 0,
-        "routes_checked": 0,
-        "routes_validated": 0,
         "km_requested": km,
         "target_m": target_m,
-        "time_s": 0.0,
+        "routes_checked": 0,
+        "routes_validated": 0,
         "message": "",
+        "time_s": 0.0,
     }
 
-    # 1) 보행자 그래프
-    try:
-        G = _build_pedestrian_graph(lat, lng, km)
-    except Exception as e:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= target_m * LENGTH_TOL_FRAC),
-            used_fallback=True,
-            message=f"OSM 보행자 그래프 생성 실패로 사각형 루프를 사용했습니다: {e}",
-        )
-        meta["time_s"] = time.time() - start_time
-        return poly, safe_dict(meta)
-
-    try:
-        undirected: nx.MultiGraph = ox.utils_graph.get_undirected(G)
-    except Exception:
-        undirected = G.to_undirected()
-
-    # 1-1) redzone 노드 제거
-    remove_nodes = []
-    for n, data in list(undirected.nodes(data=True)):
-        la = float(data.get("y"))
-        lo = float(data.get("x"))
-        if is_in_redzone(la, lo):
-            remove_nodes.append(n)
-    if remove_nodes:
-        undirected.remove_nodes_from(remove_nodes)
-
-    if undirected.number_of_nodes() == 0:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= target_m * LENGTH_TOL_FRAC),
-            used_fallback=True,
-            message="redzone 필터링 후 사용 가능한 노드가 없어 사각형 루프를 사용했습니다.",
-        )
-        meta["time_s"] = time.time() - start_time
-        return poly, safe_dict(meta)
-
-    # 2) start node
-    try:
-        start_node = ox.distance.nearest_nodes(undirected, X=lng, Y=lat)
-    except Exception as e:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= target_m * LENGTH_TOL_FRAC),
-            used_fallback=True,
-            message=f"시작 좌표를 그래프에 스냅하지 못해 사각형 루프를 사용했습니다: {e}",
-        )
-        meta["time_s"] = time.time() - start_time
-        return poly, safe_dict(meta)
-
-    # 3) start에서 rod endpoint 후보 탐색
-    try:
-        dist_from_start: Dict[int, float] = nx.single_source_dijkstra_path_length(
-            undirected,
-            start_node,
-            cutoff=target_m * 0.8,
-            weight="length",
-        )
-    except Exception as e:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= target_m * LENGTH_TOL_FRAC),
-            used_fallback=True,
-            message=f"그래프 최단거리 탐색 실패로 사각형 루프를 사용했습니다: {e}",
-        )
-        meta["time_s"] = time.time() - start_time
-        return poly, safe_dict(meta)
-
-    rod_target = target_m / 2.0
-    rod_min = rod_target * 0.6
-    rod_max = rod_target * 1.4
-
-    candidate_nodes = [
-        n for n, d in dist_from_start.items()
-        if rod_min <= d <= rod_max and n != start_node
-    ]
-
-    if len(candidate_nodes) < 5:
-        lo = target_m * 0.25
-        hi = target_m * 0.75
-        candidate_nodes = [
-            n for n, d in dist_from_start.items()
-            if lo <= d <= hi and n != start_node
-        ]
-
-    if not candidate_nodes:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= target_m * LENGTH_TOL_FRAC),
-            used_fallback=True,
-            message="적절한 rod endpoint 후보를 찾지 못해 사각형 루프를 사용했습니다.",
-        )
-        meta["time_s"] = time.time() - start_time
-        return poly, safe_dict(meta)
-
-    random.shuffle(candidate_nodes)
-    candidate_nodes = candidate_nodes[:120]
-
-    best_score = -1e18
-    best_poly: Optional[Polyline] = None
-    best_stats: Dict[str, Any] = {}
-
-    # 4) forward + poisoned backward 루프 생성
-    for endpoint in candidate_nodes:
-        try:
-            forward_nodes = nx.shortest_path(
-                undirected,
-                start_node,
-                endpoint,
-                weight="length",
+    # 1) pivot 기반 고품질 루프
+    loop = _search_best_loop(start, target_m, quality_first=True)
+    if loop:
+        msg = "고품질 러닝 루프 생성 완료"
+    else:
+        # 2) 실패 시 out-and-back
+        loop = _build_simple_out_and_back(start, target_m)
+        if loop:
+            msg = "안전한 단순 왕복 루프로 루트를 생성했습니다."
+            meta["used_fallback"] = True
+        else:
+            # 최후의 최후 수단: 기하학적 사각형 (레드존 여부 무시할 수밖에 없음)
+            poly, length, r = _fallback_square_loop(lat, lng, km)
+            err = abs(length - target_m)
+            meta.update(
+                len=length,
+                err=err,
+                roundness=r,
+                score=r,
+                success=False,
+                length_ok=False,
+                used_fallback=True,
+                message="Valhalla 루프 생성 실패 (fallback 사각형)",
             )
-        except Exception:
-            continue
+            meta["time_s"] = time.time() - start_time
+            return poly, safe_dict(meta)
 
-        forward_len = _path_length_on_graph(undirected, forward_nodes)
-        if forward_len <= 0.0:
-            continue
+    # 스파이크 제거
+    loop = _remove_spikes(loop)
 
-        if forward_len < target_m * 0.25 or forward_len > target_m * 0.8:
-            continue
+    # 메타데이터 계산
+    length_m = _polyline_length_m_val(loop)
+    err = abs(length_m - target_m)
+    roundness = polygon_roundness(loop)
+    length_ok = err <= target_m * 0.05  # ±5%
 
-        poisoned = _apply_route_poison(undirected, forward_nodes, factor=8.0)
-
-        try:
-            back_nodes = nx.shortest_path(
-                poisoned,
-                endpoint,
-                start_node,
-                weight="length",
-            )
-        except Exception:
-            continue
-
-        back_len = _path_length_on_graph(undirected, back_nodes)
-        if back_len <= 0.0:
-            continue
-
-        full_nodes = forward_nodes + back_nodes[1:]
-        meta["routes_checked"] += 1
-
-        poly = _nodes_to_polyline(undirected, full_nodes)
-        length_m = polyline_length_m(poly)
-        if length_m <= 0.0:
-            continue
-
-        if polyline_hits_redzone(poly):
-            continue
-
-        err = abs(length_m - target_m)
-        if err > target_m * HARD_ERR_FRAC:
-            continue
-
-        r = polygon_roundness(poly)
-        ov = _edge_overlap_fraction(full_nodes)
-        cp = _curve_penalty(full_nodes, undirected)
-
-        length_pen = err / (max(1.0, target_m * LENGTH_TOL_FRAC))
-
-        score = (
-            ROUNDNESS_WEIGHT * r
-            - OVERLAP_PENALTY * ov
-            - CURVE_PENALTY_WEIGHT * cp
-            - LENGTH_PENALTY_WEIGHT * length_pen
-        )
-
-        length_ok = err <= target_m * LENGTH_TOL_FRAC
-        if length_ok:
-            meta["routes_validated"] += 1
-
-        if score > best_score:
-            best_score = score
-            best_poly = poly
-            best_stats = {
-                "len": length_m,
-                "err": err,
-                "roundness": r,
-                "overlap": ov,
-                "curve_penalty": cp,
-                "score": score,
-                "length_ok": length_ok,
-            }
-
-    if best_poly is None:
-        poly, length, r = _fallback_square_loop(lat, lng, km)
-        err = abs(length - target_m)
-        meta.update(
-            len=length,
-            err=err,
-            roundness=r,
-            overlap=0.0,
-            curve_penalty=0.0,
-            score=r,
-            success=False,
-            length_ok=(err <= target_m * LENGTH_TOL_FRAC),
-            used_fallback=True,
-            message="논문 기반 OSM 루프 생성에 실패하여 사각형 루프를 사용했습니다.",
-        )
-        meta["time_s"] = time.time() - start_time
-        return poly, safe_dict(meta)
-
-    # 6) 시작 좌표 앵커링
-    if best_poly:
-        first_lat, first_lng = best_poly[0]
-        if haversine(lat, lng, first_lat, first_lng) > 1.0:
-            best_poly.insert(0, (lat, lng))
-
-        last_lat, last_lng = best_poly[-1]
-        if haversine(lat, lng, last_lat, last_lng) > 1.0:
-            best_poly.append((lat, lng))
-
-        length2 = polyline_length_m(best_poly)
-        err2 = abs(length2 - target_m)
-        length_ok2 = err2 <= target_m * LENGTH_TOL_FRAC
-
-        best_stats["len"] = length2
-        best_stats["err"] = err2
-        best_stats["length_ok"] = length_ok2
-
-    success = bool(best_stats.get("length_ok"))
-
-    meta.update(best_stats)
     meta.update(
-        success=success,
-        used_fallback=False,
-        routes_checked=meta["routes_checked"],
-        routes_validated=meta["routes_validated"],
-        message=(
-            "최적의 정밀 경로가 도출되었습니다."
-            if success
-            else f"요청 오차(±{int(target_m * LENGTH_TOL_FRAC)}m)를 초과하지만, 가장 인접한 러닝 루프를 반환합니다."
-        ),
+        len=length_m,
+        err=err,
+        roundness=roundness,
+        success=bool(length_ok),
+        length_ok=bool(length_ok),
+        message=msg,
     )
     meta["time_s"] = time.time() - start_time
 
-    return best_poly, safe_dict(meta)
+    return loop, safe_dict(meta)
+
+
+# ============================================================
+# 메인: 러닝 루프 생성기 (2km 기준 분리)
+# ============================================================
+def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
+    """
+    요청 좌표(lat, lng)와 목표 거리(km)를 기반으로 러닝 루프를 생성한다.
+
+    - km < 2.0  : OSMnx 기반 근거리 Local Loop + 레드존 회피
+    - km >= 2.0 : Valhalla pivot 기반 루프 + 레드존 회피
+    """
+    if km < 2.0:
+        poly, meta = _generate_local_loop(lat, lng, km)
+    else:
+        poly, meta = _generate_valhalla_loop(lat, lng, km)
+
+    # 시작 좌표가 polyline에 없으면 앵커링 (양쪽 공통)
+    if poly:
+        first_lat, first_lng = poly[0]
+        if haversine(lat, lng, first_lat, first_lng) > 1.0:
+            poly.insert(0, (lat, lng))
+
+        last_lat, last_lng = poly[-1]
+        if haversine(lat, lng, last_lat, last_lng) > 1.0:
+            poly.append((lat, lng))
+
+        # 길이/오차 재계산
+        target_m = meta.get("target_m", max(200.0, km * 1000.0))
+        length2 = polyline_length_m(poly)
+        err2 = abs(length2 - target_m)
+        meta["len"] = length2
+        meta["err"] = err2
+
+    return poly, safe_dict(meta)
