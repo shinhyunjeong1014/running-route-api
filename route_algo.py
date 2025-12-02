@@ -17,7 +17,7 @@ Polyline = List[LatLng]
 
 
 # ============================================================
-# 1. 기본 유틸 함수들 (V2-C 유지)
+# 1. 기본 유틸 함수들 (유지)
 # ============================================================
 
 def haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -197,19 +197,19 @@ def _apply_route_poison(G: nx.MultiDiGraph, path_nodes: List[int], factor: float
 
 
 # ============================================================
-# 3. OSMnx 보행자 그래프 구성 (V2-C 최종 안정화)
+# 3. OSMnx 보행자 그래프 구성 (V3-C 강력 필터링)
 # ============================================================
 
 def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGraph:
     """
-    [V2-C 유지] 아파트 단지 진입 및 부적합 경로를 차단하는 엄격한 필터 적용.
+    [V3-C 유지] 아파트 단지 진입 및 부적합 경로를 차단하는 엄격한 필터 적용.
     """
     if ox is None:
         raise RuntimeError("osmnx가 설치되어 있지 않습니다.")
 
     radius_m = max(700.0, km * 500.0 + 700.0)
 
-    # [V2-C 필터링] 보행자 전용 및 친화 경로만 포함 (residential, service, steps, motorway 등 제외)
+    # [V3-C 필터링] 보행자 전용 및 친화 경로만 포함 (residential, service, steps, motorway 등 제외)
     custom_filter = ('["highway"~"footway|path|pedestrian|track|cycleway|sidewalk"]') + \
                     '["access"!~"private"]'
 
@@ -247,14 +247,14 @@ def _nodes_to_polyline(G: nx.MultiDiGraph, nodes: List[int]) -> Polyline:
 
 def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
     """
-    V2-C (Detour 길이 제어 및 길이 정확도 복원 버전)
+    V3-C (Detour 길이 제어 및 Roundness 가중치 강화 버전)
     """
     start_time = time.time()
     target_m = km * 1000.0
 
-    # 스코어링 가중치 (Overlap Penalty 극단적 강화)
-    ROUNDNESS_WEIGHT = 1.2
-    OVERLAP_PENALTY = 20.0  # Overlap 0.1만 돼도 -2점
+    # 스코어링 가중치 (Roundness 가중치 강화)
+    ROUNDNESS_WEIGHT = 3.0 # 1.2 -> 3.0으로 강화
+    OVERLAP_PENALTY = 20.0  
     CURVE_PENALTY_WEIGHT = 0.3
     LENGTH_PENALTY_WEIGHT = 10.0
     LENGTH_TOL_FRAC = 0.05  # 허용거리 오차 비율 (±5%)
@@ -391,14 +391,15 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             path_back: List[int] = nx.shortest_path(poisoned_G, endpoint, start_node, weight="length")
             dist_back = _graph_path_length(UG, path_back)
 
-            # 3-4. [V2-C 제약] Detour 경로의 길이 제약 및 Overlap/U-turn 방지
+            # 3-4. [V3-C 제약] Detour 경로 길이 제약 (Overlap/U-turn 방지)
+            
             # Detour가 Rod 길이의 90% 미만이면 Overlap이 높다고 판단하여 폐기
             if dist_back < dist_out * 0.9: 
                  continue
             
-            # [V2-C 제약] Detour가 목표 길이의 70%를 넘으면 폐기 (길이 폭발 방지)
-            if dist_back > target_m * 0.7:
-                continue
+            # [V3-C 제약] Rod와 Detour 길이 차이가 10%를 넘으면 (Detour가 너무 길면) Overlap/비효율적 우회로로 판단하여 폐기
+            if dist_back > dist_out * 1.1:
+                 continue
 
             # 3-5. 왕복 루프 구성 및 검증
             full_nodes = path_out + path_back[1:]
@@ -421,8 +422,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             length_pen = err / max(1.0, target_m)
 
             score = (
-                ROUNDNESS_WEIGHT * r
-                - OVERLAP_PENALTY * ov
+                ROUNDNESS_WEIGHT * r # Roundness 가중치 강화 (3.0)
+                - OVERLAP_PENALTY * ov  # Overlap Penalty 극단적 강화 (20.0)
                 - CURVE_PENALTY_WEIGHT * cp
                 - LENGTH_PENALTY_WEIGHT * length_pen
             )
