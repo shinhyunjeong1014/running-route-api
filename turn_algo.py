@@ -11,7 +11,7 @@ logger.setLevel(logging.INFO)
 # 설정값
 # -----------------------------
 ANGLE_UTURN = 150.0        # U턴 기준 각도
-ANGLE_TURN = 20.0          # 턴 감지 기준 각도
+ANGLE_TURN = 45.0          # 턴 감지 기준 각도
 MIN_DIST_TURN = 40.0       # 연속된 턴 사이 최소 거리(m)
 MIN_DIST_SIMPLIFY = 8.0    # polyline 단순화 간격(m)
 
