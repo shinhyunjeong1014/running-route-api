@@ -1,4 +1,4 @@
-<2km 미만 성능 나쁨. 그러나 2km 이상 성능 좋음>
+##<2km 미만 성능 나쁨. 그러나 2km 이상 성능 좋음>
 import math
 import os
 import logging
