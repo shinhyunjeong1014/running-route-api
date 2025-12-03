@@ -1,7 +1,8 @@
 import math
 import logging
 from typing import List, Dict, Tuple, Optional
-import requests
+
+from poi.poi_db import get_nearest_poi  # 로컬 POI DB 조회
 
 logger = logging.getLogger("turn_algo")
 logger.setLevel(logging.INFO)
@@ -10,19 +11,16 @@ logger.setLevel(logging.INFO)
 # 설정값
 # -----------------------------
 ANGLE_UTURN = 150.0        # U턴 기준 각도
-ANGLE_TURN = 20.0          # 턴 감지 기준 각도 (요청: 20도)
+ANGLE_TURN = 20.0          # 턴 감지 기준 각도
 MIN_DIST_TURN = 40.0       # 연속된 턴 사이 최소 거리(m)
 MIN_DIST_SIMPLIFY = 8.0    # polyline 단순화 간격(m)
 
 CHECKPOINT_INTERVAL = 200.0  # 체크포인트 간격(m)
 PRE_ALERT_DIST = 150.0       # 턴 150m 전 예고
 EXEC_ALERT_DIST = 30.0       # 턴 30m 전 실행
-AFTER_TURN_DIST = 10.0       # 턴 후 10m 지점에서 피드백
+AFTER_TURN_DIST = 10.0       # 턴 후 10m 피드백
 
 RUNNING_SPEED_KMH = 8.0
-
-POI_SEARCH_RADIUS_M = 40.0   # POI 검색 반경(m)
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 
 # -----------------------------
@@ -92,7 +90,7 @@ def simplify_polyline(points: List[Tuple[float, float]], min_dist: float) -> Lis
 
 
 # -----------------------------
-# 턴 분류 및 메시지
+# 턴 분류 및 한국어 방향표현
 # -----------------------------
 def _classify_turn(prev_b: float, cur_b: float) -> str:
     """방향 변화량을 바탕으로 좌/우/U턴 분류."""
@@ -149,122 +147,6 @@ def interpolate_point_along_polyline(
 
 
 # -----------------------------
-# POI (랜드마크) 검색 및 이름 축약
-# -----------------------------
-def _shorten_poi_name(name: str) -> str:
-    """
-    OSM name이 너무 길거나 불필요한 단어가 포함된 경우
-    러닝 안내에 적합하도록 자동 축약.
-    """
-    name = name.strip()
-
-    # 특수문자 기준으로 잘라서 앞부분만 사용
-    for sep in [",", "·", "-", "—", "|", "/", "("]:
-        if sep in name:
-            name = name.split(sep)[0].strip()
-
-    tokens = name.split()
-
-    # 불필요 토큰 후보
-    drop_keywords = [
-        "출입구", "입구", "정문", "후문", "지하", "주차장",
-        "점", "호점", "역점"
-    ]
-
-    filtered = []
-    for t in tokens:
-        skip = False
-        for dk in drop_keywords:
-            if dk in t:
-                skip = True
-                break
-        if not skip:
-            filtered.append(t)
-
-    if filtered:
-        name = " ".join(filtered)
-    else:
-        name = tokens[0] if tokens else name
-
-    # 특정 긴 접두어 제거
-    if name.startswith("대한예수교장로회 "):
-        name = name.replace("대한예수교장로회 ", "", 1).strip()
-
-    # 너무 길면 앞 8~10자만 사용
-    if len(name) > 10:
-        name = name[:10].rstrip()
-
-    return name
-
-
-def _fetch_nearby_poi(lat: float, lng: float, radius_m: float = POI_SEARCH_RADIUS_M) -> Optional[str]:
-    """
-    Overpass API를 사용해 (lat,lng) 주변 반경 내 POI를 조회하고
-    가장 가까운 POI의 축약 이름을 반환. 없으면 None.
-    """
-    # 대략적인 위도/경도 거리 변환(근사)
-    # around:radius_m 를 그대로 사용 가능(미터 단위)
-    overpass_query = f"""
-    [out:json];
-    (
-      node(around:{int(radius_m)},{lat},{lng})["name"];
-      way(around:{int(radius_m)},{lat},{lng})["name"];
-    );
-    out center;
-    """
-
-    try:
-        resp = requests.post(OVERPASS_URL, data={"data": overpass_query}, timeout=5)
-        if resp.status_code != 200:
-            logger.warning(f"Overpass API status: {resp.status_code}")
-            return None
-
-        data = resp.json()
-    except Exception as e:
-        logger.warning(f"Overpass API error: {e}")
-        return None
-
-    elements = data.get("elements", [])
-    if not elements:
-        return None
-
-    best_name = None
-    best_dist = float("inf")
-
-    for el in elements:
-        tags = el.get("tags", {})
-        name = tags.get("name")
-        if not name:
-            continue
-
-        # node: lat/lon, way: center.lat/lon
-        if el.get("type") == "node":
-            plat = el.get("lat")
-            plon = el.get("lon")
-        else:
-            center = el.get("center", {})
-            plat = center.get("lat")
-            plon = center.get("lon")
-
-        if plat is None or plon is None:
-            continue
-
-        d = haversine_m(lat, lng, plat, plon)
-        if d < best_dist:
-            best_dist = d
-            best_name = name
-
-    if best_name is None:
-        return None
-
-    # 반경 밖이면 무시
-    if best_dist > radius_m:
-        return None
-
-    return _shorten_poi_name(best_name)
-
-
-# -----------------------------
 # 턴바이턴 + 내비게이션 이벤트 생성
 # -----------------------------
 def build_turn_by_turn(
@@ -274,7 +156,7 @@ def build_turn_by_turn(
     """
     polyline 기준 턴바이턴 + 음성 이벤트 + 요약 생성.
     반환:
-      turns: 내비게이션 이벤트(voice events)
+      events: 내비게이션 이벤트(voice events)
       summary: 길이, 예상시간, 이벤트 개수 등
     """
     if len(polyline) < 2:
@@ -311,7 +193,6 @@ def build_turn_by_turn(
     for i in range(1, len(simp)):
         cur_pt = simp[i]
         seg_d = haversine_m(*last_pt, *cur_pt)
-        start_cum = cum_dist
         cum_dist += seg_d
 
         # 1-1) 체크포인트(200m 간격) 기록(거리만)
@@ -352,11 +233,12 @@ def build_turn_by_turn(
         lat, lng = t["lat"], t["lng"]
         key = (round(lat * 10000), round(lng * 10000))
         if key in poi_cache:
-            poi = poi_cache[key]
+            poi_name = poi_cache[key]
         else:
-            poi = _fetch_nearby_poi(lat, lng)
-            poi_cache[key] = poi
-        t["poi"] = poi
+            poi_info = get_nearest_poi(lat, lng, radius_m=40.0)
+            poi_name = poi_info[0] if poi_info else None
+            poi_cache[key] = poi_name
+        t["poi"] = poi_name
 
     # -------------------------
     # 3) 이벤트(voice events) 생성
@@ -374,7 +256,6 @@ def build_turn_by_turn(
         }
     )
 
-    # 미리 raw_turns를 거리 기준 정렬(이미 순서대로지만 명시적으로)
     raw_turns.sort(key=lambda x: x["dist_m"])
 
     # (1) 체크포인트 이벤트 생성 (200m, 400m, ...)
@@ -396,7 +277,7 @@ def build_turn_by_turn(
             msg = f"지금까지 {int(d)}m 이동했습니다. 코스를 따라 계속 직진하세요."
 
         events.append(
-            {
+                {
                 "type": "checkpoint",
                 "lat": lat,
                 "lng": lng,
@@ -433,10 +314,10 @@ def build_turn_by_turn(
                 }
             )
 
-        # 2-2) Execution (30m 전 → '지금 ~하세요' 느낌)
+        # 2-2) Execution (30m 전 → '이제 ~하세요')
         exec_dist = dist_turn - EXEC_ALERT_DIST
         if exec_dist < 0:
-            exec_dist = dist_turn  # 너무 가까우면 그냥 턴 지점으로
+            exec_dist = dist_turn
         exec_lat, exec_lng = interpolate_point_along_polyline(simp, exec_dist)
 
         if poi:
