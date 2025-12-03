@@ -18,25 +18,28 @@ app.add_middleware(
 @app.get("/api/recommend-route")
 def recommend_route(lat: float, lng: float, km: float):
 
-    # -------------------------------
-    # 2km 이상 → Valhalla(v1)
-    # -------------------------------
+    # ---------------------------------------------------------
+    # 2km 이상 → Valhalla 기반 v1
+    # ---------------------------------------------------------
     if km >= 2.0:
         result = generate_route_v1(lat, lng, km)
 
-        # v1 polyline = list of dict → convert to tuple list for turn_algo
+        # polyline이 비었으면 바로 error 리턴
+        if not result["polyline"]:
+            return result  # v1이 이미 error 구조 반환함
+
+        # dict list → tuple list 변환
         polyline_tuples = [(p["lat"], p["lng"]) for p in result["polyline"]]
 
         # turn-by-turn
         turns, summary = build_turn_by_turn(polyline_tuples, km_requested=km)
-
         result["turns"] = turns
         result["summary"] = summary
         return result
 
-    # -------------------------------
-    # 2km 미만 → OSM(v2)
-    # -------------------------------
+    # ---------------------------------------------------------
+    # 2km 미만 → OSM 기반 v2
+    # ---------------------------------------------------------
     else:
         polyline, meta = generate_route_v2(lat, lng, km)
 
@@ -48,7 +51,6 @@ def recommend_route(lat: float, lng: float, km: float):
             "meta": meta,
         }
 
-        # v2 polyline = tuple list already
         turns, summary = build_turn_by_turn(polyline, km_requested=km)
         result["turns"] = turns
         result["summary"] = summary
