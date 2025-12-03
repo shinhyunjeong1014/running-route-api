@@ -8,8 +8,11 @@ import requests
 LatLng = Tuple[float, float]
 EARTH_RADIUS_M = 6371000.0
 
-VALHALLA_ROUTE_URL = os.getenv("VALHALLA_ROUTE_URL", "http://localhost:8002/route")
-VALHALLA_LOCATE_URL = os.getenv("VALHALLA_LOCATE_URL", "http://localhost:8002/locate")
+#VALHALLA_ROUTE_URL = os.getenv("VALHALLA_ROUTE_URL", "http://localhost:8002/route")
+#VALHALLA_LOCATE_URL = os.getenv("VALHALLA_LOCATE_URL", "http://localhost:8002/locate")
+
+VALHALLA_ROUTE_URL = "http://0.0.0.0:8002/route"
+VALHALLA_LOCATE_URL = "http://0.0.0.0:8002/locate"
 
 DEFAULT_COSTING = "pedestrian"
 
