@@ -16,7 +16,7 @@ LatLng = Tuple[float, float]
 Polyline = List[LatLng]
 
 # ==========================================================
-# 🔥 그래프 캐시 (동일/근접 위치 + 거리별로 OSM 그래프 재사용)
+# 그래프 캐시 (동일/근접 위치 + 거리별로 OSM 그래프 재사용)
 # ==========================================================
 _GRAPH_CACHE: Dict[Tuple[int, int, int], Tuple[nx.MultiDiGraph, nx.MultiGraph]] = {}
 _GRAPH_CACHE_MAX = 8  # 캐시 항목 상한
@@ -294,7 +294,7 @@ def _fallback_square_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, 
 
 
 # ==========================================================
-# 🔥 메인: 러닝 루프 생성
+# 메인: 러닝 루프 생성
 # ==========================================================
 def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
     start_time = time.time()
@@ -395,30 +395,22 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     rod_min = rod_target * 0.6
     rod_max = rod_target * 1.4
 
-    # 3-1) 1차 후보 (거리 기반)
-    candidate_infos: List[Tuple[int, float, int, float]] = []
-    for n, d in dist_map.items():
-        if n == start_node:
-            continue
-        if rod_min <= d <= rod_max:
-            deg = undirected.degree(n)
-            closeness = abs(d - rod_target)
-            candidate_infos.append((n, d, deg, closeness))
+    # 3-1) 거리 기반 1차 후보 (이전 버전과 동일한 조건)
+    candidate_nodes = [
+        n for n, d in dist_map.items()
+        if rod_min <= d <= rod_max and n != start_node
+    ]
 
-    # 3-2) 부족하면 범위 완화
-    if len(candidate_infos) < 5:
-        candidate_infos = []
+    # 3-2) 후보가 너무 적으면 범위 완화
+    if len(candidate_nodes) < 5:
         lo = target_m * 0.25
         hi = target_m * 0.75
-        for n, d in dist_map.items():
-            if n == start_node:
-                continue
-            if lo <= d <= hi:
-                deg = undirected.degree(n)
-                closeness = abs(d - rod_target)
-                candidate_infos.append((n, d, deg, closeness))
+        candidate_nodes = [
+            n for n, d in dist_map.items()
+            if lo <= d <= hi and n != start_node
+        ]
 
-    if not candidate_infos:
+    if not candidate_nodes:
         poly, length, r = _fallback_square_loop(lat, lng, km)
         err = abs(length - target_m)
         meta.update(
@@ -433,13 +425,10 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    # 3-3) Smart 정렬: target/2에 가까운 거리 + degree 높은 순
-    candidate_infos.sort(key=lambda x: (x[3], -x[2]))  # (closeness, -deg)
-
-    # 3-4) 상위 N개만 사용 (km에 따라 동적, 최대 36개)
-    max_candidates = max(12, min(36, int(6 * km) + 12))  # 2km → 24, 5km → 36
-    candidate_infos = candidate_infos[:max_candidates]
-    candidates = [info[0] for info in candidate_infos]
+    # 3-3) 후보 수 상한 (너무 많으면 랜덤 샘플링)
+    random.shuffle(candidate_nodes)
+    max_candidates = min(len(candidate_nodes), 80)  # 이전(120)보다는 줄이되 충분히 유지
+    candidate_nodes = candidate_nodes[:max_candidates]
 
     best_poly: Optional[Polyline] = None
     best_score = -1e18
@@ -448,7 +437,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     # ------------------------------------------------------
     # 4) 각 endpoint에 대해 forward + "경량 poison" backward
     # ------------------------------------------------------
-    for endpoint in candidates:
+    for endpoint in candidate_nodes:
         # 4-1. forward path
         try:
             forward_nodes = nx.shortest_path(
@@ -479,8 +468,9 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         # 4-3. "경량 poison" weight 함수
         def poison_weight(u: int, v: int, data: Dict[str, Any]) -> float:
             base_len = float(data.get("length", 0.0)) or 0.0001
+            # forward에서 쓴 간선은 길이를 키워서 다른 길을 선호하게 만듦
             if (u, v) in rod_edges:
-                return base_len * 8.0
+                return base_len * 5.0  # 기존 8.0보다 완화해 너무 과한 우회를 방지
             return base_len
 
         # 4-4. poisoned weight 기반 backward path
@@ -499,13 +489,14 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
 
         # 4-5. forward + backward를 붙여 하나의 루프
         full_nodes = forward_nodes + back_nodes[1:]
+        meta["routes_checked"] += 1
+
         poly = _nodes_to_polyline(undirected, full_nodes)
         length_m = polyline_length_m(poly)
         if length_m <= 0.0:
             continue
 
         err = abs(length_m - target_m)
-        meta["routes_checked"] += 1
 
         # 길이 오차가 너무 큰 후보는 버림
         if err > target_m * HARD_ERR_FRAC:
