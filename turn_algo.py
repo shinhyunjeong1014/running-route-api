@@ -4,8 +4,6 @@ from typing import List, Dict, Tuple, Optional
 
 import requests
 
-from poi.poi_db import get_nearest_poi  # 로컬 OSM 기반 POI
-
 logger = logging.getLogger("turn_algo")
 logger.setLevel(logging.INFO)
 
@@ -26,17 +24,50 @@ AFTER_TURN_DIST = 10.0     # 턴 후 10m 피드백
 
 RUNNING_SPEED_KMH = 8.0
 
-# POI 관련
+# POI 관련 (카카오만 사용)
 KAKAO_REST_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
-KAKAO_POI_RADIUS_M = 150.0
-OSM_POI_RADIUS_M = 120.0
-POI_BEFORE_AFTER_THRESH_M = 25.0  # 턴 기준 25m 이내면 "교차로에서", 그 이상은 이전/이후
+KAKAO_POI_RADIUS_M = 150.0        # 턴 주변 검색 반경 (직선 거리)
+
+POI_SCAN_BEFORE_M = 60.0          # 턴 기준 경로 상 이전 구간(POI 허용 범위)
+POI_SCAN_AFTER_M = 80.0           # 턴 기준 경로 상 이후 구간(POI 허용 범위)
+POI_LATERAL_MAX_M = 25.0          # 경로와 수직거리 임계값(이상일 경우 "지나간다"라고 말하면 안 됨)
 
 KAKAO_TIMEOUT_SEC = 2.0
-KAKAO_CATEGORY_CODES = ["CE7", "CS2", "FD6"]  # 카페, 편의점, 음식점 등
+KAKAO_CATEGORY_CODES = ["CS2", "CE7", "FD6"]  # 편의점, 카페, 음식점 위주
 
-# 캐시 (좌표 -> POI)
-_poi_cache: Dict[Tuple[int, int], Optional[Tuple[str, float, float, str]]] = {}
+# 브랜드 우선순위 (숫자 작을수록 우선순위 높음)
+BRAND_KEYWORDS = [
+    ("세븐일레븐", 0),
+    ("7-ELEVEN", 0),
+    ("GS25", 0),
+    ("CU", 0),
+    ("이마트24", 0),
+
+    ("스타벅스", 1),
+    ("빽다방", 1),
+    ("파스쿠찌", 1),
+    ("이디야", 1),
+    ("메가커피", 1),
+    ("컴포즈", 1),
+    ("투썸", 1),
+    ("할리스", 1),
+    ("폴바셋", 1),
+
+    ("맘스터치", 2),
+    ("맥도날드", 2),
+    ("버거킹", 2),
+    ("롯데리아", 2),
+    ("KFC", 2),
+    ("BBQ", 2),
+    ("BHC", 2),
+    ("교촌", 2),
+]
+
+CATEGORY_RANK = {
+    "CS2": 0,  # 편의점
+    "CE7": 1,  # 카페
+    "FD6": 2,  # 음식점
+}
 
 
 # -----------------------------
@@ -163,7 +194,7 @@ def interpolate_point_along_polyline(
 
 
 # -----------------------------
-# polyline 상에서 임의 좌표의 "경로 상 거리" 근사
+# polyline 상에서 임의 좌표의 "경로 상 거리" + 경로와의 수직거리
 # -----------------------------
 def distance_along_polyline_to_point(
     points: List[Tuple[float, float]],
@@ -173,13 +204,12 @@ def distance_along_polyline_to_point(
     """
     polyline에서 가장 가까운 vertex를 기준으로
     - 그 지점까지의 경로 거리
-    - 해당 vertex와의 직선 거리
+    - 해당 vertex와의 직선 거리(수직 거리 근사)
     를 반환.
     """
     if not points:
         return 0.0, float("inf")
 
-    # 가장 가까운 vertex 찾기
     best_idx = 0
     best_d = float("inf")
     for i, (plat, plng) in enumerate(points):
@@ -188,7 +218,6 @@ def distance_along_polyline_to_point(
             best_d = d
             best_idx = i
 
-    # 시작점부터 best_idx까지 경로 거리 합산
     cum = 0.0
     for i in range(best_idx):
         cum += haversine_m(*points[i], *points[i + 1])
@@ -199,7 +228,7 @@ def distance_along_polyline_to_point(
 def classify_poi_relation_to_turn(
     poi_dist_along: float,
     turn_dist: float,
-    threshold: float = POI_BEFORE_AFTER_THRESH_M,
+    at_threshold: float = 20.0,
 ) -> str:
     """
     POI가 턴 기준으로
@@ -208,46 +237,61 @@ def classify_poi_relation_to_turn(
       - 이후(after)
     인지 판별.
     """
-    if poi_dist_along < turn_dist - threshold:
+    if poi_dist_along < turn_dist - at_threshold:
         return "before"
-    if poi_dist_along > turn_dist + threshold:
+    if poi_dist_along > turn_dist + at_threshold:
         return "after"
     return "at"
 
 
 # -----------------------------
-# POI 이름 축약 (카카오/OSM 공통)
+# POI 이름 축약 + 브랜드 우선순위
 # -----------------------------
 def shorten_poi_name(name: str) -> str:
     name = name.strip()
 
-    for sep in [",", "·", "-", "—", "|", "/", "("]:
+    # 괄호 뒤, 하이픈 뒤 등 추가정보 제거
+    for sep in ["|", "/", "·", "-", "—", "(", ","]:
         if sep in name:
             name = name.split(sep)[0].strip()
 
-    if len(name) > 10:
-        name = name[:10].rstrip()
+    # "OO점", "OO지점", "OO호점" 등의 꼬리 제거
+    for suffix in ["지점", "점", "호점"]:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)].strip()
+
+    # 너무 길면 15자 정도로 자르기
+    if len(name) > 15:
+        name = name[:15].rstrip()
     return name
 
 
+def brand_priority(name: str) -> int:
+    lname = name.lower()
+    best = 3  # 기본값(낮은 우선순위)
+    for kw, rank in BRAND_KEYWORDS:
+        if kw.lower() in lname:
+            best = min(best, rank)
+    return best
+
+
 # -----------------------------
-# 카카오맵 POI 검색
+# 카카오맵 POI 후보 검색
 # -----------------------------
-def search_kakao_poi(
+def search_kakao_poi_candidates(
     lat: float,
     lng: float,
     radius_m: float = KAKAO_POI_RADIUS_M,
-) -> Optional[Tuple[str, float, float]]:
+) -> List[Dict]:
     """
-    카카오 카테고리 검색 기반으로 가장 가까운 POI 1개 조회.
-    반환: (축약이름, poi_lat, poi_lng) 또는 None
+    카카오 카테고리 검색 기반으로 여러 POI 후보를 가져온다.
+    반환: documents 리스트(원본 JSON 일부)
     """
     if not KAKAO_REST_API_KEY:
-        return None
+        return []
 
     headers = {"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"}
-    best: Optional[Tuple[str, float, float]] = None
-    best_dist = float("inf")
+    candidates: List[Dict] = []
 
     for cat in KAKAO_CATEGORY_CODES:
         try:
@@ -260,6 +304,7 @@ def search_kakao_poi(
                     "x": lng,
                     "radius": int(radius_m),
                     "sort": "distance",
+                    "size": 15,
                 },
                 timeout=KAKAO_TIMEOUT_SEC,
             )
@@ -268,61 +313,92 @@ def search_kakao_poi(
 
             data = resp.json()
             for doc in data.get("documents", []):
-                name = doc.get("place_name")
-                if not name:
-                    continue
-                d = float(doc.get("distance", "999999"))
-                if d < best_dist and d <= radius_m:
-                    plat = float(doc["y"])
-                    plng = float(doc["x"])
-                    best_dist = d
-                    best = (shorten_poi_name(name), plat, plng)
+                doc["category_group_code"] = cat
+                candidates.append(doc)
         except Exception as e:
             logger.warning(f"Kakao POI search error: {e}")
             continue
 
-    return best
+    return candidates
 
 
 # -----------------------------
-# 통합 POI 검색 (카카오 우선 + OSM 보조)
+# 턴 기준으로 사용할 최적 POI 선택 (카카오만 사용)
 # -----------------------------
-def find_best_poi_for_turn(
-    lat: float,
-    lng: float,
-) -> Optional[Tuple[str, float, float, str]]:
+def choose_best_poi_for_turn(
+    simp_polyline: List[Tuple[float, float]],
+    turn_dist: float,
+    turn_lat: float,
+    turn_lng: float,
+) -> Optional[Dict]:
     """
     턴 근처에서 사용할 대표 POI 1개 선택.
-    반환:
-      (poi_name, poi_lat, poi_lng, source) 또는 None
-      source: "kakao" | "osm"
+    반환: {
+        "name": str,
+        "lat": float,
+        "lng": float,
+        "category_group_code": str,
+        "relation": "before"|"at"|"after",
+        "dist_along": float,
+        "lateral": float,
+    } 또는 None
     """
+    docs = search_kakao_poi_candidates(turn_lat, turn_lng, radius_m=KAKAO_POI_RADIUS_M)
+    if not docs:
+        return None
 
-    key = (round(lat * 10000), round(lng * 10000))
-    if key in _poi_cache:
-        return _poi_cache[key]
+    best_poi: Optional[Dict] = None
+    best_score: Optional[Tuple[float, float, float, float]] = None
 
-    # 1) 카카오 우선
-    k = search_kakao_poi(lat, lng, radius_m=KAKAO_POI_RADIUS_M)
-    if k:
-        poi = (k[0], k[1], k[2], "kakao")
-        _poi_cache[key] = poi
-        return poi
+    for doc in docs:
+        try:
+            name_raw = doc.get("place_name")
+            if not name_raw:
+                continue
+            name = shorten_poi_name(name_raw)
 
-    # 2) OSM POI (로컬 DB)
-    try:
-        o = get_nearest_poi(lat, lng, radius_m=OSM_POI_RADIUS_M)
-    except Exception as e:
-        logger.warning(f"OSM POI search error: {e}")
-        o = None
+            poi_lat = float(doc["y"])
+            poi_lng = float(doc["x"])
+            cat_code = doc.get("category_group_code", "")
 
-    if o:
-        poi = (shorten_poi_name(o[0]), o[1], o[2], "osm")
-        _poi_cache[key] = poi
-        return poi
+            dist_along, lateral = distance_along_polyline_to_point(
+                simp_polyline, poi_lat, poi_lng
+            )
 
-    _poi_cache[key] = None
-    return None
+            # 1) 경로와 너무 멀면 제외 (회뜨는 포차 같은 케이스 방지)
+            if lateral > POI_LATERAL_MAX_M:
+                continue
+
+            # 2) 턴 기준 경로 상 구간 필터
+            if dist_along < turn_dist - POI_SCAN_BEFORE_M:
+                continue
+            if dist_along > turn_dist + POI_SCAN_AFTER_M:
+                continue
+
+            relation = classify_poi_relation_to_turn(dist_along, turn_dist)
+
+            # 3) 스코어링
+            b_rank = brand_priority(name)
+            c_rank = CATEGORY_RANK.get(cat_code, 5)
+            along_diff = abs(dist_along - turn_dist)
+
+            score = (b_rank, c_rank, along_diff, lateral)
+
+            if (best_score is None) or (score < best_score):
+                best_score = score
+                best_poi = {
+                    "name": name,
+                    "lat": poi_lat,
+                    "lng": poi_lng,
+                    "category_group_code": cat_code,
+                    "relation": relation,
+                    "dist_along": dist_along,
+                    "lateral": lateral,
+                }
+        except Exception:
+            continue
+
+    return best_poi
 
 
 # -----------------------------
@@ -405,28 +481,22 @@ def build_turn_by_turn(
         last_pt = cur_pt
 
     # -------------------------
-    # 2) 각 턴에 대해 POI 조회 + 턴 기준 상대 위치 계산
+    # 2) 각 턴에 대해 POI 조회 + 관계 계산
     # -------------------------
     for t in raw_turns:
-        t_lat, t_lng = t["lat"], t["lng"]
-        turn_dist = t["dist_m"]
+        t_lat = t["lat"]
+        t_lng = t["lng"]
+        t_dist = t["dist_m"]
 
-        poi = find_best_poi_for_turn(t_lat, t_lng)
-        if not poi:
+        poi = choose_best_poi_for_turn(simp, t_dist, t_lat, t_lng)
+        if poi is None:
             t["poi_name"] = None
-            continue
-
-        poi_name, poi_lat, poi_lng, poi_src = poi
-        # polyline 상에서 POI의 경로 거리 근사
-        poi_along, _ = distance_along_polyline_to_point(simp, poi_lat, poi_lng)
-        rel = classify_poi_relation_to_turn(poi_along, turn_dist)
-
-        t["poi_name"] = poi_name
-        t["poi_lat"] = poi_lat
-        t["poi_lng"] = poi_lng
-        t["poi_source"] = poi_src
-        t["poi_dist_along"] = poi_along
-        t["poi_relation"] = rel
+        else:
+            t["poi_name"] = poi["name"]
+            t["poi_relation"] = poi["relation"]
+            t["poi_dist_along"] = poi["dist_along"]
+            t["poi_lateral"] = poi["lateral"]
+            t["poi_category_group_code"] = poi["category_group_code"]
 
     # -------------------------
     # 3) 이벤트(voice events) 생성
@@ -482,8 +552,8 @@ def build_turn_by_turn(
     # (2) 각 턴마다 pre-alert, execution, after-turn 이벤트 생성
     for t in raw_turns:
         dist_turn = t["dist_m"]
-        lat = t["lat"]
-        lng = t["lng"]
+        turn_lat = t["lat"]
+        turn_lng = t["lng"]
         turn_type = t["type"]
         poi_name = t.get("poi_name")
         poi_relation = t.get("poi_relation")
