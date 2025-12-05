@@ -1,67 +1,26 @@
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+# ▼ [변경 1] 기본 JSONResponse 대신 속도가 20~50배 빠른 ORJSONResponse 사용
+from fastapi.responses import ORJSONResponse
+# ▼ [변경 2] 데이터 압축 전송을 위한 GZipMiddleware 사용
+from fastapi.middleware.gzip import GZipMiddleware
+
 import logging
 from typing import List, Dict, Tuple
-import os
-import pickle
-import time
+import uvicorn
 
-# 수정된 모듈 import
+# route_algo와 turn_algo는 기존 파일 그대로 사용
 from route_algo import generate_area_loop, polyline_length_m
-from turn_algo import build_turn_by_turn_async
+from turn_algo import build_turn_by_turn
 
 logger = logging.getLogger("app")
 logger.setLevel(logging.INFO)
 
-# ============================
-# Global Graph Storage
-# ============================
-global_graph = None
-MAP_FILE = "my_area.pickle"
+# ▼ [변경 3] default_response_class를 ORJSONResponse로 설정하여 모든 응답 속도 향상
+app = FastAPI(default_response_class=ORJSONResponse)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # ----------------------------------------------------
-    # 서버 시작 시: Pickle 데이터 로드 (고속)
-    # ----------------------------------------------------
-    global global_graph
-    
-    print("\n" + "="*50)
-    print("🚀 서버 시작 프로세스 가동")
-    print("="*50)
-
-    try:
-        if os.path.exists(MAP_FILE):
-            print(f"📂 맵 파일({MAP_FILE}) 발견! 메모리로 로드합니다...")
-            start_time = time.time()
-            
-            # [핵심] Pickle 로드: 파싱 과정 없이 메모리에 바로 적재됨 (매우 빠름)
-            with open(MAP_FILE, "rb") as f:
-                global_graph = pickle.load(f)
-                
-            elapsed = time.time() - start_time
-            print(f"✅ 맵 로드 완료! (소요시간: {elapsed:.2f}초)")
-            print(f"📍 로드된 노드 개수: {len(global_graph.nodes)}개")
-            print("✨ 서버 준비 완료! 요청을 받을 수 있습니다.\n")
-            
-        else:
-            print(f"❌ 오류: '{MAP_FILE}' 파일이 없습니다!")
-            print("👉 먼저 'python init_map.py'를 실행해서 맵 파일을 만들어주세요.")
-            global_graph = None
-            
-    except Exception as e:
-        print(f"❌ 맵 로드 중 치명적 오류 발생: {e}")
-        global_graph = None
-
-    yield
-    
-    # 서버 종료 시 정리
-    print("🛑 서버 종료: 메모리를 정리합니다.")
-    global_graph = None
-
-
-app = FastAPI(lifespan=lifespan)
+# ▼ [변경 4] 1KB 이상 데이터는 자동으로 압축하여 전송 (네트워크 대기 시간 단축)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,98 +29,75 @@ app.add_middleware(
     allow_methods=["*"],
 )
 
-
 @app.get("/health")
 def health():
-    """서버 상태 및 맵 로드 여부 확인"""
-    return {
-        "status": "ok", 
-        "map_ready": global_graph is not None,
-        "map_nodes": len(global_graph.nodes) if global_graph else 0
-    }
+    return {"status": "ok"}
 
-
-def _format_polyline_for_frontend(polyline: List[Tuple[float, float]]) -> List[Dict[str, float]]:
+def _format_polyline_for_frontend(
+    polyline: List[Tuple[float, float]],
+) -> List[Dict[str, float]]:
     return [{"lat": lat, "lng": lng} for lat, lng in polyline]
 
-
+# ▼ [중요 체크] async def가 아닌 'def'를 유지해야 합니다.
+# async def로 바꾸면 연산하는 1분 동안 서버 전체가 멈춥니다. 
+# def로 두면 FastAPI가 별도 스레드에서 실행하여 서버 멈춤을 방지합니다.
 @app.get("/api/recommend-route")
-async def recommend_route(
+def recommend_route(
     lat: float = Query(..., description="시작 지점 위도"),
     lng: float = Query(..., description="시작 지점 경도"),
     km: float = Query(..., gt=0.1, lt=50.0, description="목표 거리(km)"),
 ):
-    """
-    [Async] 러닝 루프 추천 API
-    1. Pre-loaded Graph (Memory) 사용 -> I/O 대기 없음
-    2. Async POI 검색 -> Network 대기 최소화
-    """
+    """러닝 루프 추천 API."""
+    
     start_point_dict = {"lat": lat, "lng": lng}
     
-    # 1) 맵 데이터 준비 확인
-    if global_graph is None:
-        return {
-            "status": "error",
-            "message": "서버에 맵 데이터가 로드되지 않았습니다. 관리자에게 문의하세요.",
-            "start": start_point_dict,
-            "polyline": [start_point_dict],
-            "turns": [],
-            "summary": {"length_m": 0, "km_requested": km, "estimated_time_min": 0, "event_count": 0},
-            "meta": {"success": False}
-        }
-
-    # 2) 루프 생성 (CPU 연산)
-    try:
-        polyline_tuples, meta = generate_area_loop(global_graph, lat, lng, km)
-    except Exception as e:
-        print(f"🔥 알고리즘 에러 발생: {e}")
-        return {
-            "status": "error",
-            "message": f"경로 생성 중 내부 오류: {e}",
-            "start": start_point_dict,
-            "polyline": [start_point_dict],
-            "turns": [],
-            "summary": {"length_m": 0, "km_requested": km, "estimated_time_min": 0, "event_count": 0},
-            "meta": {"success": False}
-        }
+    # 1) 루프 생성 (시간이 오래 걸리는 작업)
+    polyline_tuples, meta = generate_area_loop(lat, lng, km)
     
+    # 2) 유효성 확인
     is_valid_route = polyline_tuples and polyline_length_m(polyline_tuples) > 0
 
     if is_valid_route:
-        # 3) [Await] 비동기 턴바이턴 생성 (I/O 병렬 처리)
-        try:
-            turns, summary = await build_turn_by_turn_async(polyline_tuples, km_requested=km)
-        except Exception as e:
-            print(f"🔥 턴바이턴 에러 발생: {e}")
-            turns, summary = [], {"length_m": 0}
-
-        # 메시지 처리
-        final_message = meta.get("message", "")
+        # 턴바이턴 정보 생성
+        turns, summary = build_turn_by_turn(polyline_tuples, km_requested=km)
+        
         if meta.get("success", False):
             final_message = "최적의 정밀 경로가 도출되었습니다."
-        elif not final_message:
-            final_message = f"요청 오차 범위를 초과하지만, 가장 인접한 경로({summary.get('length_m', 0)}m)를 반환합니다."
-        
+        else:
+            final_message = meta.get("message", f"요청 오차(±99m)를 초과하지만, 가장 인접한 경로({summary['length_m']}m)를 반환합니다.")
+
         meta["message"] = final_message
-        
+        formatted_polyline = _format_polyline_for_frontend(polyline_tuples)
+
         return {
             "status": "ok",
             "start": start_point_dict,
-            "polyline": _format_polyline_for_frontend(polyline_tuples),
+            "polyline": formatted_polyline,
             "turns": turns,
             "summary": summary,
             "meta": meta,
         }
     else:
-        # 유효 경로 없음 (Error)
+        length_m = meta.get("len", 0.0)
         return {
             "status": "error",
             "message": meta.get("message", "탐색 결과, 유효한 경로 후보를 찾을 수 없습니다."),
             "start": start_point_dict,
             "polyline": [start_point_dict],
             "turns": [],
-            "summary": {"length_m": meta.get("len", 0.0), "km_requested": km, "estimated_time_min": 0.0, "event_count": 0},
+            "summary": {"length_m": length_m, "km_requested": km, "estimated_time_min": 0.0, "turn_count": 0},
             "meta": meta,
         }
+
+if __name__ == "__main__":
+    # ▼ [변경 5] 타임아웃 설정을 300초(5분)로 넉넉하게 설정
+    # 이렇게 해야 1분 연산 중에도 연결이 끊기지 않습니다.
+    uvicorn.run(
+        "app:app", 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=True,
+        timeout_keep_alive=300
+    )
 
 
