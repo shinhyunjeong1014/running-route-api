@@ -30,6 +30,7 @@ MAX_VIA_TOTAL = 6           # 전체 via-node 상한 (double-loop 대비)
 MAX_VIA_PAIRS = 15          # 평가할 via 쌍 최대 개수
 
 POISON_FACTOR = 3.0         # 왕복 경로 억제를 위한 가중치 배수
+MAX_MICRO_LOOPS = 3         # 거리 보정 micro-loop 최대 삽입 횟수
 
 
 # ==========================
@@ -130,6 +131,8 @@ def _build_osm_graph(lat: float, lng: float, target_m: float) -> Tuple[nx.Graph,
     if ox is None:
         raise RuntimeError("osmnx 가 설치되어 있지 않습니다.")
 
+    # 요청 거리와 좌표가 항상 다르다는 점을 고려해,
+    # 목표 거리 기반으로 "적당한" 반경을 설정 (지형에 따라 조금 작은 그래프일 수는 있음)
     radius = max(MIN_OSMNX_RADIUS_M, min(MAX_OSMNX_RADIUS_M, target_m * 0.7))
 
     G_raw = ox.graph_from_point(
@@ -182,9 +185,10 @@ def _select_via_candidates(
 
     # 원형 루프의 반지름 근사: L ≈ 2πR → R ≈ L / (2π)
     rough_radius = target_m / (2 * math.pi)
-    # 거리 정밀도 높이려고 링 폭을 조금 좁힘
+
+    # 요청 거리와 좌표가 매번 다르므로, 지형에 따라 조금 유연하게 링 폭을 설정
     min_r = max(rough_radius * 0.8, 200.0)
-    max_r = rough_radius * 1.2
+    max_r = rough_radius * 1.3  # 약간 더 여유를 줌
 
     sector_best: Dict[int, Tuple[int, float]] = {}
 
@@ -362,14 +366,88 @@ def _compute_curve_penalty(poly: Polyline) -> float:
 
 
 # ==========================
-# 메인: 러닝 루프 생성 (double via)
+# 거리 보정용 micro-loop 삽입
+# ==========================
+
+def _extend_with_micro_loops(
+    G: nx.Graph,
+    node_path: List[int],
+    current_len: float,
+    target_m: float,
+    max_loops: int = MAX_MICRO_LOOPS,
+) -> Tuple[List[int], float]:
+    """
+    루프 길이가 목표보다 짧을 때,
+    경로 상의 교차로에서 옆 골목으로 들어갔다 나오는 micro-loop(u->w->u)를
+    최대 max_loops번까지 삽입해서 거리 보정.
+    - 실제 도로 그래프 위에서만 움직임.
+    """
+    if not node_path or len(node_path) < 2:
+        return node_path, current_len
+
+    new_node_path = list(node_path)
+    total_len = current_len
+
+    for _ in range(max_loops):
+        missing = target_m - total_len
+        if missing <= target_m * LENGTH_TOL_FRAC:
+            break  # 이미 허용 오차 이내
+
+        best_idx = None
+        best_neighbor = None
+        best_new_len = None
+        best_err = float("inf")
+
+        # 경로 중간 노드들에서 micro-loop 후보 탐색
+        for i in range(1, len(new_node_path) - 1):
+            u = new_node_path[i]
+            # 교차로(연결이 여러 개) 위주로 시도
+            if G.degree[u] < 3:
+                continue
+
+            for w in G.neighbors(u):
+                # 기존 경로의 직전/직후 노드는 제외 (이미 사용 중인 방향)
+                if w == new_node_path[i - 1] or w == new_node_path[i + 1]:
+                    continue
+                base_len = G[u][w]["length"]
+                extra = 2.0 * base_len  # u->w->u
+                candidate_len = total_len + extra
+                # 너무 많이 overshoot 하면 skip
+                if candidate_len > target_m * (1.0 + LENGTH_TOL_FRAC):
+                    continue
+                err = abs(candidate_len - target_m)
+                if err < best_err:
+                    best_err = err
+                    best_idx = i
+                    best_neighbor = w
+                    best_new_len = candidate_len
+
+        if best_idx is None or best_neighbor is None or best_new_len is None:
+            # 더 이상 쓸만한 micro-loop 없음
+            break
+
+        # 실제로 node_path에 micro-loop 삽입: ... u, w, u, next ...
+        insert_pos = best_idx + 1
+        u = new_node_path[best_idx]
+        new_node_path = (
+            new_node_path[:insert_pos] + [best_neighbor, u] + new_node_path[insert_pos:]
+        )
+        total_len = best_new_len
+
+    return new_node_path, total_len
+
+
+# ==========================
+# 메인: 러닝 루프 생성 (double via + 거리보정)
 # ==========================
 
 def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
-    """double-via 기반 러닝 루프 생성.
+    """double-via 기반 러닝 루프 + 거리보정 micro-loop.
 
     - via-node 2개(A,B)를 조합해 start→A→B→start 루프를 만든다.
-    - PCD/goal-directed A*를 이용해 탐색을 줄이되, 거리 정밀도와 루프 모양을 동시에 고려한다.
+    - PCD/goal-directed A*를 이용해 탐색을 줄이되,
+      거리 정밀도와 루프 모양을 동시에 고려한다.
+    - 루프가 목표 거리보다 짧으면 실제 도로 위에서 micro-loop를 삽입해 거리 보정.
     """
     start_time = time.time()
     target_m = max(MIN_LOOP_M, km * 1000.0)
@@ -453,8 +531,12 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
                 poison_edges.add(e)
             back_len, back_nodes = _astar_path(G, only_v, start_node, poison_edges=poison_edges)
             node_path = out_nodes + back_nodes[1:]
-            poly: Polyline = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in node_path]
             loop_len = out_len + back_len
+
+            # 거리 보정 micro-loop 시도
+            node_path, loop_len = _extend_with_micro_loops(G, node_path, loop_len, target_m)
+
+            poly: Polyline = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in node_path]
             err = abs(loop_len - target_m)
 
             r = _compute_roundness(poly)
@@ -472,7 +554,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
                 success=bool(err <= target_m * LENGTH_TOL_FRAC),
                 length_ok=bool(err <= target_m * LENGTH_TOL_FRAC),
                 used_fallback=False,
-                message="via-node가 1개뿐이라 single-loop로 생성했습니다.",
+                message="via-node가 1개뿐이라 single-loop + 거리보정으로 생성했습니다.",
             )
             meta["time_s"] = float(time.time() - start_time)
             return safe_list(poly), safe_dict(meta)
@@ -531,7 +613,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     meta["via_pairs"] = all_pairs
 
     best_score = -float("inf")
-    best_poly: Polyline = []
+    best_node_path: List[int] = []
     best_len = 0.0
     best_err = float("inf")
     best_roundness = 0.0
@@ -563,10 +645,10 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             len3, path3 = _astar_path(G, b, start_node, poison_edges=poison_edges)
 
             node_path = path1 + path2[1:] + path3[1:]
-            poly: Polyline = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in node_path]
             loop_len = len1 + len2 + len3
             err = abs(loop_len - target_m)
 
+            poly: Polyline = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in node_path]
             r = _compute_roundness(poly)
             overlap = _compute_overlap_ratio(node_path)
             curve_pen = _compute_curve_penalty(poly)
@@ -583,7 +665,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
 
             if score > best_score:
                 best_score = score
-                best_poly = poly
+                best_node_path = node_path
                 best_len = loop_len
                 best_err = err
                 best_roundness = r
@@ -593,7 +675,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         except Exception:
             continue
 
-    if not best_poly:
+    if not best_node_path:
         poly, length_m, err = _fallback_square_loop(lat, lng, km)
         meta.update(
             status="no_loop_fallback",
@@ -611,26 +693,48 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = float(time.time() - start_time)
         return safe_list(poly), safe_dict(meta)
 
-    success = bool(best_err <= target_m * LENGTH_TOL_FRAC)
+    # 6) 거리 보정 micro-loop 삽입 (부족한 경우에만)
+    adjusted_node_path = list(best_node_path)
+    adjusted_len = best_len
+    if adjusted_len < target_m:
+        adjusted_node_path, adjusted_len = _extend_with_micro_loops(
+            G, adjusted_node_path, adjusted_len, target_m
+        )
+
+    adjusted_err = abs(adjusted_len - target_m)
+    adjusted_poly: Polyline = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in adjusted_node_path]
+    adjusted_roundness = _compute_roundness(adjusted_poly)
+    adjusted_overlap = _compute_overlap_ratio(adjusted_node_path)
+    adjusted_curve_penalty = _compute_curve_penalty(adjusted_poly)
+
+    length_term = -ERROR_WEIGHT * (adjusted_err / target_m)
+    adjusted_score = (
+        length_term
+        + ROUNDNESS_WEIGHT * adjusted_roundness
+        - OVERLAP_PENALTY * adjusted_overlap
+        - CURVE_PENALTY_WEIGHT * adjusted_curve_penalty
+    )
+
+    success = bool(adjusted_err <= target_m * LENGTH_TOL_FRAC)
     used_fallback = False
 
     meta.update(
         status="ok" if success else "approx",
-        len=float(best_len),
-        err=float(best_err),
-        roundness=float(best_roundness),
-        overlap=float(best_overlap),
-        curve_penalty=float(best_curve_penalty),
-        score=float(best_score),
+        len=float(adjusted_len),
+        err=float(adjusted_err),
+        roundness=float(adjusted_roundness),
+        overlap=float(adjusted_overlap),
+        curve_penalty=float(adjusted_curve_penalty),
+        score=float(adjusted_score),
         success=success,
         length_ok=success,
         used_fallback=bool(used_fallback),
         message=(
             "요청 거리와 모양을 모두 만족하는 double-loop 러닝 코스를 생성했습니다."
             if success
-            else f"요청 오차(±{int(target_m * LENGTH_TOL_FRAC)}m)를 일부 초과했지만, 가장 근접한 double-loop 코스를 반환합니다."
+            else f"요청 오차(±{int(target_m * LENGTH_TOL_FRAC)}m)를 일부 초과했지만, 거리 보정을 포함한 가장 근접한 루프를 반환합니다."
         ),
     )
     meta["time_s"] = float(time.time() - start_time)
 
-    return safe_list(best_poly), safe_dict(meta)
+    return safe_list(adjusted_poly), safe_dict(meta)
