@@ -250,19 +250,40 @@ def classify_poi_relation_to_turn(
 def shorten_poi_name(name: str) -> str:
     name = name.strip()
 
-    # 괄호 뒤, 하이픈 뒤 등 추가정보 제거
+    # 1. 괄호 및 특수문자 뒤 내용 제거 (기존 로직)
+    # 예: "스타벅스 (강남점)" -> "스타벅스"
     for sep in ["|", "/", "·", "-", "—", "(", ","]:
         if sep in name:
             name = name.split(sep)[0].strip()
 
-    # "OO점", "OO지점", "OO호점" 등의 꼬리 제거
-    for suffix in ["지점", "점", "호점"]:
-        if name.endswith(suffix):
-            name = name[: -len(suffix)].strip()
+    # 2. [수정됨] 지점명 제거 (공백 기준으로 분리 후 "점", "지점" 등으로 끝나는 단어 제거)
+    # 예: "CU 인하대후문점" -> "CU"
+    # 예: "스타벅스 강남대로점" -> "스타벅스"
+    tokens = name.split()
+    if len(tokens) > 1:
+        # 마지막 단어가 지점명인 경우가 많으므로 확인
+        last_token = tokens[-1]
+        if last_token.endswith("점") or last_token.endswith("지점") or last_token.endswith("호점"):
+            # 지점명을 제외한 나머지 부분만 다시 합침
+            name = " ".join(tokens[:-1]).strip()
 
-    # 너무 길면 15자 정도로 자르기
+    # 3. [보완] 혹시 띄어쓰기가 안 되어 있는 경우 (예: "스타벅스강남점")
+    # 유명 브랜드 이름이 포함되어 있다면 그 브랜드 이름만 남기는 것도 방법이나,
+    # 오탐 가능성이 있어 보수적으로 "점"으로 끝나는 긴 이름은 뒤를 자름
+    # (단, "상점", "백화점" 같은 고유명사 제외를 위해 3글자 이상일 때만)
+    if len(name) > 3 and (name.endswith("지점") or name.endswith("호점")):
+         if name.endswith("지점"):
+             name = name[:-2].strip()
+         elif name.endswith("호점"):
+             name = name[:-2].strip()
+    
+    # "점"으로 끝나는 경우, 브랜드명일 수도 있으므로 주의 (예: "맥도날드점"은 없겠지만)
+    # 일반적으로 카카오맵 데이터는 "브랜드명 지점명" 형태가 많으므로 2번 로직이 핵심입니다.
+
+    # 4. 너무 길면 15자 정도로 자르기 (기존 로직)
     if len(name) > 15:
         name = name[:15].rstrip()
+        
     return name
 
 
