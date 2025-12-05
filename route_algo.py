@@ -247,7 +247,7 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
     return G
 
 
-def _nodes_to_polyline(G: nx.MultiGraph, nodes: List[int]) -> Polyline:
+def _nodes_to_polyline(G: nx.Graph, nodes: List[int]) -> Polyline:
     """
     노드 리스트를 위경도 좌표 리스트(Polyline)로 변환합니다.
     단순히 노드만 연결하는 것이 아니라, 엣지(Edge)의 형상정보(geometry)를 포함하여
@@ -263,64 +263,56 @@ def _nodes_to_polyline(G: nx.MultiGraph, nodes: List[int]) -> Polyline:
     poly.append((float(first_node['y']), float(first_node['x'])))
 
     for u, v in zip(nodes[:-1], nodes[1:]):
-        # u -> v 엣지 데이터 가져오기
-        if not G.has_edge(u, v):
-            # 연결 끊김 등 예외 상황: v 노드 좌표만 직선 연결
-            node_v = G.nodes[v]
-            poly.append((float(node_v['y']), float(node_v['x'])))
-            continue
+        # 엣지 데이터 찾기 (u->v 또는 v->u)
+        # Undirected 그래프가 아닌 Original(Directed) G를 쓸 때를 대비하여 양방향 체크
+        edge_data = None
+        is_reverse = False
 
-        # MultiGraph이므로 u-v 사이에 여러 엣지가 있을 수 있음
-        edges = G[u][v]
+        # 1. Forward check (u -> v)
+        if G.has_edge(u, v):
+            candidates = G[u][v]
+            # geometry가 있는 엣지를 우선 선택
+            with_geom = [d for d in candidates.values() if 'geometry' in d]
+            if with_geom:
+                edge_data = min(with_geom, key=lambda d: d.get('length', float('inf')))
+            elif candidates:
+                edge_data = min(candidates.values(), key=lambda d: d.get('length', float('inf')))
         
-        # [수정] geometry가 있는 엣지를 우선적으로 선택하도록 로직 강화
-        with_geom = []
-        without_geom = []
+        # 2. Reverse check (v -> u) - Forward에서 형상을 못 찾았거나 엣지가 없는 경우
+        if edge_data is None or 'geometry' not in edge_data:
+            if G.has_edge(v, u):
+                candidates = G[v][u]
+                with_geom = [d for d in candidates.values() if 'geometry' in d]
+                if with_geom:
+                    edge_data = min(with_geom, key=lambda d: d.get('length', float('inf')))
+                    is_reverse = True
         
-        for key, data in edges.items():
-            if 'geometry' in data:
-                with_geom.append(data)
-            else:
-                without_geom.append(data)
-        
-        # 1순위: geometry가 있는 엣지 중 가장 짧은 것
-        if with_geom:
-            data = min(with_geom, key=lambda d: d.get('length', float('inf')))
-        # 2순위: geometry가 없다면 그냥 가장 짧은 것
-        elif without_geom:
-            data = min(without_geom, key=lambda d: d.get('length', float('inf')))
-        else:
-            # Should not happen
-            node_v = G.nodes[v]
-            poly.append((float(node_v['y']), float(node_v['x'])))
-            continue
-
-        if 'geometry' in data:
-            # OSMnx는 geometry를 shapely.geometry.LineString으로 저장함 ((lng, lat) 순서)
-            g = data['geometry']
+        # 형상 정보 적용
+        if edge_data and 'geometry' in edge_data:
+            g = edge_data['geometry']
             coords = list(g.coords)
             
-            # [중요] 엣지 지오메트리 방향 보정
-            # Undirected 그래프에서는 엣지가 (u, v)로 저장되어 있어도
-            # 지오메트리는 v -> u 방향일 수 있음.
-            # 따라서 지오메트리의 시작점이 u와 가까운지 확인해야 함.
-            node_u = G.nodes[u]
-            u_lng, u_lat = float(node_u['x']), float(node_u['y'])
+            # 역방향 엣지를 참조한 경우 좌표 뒤집기
+            if is_reverse:
+                coords = coords[::-1]
             
-            # 첫 점과 u 사이의 거리 제곱
+            # [안전장치] 지오메트리 방향이 실제 u->v 진행 방향과 맞는지 시작점 거리로 검증
+            node_u = G.nodes[u]
+            u_lat, u_lng = float(node_u['y']), float(node_u['x'])
+            
+            # coords는 (lng, lat) 순서
             d_start = (coords[0][0] - u_lng)**2 + (coords[0][1] - u_lat)**2
-            # 마지막 점과 u 사이의 거리 제곱
             d_end = (coords[-1][0] - u_lng)**2 + (coords[-1][1] - u_lat)**2
             
+            # 만약 끝점이 시작점보다 더 가깝다면 뒤집어야 함
             if d_end < d_start:
-                # 지오메트리가 역방향(v -> u)으로 정의된 경우 뒤집음
                 coords = coords[::-1]
 
             # coords[0]은 u와 같으므로(혹은 매우 근접) 제외하고 추가
             for lng, lat in coords[1:]:
                 poly.append((lat, lng))
         else:
-            # geometry가 없으면 v 노드 좌표만 추가 (직선)
+            # 형상이 없으면 직선 연결
             node_v = G.nodes[v]
             poly.append((float(node_v['y']), float(node_v['x'])))
 
@@ -506,7 +498,9 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         full_nodes = forward_nodes + back_nodes[1:]
         meta["routes_checked"] += 1
 
-        poly = _nodes_to_polyline(undirected, full_nodes)
+        # [수정] 원본 그래프 G(Directed)를 사용하여 상세 형상 정보를 가져옴
+        poly = _nodes_to_polyline(G, full_nodes)
+        
         length_m = polyline_length_m(poly)
         if length_m <= 0.0:
             continue
