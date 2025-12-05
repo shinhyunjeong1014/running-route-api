@@ -233,8 +233,6 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
         raise RuntimeError("osmnx가 설치되어 있지 않습니다.")
 
     # [품질 보장 1] 반경을 너무 줄이지 않고 적절히 유지 (안전성 확보)
-    # 기존(과거): km * 500 (너무 큼) -> 직전 최적화: km * 180 (너무 작음, 막다른 길 위험)
-    # 수정(황금밸런스): km * 250 + 350 -> 3km 기준 약 1100m. 충분히 안전하고 빠름.
     radius_m = max(350.0, km * 250.0 + 350.0)
 
     G = ox.graph_from_point(
@@ -249,13 +247,64 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
     return G
 
 
-def _nodes_to_polyline(G: nx.MultiDiGraph, nodes: List[int]) -> Polyline:
+def _nodes_to_polyline(G: nx.MultiGraph, nodes: List[int]) -> Polyline:
+    """
+    노드 리스트를 위경도 좌표 리스트(Polyline)로 변환합니다.
+    단순히 노드만 연결하는 것이 아니라, 엣지(Edge)의 형상정보(geometry)를 포함하여
+    도로의 곡선이나 실제 경로를 부드럽게 표현합니다.
+    """
+    if not nodes:
+        return []
+
     poly: Polyline = []
-    for n in nodes:
-        node = G.nodes[n]
-        lat = float(node.get("y"))
-        lng = float(node.get("x"))
-        poly.append((lat, lng))
+    
+    # 첫 번째 노드 추가
+    first_node = G.nodes[nodes[0]]
+    poly.append((float(first_node['y']), float(first_node['x'])))
+
+    for u, v in zip(nodes[:-1], nodes[1:]):
+        # u -> v 엣지 데이터 가져오기
+        if not G.has_edge(u, v):
+            # 연결 끊김 등 예외 상황: v 노드 좌표만 직선 연결
+            node_v = G.nodes[v]
+            poly.append((float(node_v['y']), float(node_v['x'])))
+            continue
+
+        # MultiGraph이므로 여러 엣지 중 최적(최단 거리) 엣지 선택
+        edges = G[u][v]
+        # length가 가장 짧은 키를 선택 (Dijkstra가 선택했을 가능성 높음)
+        best_key = min(edges, key=lambda k: edges[k].get('length', float('inf')))
+        data = edges[best_key]
+
+        if 'geometry' in data:
+            # OSMnx는 geometry를 shapely.geometry.LineString으로 저장함 ((lng, lat) 순서)
+            g = data['geometry']
+            coords = list(g.coords)
+            
+            # [중요] 엣지 지오메트리 방향 보정
+            # Undirected 그래프에서는 엣지가 (u, v)로 저장되어 있어도
+            # 지오메트리는 v -> u 방향일 수 있음.
+            # 따라서 지오메트리의 시작점이 u와 가까운지 확인해야 함.
+            node_u = G.nodes[u]
+            u_lng, u_lat = float(node_u['x']), float(node_u['y'])
+            
+            # 첫 점과 u 사이의 거리 제곱
+            d_start = (coords[0][0] - u_lng)**2 + (coords[0][1] - u_lat)**2
+            # 마지막 점과 u 사이의 거리 제곱
+            d_end = (coords[-1][0] - u_lng)**2 + (coords[-1][1] - u_lat)**2
+            
+            if d_end < d_start:
+                # 지오메트리가 역방향(v -> u)으로 정의된 경우 뒤집음
+                coords = coords[::-1]
+
+            # coords[0]은 u와 같으므로(혹은 매우 근접) 제외하고 추가
+            for lng, lat in coords[1:]:
+                poly.append((lat, lng))
+        else:
+            # geometry가 없으면 v 노드 좌표만 추가 (직선)
+            node_v = G.nodes[v]
+            poly.append((float(node_v['y']), float(node_v['x'])))
+
     return poly
 
 
@@ -394,7 +443,6 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
 
     # [품질 보장 2] 후보군 5개 -> 15개로 복구
     # In-place 최적화 덕분에 15개를 검사해도 매우 빠름 (약 1~2초 소요 예상)
-    # 이를 통해 "너무 대충 만든 경로"가 나올 확률을 차단함.
     random.shuffle(candidate_nodes)
     candidate_nodes = candidate_nodes[:15]
 
