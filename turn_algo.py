@@ -26,11 +26,12 @@ RUNNING_SPEED_KMH = 8.0
 
 # POI 관련 (카카오만 사용)
 KAKAO_REST_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
-KAKAO_POI_RADIUS_M = 150.0        # 턴 주변 검색 반경 (직선 거리)
+KAKAO_POI_RADIUS_M = 100.0        # 턴 주변 검색 반경 (직선 거리) - 기존 150m에서 축소
 
-POI_SCAN_BEFORE_M = 60.0          # 턴 기준 경로 상 이전 구간(POI 허용 범위)
-POI_SCAN_AFTER_M = 80.0           # 턴 기준 경로 상 이후 구간(POI 허용 범위)
-POI_LATERAL_MAX_M = 25.0          # 경로와 수직거리 임계값(이상일 경우 "지나간다"라고 말하면 안 됨)
+# [수정] 랜드마크 스캔 범위 축소 (너무 먼 시설물 배제)
+POI_SCAN_BEFORE_M = 40.0          # 턴 기준 경로 상 이전 구간 (기존 60m -> 40m)
+POI_SCAN_AFTER_M = 50.0           # 턴 기준 경로 상 이후 구간 (기존 80m -> 50m)
+POI_LATERAL_MAX_M = 15.0          # 경로와 수직거리 임계값 (기존 25m -> 15m, 길가에 붙은 곳만)
 
 KAKAO_TIMEOUT_SEC = 2.0
 KAKAO_CATEGORY_CODES = ["CS2", "CE7", "FD6"]  # 편의점, 카페, 음식점 위주
