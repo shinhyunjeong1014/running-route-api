@@ -14,35 +14,40 @@ try:
 except Exception:  # 배포 환경에서 import 실패 대비
     ox = None
 
+# numpy 스칼라 → 파이썬 기본 타입 변환용 (JSON 인코딩 에러 방지)
+try:
+    import numpy as _np
+except Exception:
+    _np = None
+
 LatLng = Tuple[float, float]
 Polyline = List[LatLng]
 
 # -----------------------------
 # 기본 상수
 # -----------------------------
-MIN_LOOP_M = 200.0          # 최소 루프 길이 (m)
-MAX_OSMNX_RADIUS_M = 2500.0 # OSM 그래프 조회 최대 반경
-MIN_OSMNX_RADIUS_M = 600.0  # OSM 그래프 조회 최소 반경
+MIN_LOOP_M = 200.0           # 최소 루프 길이 (m)
+MAX_OSMNX_RADIUS_M = 2000.0  # OSM 그래프 조회 최대 반경 (속도 위해 2500 -> 2000)
+MIN_OSMNX_RADIUS_M = 600.0   # OSM 그래프 조회 최소 반경
 
-# 기존 비율 기반 오차 (지금은 사용하지 않지만 남겨둠)
-LENGTH_TOL_FRAC = 0.05      # 목표 거리 허용 오차 비율 (±5%)
+# 기존 비율 기반 오차 (지금은 크게 쓰지 않지만 남겨둠)
+LENGTH_TOL_FRAC = 0.05       # 목표 거리 허용 오차 비율 (±5%)
 
-# 새 절대 오차 기준 (핵심)
-MAX_ABS_ERR_M = 45.0        # 목표 거리 허용 오차 (±45m)
+# 새 절대 오차 기준
+MAX_ABS_ERR_M = 45.0         # 목표 거리 허용 오차 (±45m)
 
-# 옵션 A 튜닝값
-SECTOR_COUNT = 12           # (이제는 사용 X, 남겨둠)
-MAX_VIA_TOTAL = 4           # via-node 상한 (속도/품질 균형)
-MAX_VIA_PAIRS = 6           # 평가할 via 쌍 최대 개수
+# 옵션 A 튜닝값 (속도 위해 축소)
+SECTOR_COUNT = 10            # via-node를 뽑을 각도 섹터 개수 (12 -> 10)
+MAX_VIA_TOTAL = 3            # via-node 상한 (4 -> 3, 속도/품질 균형)
+MAX_VIA_PAIRS = 3            # 평가할 via 쌍 최대 개수 (6 -> 3)
 
-POISON_FACTOR = 3.0         # 왕복 경로 억제를 위한 가중치 배수
+POISON_FACTOR = 3.0          # 왕복 경로 억제를 위한 가중치 배수
 
-# micro-loop (옵션 B: 40~80m × 2~3회)
-MAX_MICRO_LOOPS = 3
-MICRO_MIN_EDGE = 20.0       # edge 길이 하한 (20m → loop 40m)
-MICRO_MAX_EDGE = 40.0       # edge 길이 상한 (40m → loop 80m)
-MAX_MICRO_CANDIDATES = 15   # micro-loop 후보 노드 최대 개수
-MAX_PCD_RAW_CANDIDATES = 80 # PCD용 raw 후보 최대 개수 (점수 상위 k개만 사용)
+# micro-loop (옵션 B: 40~80m × 최대 2~3회)
+MAX_MICRO_LOOPS = 2
+MICRO_MIN_EDGE = 20.0        # edge 길이 하한 (20m → loop 40m)
+MICRO_MAX_EDGE = 40.0        # edge 길이 상한 (40m → loop 80m)
+MAX_MICRO_CANDIDATES = 10    # micro-loop 후보 노드 최대 개수 (15 -> 10)
 
 
 # ==========================
@@ -50,6 +55,9 @@ MAX_PCD_RAW_CANDIDATES = 80 # PCD용 raw 후보 최대 개수 (점수 상위 k�
 # ==========================
 
 def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+    # numpy floating → 파이썬 float
+    if _np is not None and isinstance(x, _np.floating):
+        x = float(x)
     if isinstance(x, float):
         if math.isinf(x) or math.isnan(x):
             return default
@@ -57,22 +65,46 @@ def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
 
 
 def safe_list(lst: Any) -> list:
+    """리스트/튜플 + numpy 스칼라를 JSON-safe 형태로 변환."""
+    # 리스트/튜플이 아니면 단일 값으로 취급
     if not isinstance(lst, (list, tuple)):
-        return []
+        if _np is not None and isinstance(lst, _np.generic):
+            return [lst.item()]
+        return [lst]
+
     out = []
     for v in lst:
+        # 중첩 리스트/튜플
         if isinstance(v, (list, tuple)):
-            out.append([safe_float(x, None) for x in v])
+            inner = []
+            for x in v:
+                if _np is not None and isinstance(x, _np.generic):
+                    x = x.item()
+                if isinstance(x, float):
+                    inner.append(safe_float(x, None))
+                else:
+                    inner.append(x)
+            out.append(inner)
         else:
-            out.append(v)
+            if _np is not None and isinstance(v, _np.generic):
+                v = v.item()
+            if isinstance(v, float):
+                out.append(safe_float(v, None))
+            else:
+                out.append(v)
     return out
 
 
 def safe_dict(d: Any) -> dict:
+    """dict + numpy 스칼라를 JSON-safe 형태로 변환."""
     if not isinstance(d, dict):
         return {}
     out = {}
     for k, v in d.items():
+        # numpy 스칼라는 전부 파이썬 기본 타입으로
+        if _np is not None and isinstance(v, _np.generic):
+            v = v.item()
+
         if isinstance(v, float):
             out[k] = safe_float(v, None)
         elif isinstance(v, (list, tuple)):
@@ -154,8 +186,9 @@ def _build_osm_graph(lat: float, lng: float, target_m: float) -> Tuple[nx.Graph,
     if ox is None:
         raise RuntimeError("osmnx 가 설치되어 있지 않습니다.")
 
-    # 좌표와 요청거리가 매번 달라도 적절한 그래프가 만들어지도록
-    radius = max(MIN_OSMNX_RADIUS_M, min(MAX_OSMNX_RADIUS_M, target_m * 0.7))
+    # 반경: L ≈ 2πR → R ≈ L/(2π) ~ 0.16L
+    # 루프 전체를 커버하려면 대략 0.5L 정도 반경이면 충분 (0.7 -> 0.5, 속도 개선)
+    radius = max(MIN_OSMNX_RADIUS_M, min(MAX_OSMNX_RADIUS_M, target_m * 0.5))
 
     G_raw = ox.graph_from_point(
         (lat, lng),
@@ -191,39 +224,29 @@ def _build_osm_graph(lat: float, lng: float, target_m: float) -> Tuple[nx.Graph,
 
 
 # ==========================
-# via-node 후보 선택 (PCD-full)
+# via-node 후보 선택 (PCD-lite, sector 기반)
 # ==========================
 
 def _select_via_candidates(
     G: nx.Graph,
     start_node: int,
     target_m: float,
-    sectors: int = SECTOR_COUNT,   # (unused, 유지만)
+    sectors: int = SECTOR_COUNT,
     max_total: int = MAX_VIA_TOTAL,
 ) -> List[int]:
-    """
-    PCD-full 스타일 via-node 선택:
-    1) start에서 거리, degree 기반으로 raw 후보를 만든 뒤
-    2) 점수 상위 k개에서
-    3) '품질(score) + 다양성(closest-distance)'를 동시에 극대화하는 greedy selection.
-
-    - 품질(score): 목표 반경에 얼마나 잘 맞는지 + 교차로(degree) 선호
-    - 다양성(diversity): 이미 선택된 via들과의 최소거리(maximize)
-    """
-
+    """시작 노드 기준 각도 섹터별 대표 노드를 via-node 후보로 선택."""
     sy = G.nodes[start_node]["y"]
     sx = G.nodes[start_node]["x"]
 
     # 원형 루프 반지름 근사: L ≈ 2πR → R ≈ L / (2π)
     rough_radius = target_m / (2 * math.pi)
 
-    # 루프 반경 범위
+    # 옵션: 루프 반경을 조금 넉넉하게 (지형 편향 보정)
     min_r = max(rough_radius * 0.8, 200.0)
-    max_r = rough_radius * 1.6  # 넉넉하게
+    max_r = rough_radius * 1.6
 
-    raw_candidates: List[Dict[str, Any]] = []
+    sector_best: Dict[int, Tuple[int, float]] = {}
 
-    # 1) raw 후보 수집
     for n, data in G.nodes(data=True):
         if n == start_node:
             continue
@@ -231,92 +254,32 @@ def _select_via_candidates(
         lng = data.get("x")
         if lat is None or lng is None:
             continue
-
         d = haversine_m(sy, sx, lat, lng)
         if d < min_r or d > max_r:
             continue
 
+        dy = lat - sy
+        dx = lng - sx
+        angle = math.atan2(dy, dx)
+        if angle < 0:
+            angle += 2 * math.pi
+
+        sector = int(sectors * angle / (2 * math.pi))
         degree = G.degree[n]
 
-        # (1) 반경 품질: rough_radius 근처일수록 점수 ↑
-        #   d == rough_radius → 1 근처, 멀어질수록 감소
-        radius_dev = abs(d - rough_radius)
-        radius_score = max(0.0, 1.0 - radius_dev / max_r)
+        score = (d / max_r) + 0.3 * (degree / max(1, G.degree[start_node]))
 
-        # (2) 교차로 품질: degree가 높을수록 선호 (최대 6 이상은 동일 취급)
-        deg_norm = min(float(degree), 6.0) / 6.0  # 0~1
+        prev = sector_best.get(sector)
+        if prev is None or score > prev[1]:
+            sector_best[sector] = (n, score)
 
-        # 최종 품질 점수 (반경:degree = 0.7:0.3)
-        base_score = 0.7 * radius_score + 0.3 * deg_norm
+    candidates = [v for (v, _) in sector_best.values()]
+    random.shuffle(candidates)
 
-        raw_candidates.append(
-            {
-                "id": n,
-                "lat": lat,
-                "lng": lng,
-                "d": d,
-                "degree": degree,
-                "score": base_score,
-            }
-        )
+    if len(candidates) > max_total:
+        candidates = candidates[:max_total]
 
-    if not raw_candidates:
-        return []
-
-    # 2) 품질 점수 상위 일부만 사용 (속도/안정성용)
-    raw_candidates.sort(key=lambda c: c["score"], reverse=True)
-    k = max(max_total, min(MAX_PCD_RAW_CANDIDATES, len(raw_candidates)))
-    raw_candidates = raw_candidates[:k]
-
-    # 3) PCD-style greedy selection
-    chosen: List[Dict[str, Any]] = []
-    chosen_ids: List[int] = []
-
-    # 첫 번째는 품질이 가장 높은 노드 선택
-    first = raw_candidates[0]
-    chosen.append(first)
-    chosen_ids.append(first["id"])
-
-    if len(raw_candidates) == 1 or max_total == 1:
-        return [first["id"]]
-
-    # 품질-다양성 trade-off 계수 (λ)
-    LAMBDA_QUALITY = 0.5  # 품질 비중
-    # 1 - LAMBDA_QUALITY = 0.5 → 다양성 비중
-
-    while len(chosen_ids) < max_total and len(chosen_ids) < len(raw_candidates):
-        best_cand = None
-        best_value = -float("inf")
-
-        for cand in raw_candidates:
-            if cand["id"] in chosen_ids:
-                continue
-
-            # 다양성: 이미 선택된 via들과의 최소 거리
-            min_dist = float("inf")
-            for c in chosen:
-                d = haversine_m(cand["lat"], cand["lng"], c["lat"], c["lng"])
-                if d < min_dist:
-                    min_dist = d
-
-            # 거리를 max_r로 정규화 (0~1 클램핑)
-            diversity = min(1.0, max(0.0, min_dist / max_r))
-
-            quality = cand["score"]  # 이미 0~1 근사
-
-            value = LAMBDA_QUALITY * quality + (1.0 - LAMBDA_QUALITY) * diversity
-
-            if value > best_value:
-                best_value = value
-                best_cand = cand
-
-        if best_cand is None:
-            break
-
-        chosen.append(best_cand)
-        chosen_ids.append(best_cand["id"])
-
-    return chosen_ids
+    return candidates
 
 
 # ==========================
@@ -465,7 +428,6 @@ def _select_microloop_indices(node_path: List[int]) -> List[int]:
     """
     전체 경로 중에서 micro-loop를 시도해 볼 대표 노드 인덱스 선택.
     - 최대 MAX_MICRO_CANDIDATES 개
-    - 시작/중간/끝 쪽으로 고르게 분산
     """
     n = len(node_path)
     if n < 4:
@@ -504,7 +466,7 @@ def _extend_with_micro_loops(
     micro-loop(u->w->u)를 최대 max_loops번까지 삽입해서 거리 보정.
     - edge 길이 20~40m인 경우만 사용 (loop 40~80m)
     - 실제 도로 그래프 위에서만 움직임.
-    - overshoot: target_m + MAX_ABS_ERR_M 를 넘는 보정은 금지.
+    - overshoot 제한: target_m + MAX_ABS_ERR_M 를 넘는 보정은 금지.
     """
     if not node_path or len(node_path) < 2:
         return node_path, current_len
@@ -515,12 +477,11 @@ def _extend_with_micro_loops(
     candidate_indices = _select_microloop_indices(new_node_path)
 
     for _ in range(max_loops):
-        # 이미 절대 오차 45m 이내면 더 이상 보정하지 않음
+        # 이미 절대 오차 ±45m 이내면 더 이상 보정하지 않음 (시간 절약)
         missing = target_m - total_len
         if abs(missing) <= MAX_ABS_ERR_M:
             break
-        # 이미 target_m 이상인데, 부족한 정도가 크지 않으면(<=45m)도 위에서 break됨.
-        # missing <= 0 이면 더 이상 길이를 늘릴 필요가 없으니 종료
+        # 이미 target_m 이상인데, 부족한 정도가 작지 않으면(>45m)도 위에서 처리.
         if missing <= 0:
             break
 
@@ -531,24 +492,20 @@ def _extend_with_micro_loops(
 
         for i in candidate_indices:
             u = new_node_path[i]
-            # 교차로(연결이 여러 개) 위주로 시도
             if G.degree[u] < 3:
                 continue
 
             for w in G.neighbors(u):
-                # 기존 경로의 직전/직후 노드는 제외 (이미 사용 중인 방향)
                 if w == new_node_path[i - 1] or w == new_node_path[i + 1]:
                     continue
 
                 base_len = G[u][w]["length"]
-                # edge 20~40m만 사용 (loop 40~80m)
                 if base_len < MICRO_MIN_EDGE or base_len > MICRO_MAX_EDGE:
                     continue
 
                 extra = 2.0 * base_len  # u->w->u
                 candidate_len = total_len + extra
 
-                # overshoot: target_m + MAX_ABS_ERR_M 를 넘으면 금지
                 if candidate_len - target_m > MAX_ABS_ERR_M:
                     continue
 
@@ -560,10 +517,8 @@ def _extend_with_micro_loops(
                     best_new_len = candidate_len
 
         if best_idx is None or best_neighbor is None or best_new_len is None:
-            # 더 이상 쓸만한 micro-loop 없음
             break
 
-        # 실제로 node_path에 micro-loop 삽입: ... u, w, u, next ...
         insert_pos = best_idx + 1
         u = new_node_path[best_idx]
         new_node_path = (
@@ -575,30 +530,31 @@ def _extend_with_micro_loops(
 
 
 # ==========================
-# 메인: 러닝 루프 생성 (double via + 거리보정, PCD-full)
+# 메인: 러닝 루프 생성 (double via + 거리보정)
 # ==========================
 
 def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
-    """double-via 기반 러닝 루프 + micro-loop 거리보정 (PCD-full via 선택).
+    """double-via 기반 러닝 루프 + micro-loop 거리보정.
 
     - via-node 2개(A,B)를 조합해 start→A→B→start 루프를 만든다.
-    - PCD-style via 선택으로 '품질 + 다양성'을 극대화한다.
-    - 루프가 목표 거리보다 짧으면 실제 도로 위에서 micro-loop를 삽입해 거리 보정.
+    - A*를 이용해 탐색을 줄이되,
+      '거리 오차 최소'를 1순위, 모양(roundness)과 겹침(overlap)은 2순위로 둔다.
+    - 루프가 목표 거리보다 많이 짧을 때만 micro-loop를 삽입해 거리 보정.
     - 거리 허용 오차는 '절대 45m 이내' 이며,
       target_m = 요청거리 + 45m 이므로
       실제 길이는 [요청, 요청+90]m 범위 안을 노리게 된다.
     """
     start_time = time.time()
 
-    # 핵심: target_m 을 요청거리 + 45m 로 설정
-    # 실제 성공 범위는 [target_m - 45, target_m + 45] = [km*1000, km*1000 + 90]
+    # target_m 을 요청거리 + 45m 로 설정
     target_m = max(MIN_LOOP_M, km * 1000.0 + MAX_ABS_ERR_M)
 
-    # scoring 가중치 (shape/겹침/커브/길이 오차)
+    # 스코어링 가중치
+    # ERROR_ABS_WEIGHT 를 크게 두어 '오차'를 최우선
+    ERROR_ABS_WEIGHT = 1.0
     ROUNDNESS_WEIGHT = 3.0
     OVERLAP_PENALTY = 3.0
     CURVE_PENALTY_WEIGHT = 0.6
-    ERROR_WEIGHT = 2.5
 
     meta: Dict[str, Any] = {
         "status": "init",
@@ -639,7 +595,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = float(time.time() - start_time)
         return safe_list(poly), safe_dict(meta)
 
-    # 2) via-node 후보 선택 (PCD-full)
+    # 2) via-node 후보 선택
     via_nodes = _select_via_candidates(G, start_node, target_m)
     meta["via_candidates"] = via_nodes
 
@@ -803,7 +759,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
 
             meta["routes_validated"] += 1
 
-            length_term = -ERROR_WEIGHT * (err / target_m)
+            # 거리 오차 절대값을 최우선으로 하는 스코어
+            length_term = -ERROR_ABS_WEIGHT * err
             score = (
                 length_term
                 + ROUNDNESS_WEIGHT * r
@@ -841,10 +798,10 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = float(time.time() - start_time)
         return safe_list(poly), safe_dict(meta)
 
-    # 6) 거리 보정 micro-loop 삽입 (부족한 경우에만)
+    # 6) 거리 보정 micro-loop 삽입 (부족한 경우에만, 오차가 큰 경우만 시도)
     adjusted_node_path = list(best_node_path)
     adjusted_len = best_len
-    if adjusted_len < target_m:
+    if adjusted_len < target_m - MAX_ABS_ERR_M:
         adjusted_node_path, adjusted_len = _extend_with_micro_loops(
             G, adjusted_node_path, adjusted_len, target_m
         )
@@ -855,7 +812,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     adjusted_overlap = _compute_overlap_ratio(adjusted_node_path)
     adjusted_curve_penalty = _compute_curve_penalty(adjusted_poly)
 
-    length_term = -ERROR_WEIGHT * (adjusted_err / target_m)
+    length_term = -ERROR_ABS_WEIGHT * adjusted_err
     adjusted_score = (
         length_term
         + ROUNDNESS_WEIGHT * adjusted_roundness
@@ -874,8 +831,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         overlap=float(adjusted_overlap),
         curve_penalty=float(adjusted_curve_penalty),
         score=float(adjusted_score),
-        success=bool(success),
-        length_ok=bool(success),
+        success=success,
+        length_ok=success,
         used_fallback=bool(used_fallback),
         message=(
             "요청 거리와 모양을 모두 만족하는 double-loop 러닝 코스를 생성했습니다."
