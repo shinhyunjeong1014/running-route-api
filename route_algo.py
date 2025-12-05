@@ -24,7 +24,11 @@ MIN_LOOP_M = 200.0          # 최소 루프 길이 (m)
 MAX_OSMNX_RADIUS_M = 2500.0 # OSM 그래프 조회 최대 반경
 MIN_OSMNX_RADIUS_M = 600.0  # OSM 그래프 조회 최소 반경
 
+# 기존 비율 기반 오차 (지금은 사용하지 않지만 남겨둠)
 LENGTH_TOL_FRAC = 0.05      # 목표 거리 허용 오차 비율 (±5%)
+
+# 새 절대 오차 기준 (핵심)
+MAX_ABS_ERR_M = 45.0        # 목표 거리 허용 오차 (±45m)
 
 # 옵션 A 튜닝값
 SECTOR_COUNT = 12           # via-node를 뽑을 각도 섹터 개수
@@ -109,9 +113,20 @@ def polyline_length_m(poly: Polyline) -> float:
 # fallback: 기하학적 사각형 루프
 # ==========================
 
-def _fallback_square_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, float, float]:
-    """OSM/그래프를 전혀 쓰지 못할 때 사용하는 단순 정사각형 루프."""
-    target_m = max(MIN_LOOP_M, km * 1000.0)
+def _fallback_square_loop(
+    lat: float,
+    lng: float,
+    km: float,
+    target_m: Optional[float] = None,
+) -> Tuple[Polyline, float, float]:
+    """
+    OSM/그래프를 전혀 쓰지 못할 때 사용하는 단순 정사각형 루프.
+    - target_m이 주어지면 그 값을 기준으로 길이를 맞추고
+    - 없으면 km * 1000.0을 기준으로 맞춘다.
+    """
+    if target_m is None:
+        target_m = max(MIN_LOOP_M, km * 1000.0)
+
     side = target_m / 4.0
 
     d_lat = side / 111111.0
@@ -419,6 +434,7 @@ def _extend_with_micro_loops(
     micro-loop(u->w->u)를 최대 max_loops번까지 삽입해서 거리 보정.
     - edge 길이 20~40m인 경우만 사용 (loop 40~80m, 옵션 B)
     - 실제 도로 그래프 위에서만 움직임.
+    - overshoot 옵션 B: target_m + MAX_ABS_ERR_M 를 넘는 보정은 금지.
     """
     if not node_path or len(node_path) < 2:
         return node_path, current_len
@@ -429,9 +445,14 @@ def _extend_with_micro_loops(
     candidate_indices = _select_microloop_indices(new_node_path)
 
     for _ in range(max_loops):
+        # 이미 절대 오차 45m 이내면 더 이상 보정하지 않음
         missing = target_m - total_len
-        if missing <= target_m * LENGTH_TOL_FRAC:
-            break  # 이미 허용 오차 이내
+        if abs(missing) <= MAX_ABS_ERR_M:
+            break
+        # 이미 target_m 이상인데, 부족한 정도가 크지 않으면(<=45m)도 위에서 break됨.
+        # missing <= 0 이면 더 이상 길이를 늘릴 필요가 없으니 종료
+        if missing <= 0:
+            break
 
         best_idx = None
         best_neighbor = None
@@ -457,8 +478,8 @@ def _extend_with_micro_loops(
                 extra = 2.0 * base_len  # u->w->u
                 candidate_len = total_len + extra
 
-                # 너무 많이 overshoot 하면 skip
-                if candidate_len > target_m * (1.0 + LENGTH_TOL_FRAC):
+                # overshoot 옵션 B: target_m + MAX_ABS_ERR_M 를 넘으면 금지
+                if candidate_len - target_m > MAX_ABS_ERR_M:
                     continue
 
                 err = abs(candidate_len - target_m)
@@ -494,9 +515,15 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     - PCD/goal-directed A*를 이용해 탐색을 줄이되,
       거리 정밀도와 루프 모양을 동시에 고려한다.
     - 루프가 목표 거리보다 짧으면 실제 도로 위에서 micro-loop를 삽입해 거리 보정.
+    - 거리 허용 오차는 '절대 45m 이내' 이며,
+      target_m = 요청거리 + 45m 이므로
+      실제 길이는 [요청, 요청+90]m 범위 안을 노리게 된다.
     """
     start_time = time.time()
-    target_m = max(MIN_LOOP_M, km * 1000.0)
+
+    # 핵심: target_m 을 요청거리 + 45m 로 설정
+    # 실제 성공 범위는 [target_m - 45, target_m + 45] = [km*1000, km*1000 + 90]
+    target_m = max(MIN_LOOP_M, km * 1000.0 + MAX_ABS_ERR_M)
 
     # 옵션 A: scoring 가중치 조정 (shape/겹침을 좀 더 중요하게)
     ROUNDNESS_WEIGHT = 3.0
@@ -526,7 +553,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     try:
         G, start_node = _build_osm_graph(lat, lng, target_m)
     except Exception as e:
-        poly, length_m, err = _fallback_square_loop(lat, lng, km)
+        poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
         meta.update(
             status="fallback",
             len=float(length_m),
@@ -535,8 +562,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             overlap=0.0,
             curve_penalty=float(_compute_curve_penalty(poly)),
             score=None,
-            success=False,
-            length_ok=bool(err <= target_m * LENGTH_TOL_FRAC),
+            success=bool(err <= MAX_ABS_ERR_M),
+            length_ok=bool(err <= MAX_ABS_ERR_M),
             used_fallback=True,
             message=f"OSM 그래프 생성 실패로 사각형 루프를 사용했습니다: {e}",
         )
@@ -548,7 +575,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     meta["via_candidates"] = via_nodes
 
     if len(via_nodes) == 0:
-        poly, length_m, err = _fallback_square_loop(lat, lng, km)
+        poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
         meta.update(
             status="no_via_fallback",
             len=float(length_m),
@@ -557,8 +584,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             overlap=0.0,
             curve_penalty=float(_compute_curve_penalty(poly)),
             score=None,
-            success=False,
-            length_ok=bool(err <= target_m * LENGTH_TOL_FRAC),
+            success=bool(err <= MAX_ABS_ERR_M),
+            length_ok=bool(err <= MAX_ABS_ERR_M),
             used_fallback=True,
             message="via-node 후보를 찾지 못해 사각형 루프를 사용했습니다.",
         )
@@ -590,23 +617,28 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             overlap = _compute_overlap_ratio(node_path)
             curve_pen = _compute_curve_penalty(poly)
 
+            success = err <= MAX_ABS_ERR_M
+
             meta.update(
-                status="approx",
+                status="ok" if success else "approx",
                 len=float(loop_len),
                 err=float(err),
                 roundness=float(r),
                 overlap=float(overlap),
                 curve_penalty=float(curve_pen),
                 score=None,
-                success=bool(err <= target_m * LENGTH_TOL_FRAC),
-                length_ok=bool(err <= target_m * LENGTH_TOL_FRAC),
+                success=success,
+                length_ok=success,
                 used_fallback=False,
-                message="via-node가 1개뿐이라 single-loop + 거리보정으로 생성했습니다.",
+                message="via-node가 1개뿐이라 single-loop + 거리보정으로 생성했습니다."
+                        if success
+                        else f"요청 오차(±{int(MAX_ABS_ERR_M)}m)를 일부 초과했지만, "
+                             f"single-loop 거리 보정을 포함한 가장 근접한 루프를 반환합니다.",
             )
             meta["time_s"] = float(time.time() - start_time)
             return safe_list(poly), safe_dict(meta)
         except Exception as e:
-            poly, length_m, err = _fallback_square_loop(lat, lng, km)
+            poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
             meta.update(
                 status="single_via_failed",
                 len=float(length_m),
@@ -615,8 +647,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
                 overlap=0.0,
                 curve_penalty=float(_compute_curve_penalty(poly)),
                 score=None,
-                success=False,
-                length_ok=bool(err <= target_m * LENGTH_TOL_FRAC),
+                success=bool(err <= MAX_ABS_ERR_M),
+                length_ok=bool(err <= MAX_ABS_ERR_M),
                 used_fallback=True,
                 message=f"single-loop 생성 실패로 사각형 루프를 사용했습니다: {e}",
             )
@@ -633,7 +665,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             continue
 
     if not start_to_via_paths:
-        poly, length_m, err = _fallback_square_loop(lat, lng, km)
+        poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
         meta.update(
             status="no_start_via_fallback",
             len=float(length_m),
@@ -642,8 +674,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             overlap=0.0,
             curve_penalty=float(_compute_curve_penalty(poly)),
             score=None,
-            success=False,
-            length_ok=bool(err <= target_m * LENGTH_TOL_FRAC),
+            success=bool(err <= MAX_ABS_ERR_M),
+            length_ok=bool(err <= MAX_ABS_ERR_M),
             used_fallback=True,
             message="start→via 경로를 하나도 찾지 못해 사각형 루프를 사용했습니다.",
         )
@@ -723,7 +755,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             continue
 
     if not best_node_path:
-        poly, length_m, err = _fallback_square_loop(lat, lng, km)
+        poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
         meta.update(
             status="no_loop_fallback",
             len=float(length_m),
@@ -732,8 +764,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             overlap=0.0,
             curve_penalty=float(_compute_curve_penalty(poly)),
             score=None,
-            success=False,
-            length_ok=bool(err <= target_m * LENGTH_TOL_FRAC),
+            success=bool(err <= MAX_ABS_ERR_M),
+            length_ok=bool(err <= MAX_ABS_ERR_M),
             used_fallback=True,
             message="via 쌍들로 유효한 루프를 찾지 못해 사각형 루프를 사용했습니다.",
         )
@@ -762,7 +794,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         - CURVE_PENALTY_WEIGHT * adjusted_curve_penalty
     )
 
-    success = bool(adjusted_err <= target_m * LENGTH_TOL_FRAC)
+    success = adjusted_err <= MAX_ABS_ERR_M
     used_fallback = False
 
     meta.update(
@@ -779,7 +811,8 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         message=(
             "요청 거리와 모양을 모두 만족하는 double-loop 러닝 코스를 생성했습니다."
             if success
-            else f"요청 오차(±{int(target_m * LENGTH_TOL_FRAC)}m)를 일부 초과했지만, 거리 보정을 포함한 가장 근접한 루프를 반환합니다."
+            else f"요청 오차(±{int(MAX_ABS_ERR_M)}m)를 일부 초과했지만, "
+                 f"거리 보정을 포함한 가장 근접한 루프를 반환합니다."
         ),
     )
     meta["time_s"] = float(time.time() - start_time)
