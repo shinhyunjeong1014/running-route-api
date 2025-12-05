@@ -9,6 +9,9 @@ import networkx as nx
 
 try:
     import osmnx as ox
+    # [최적화 1] 캐싱 활성화: 한 번 받은 지도는 로컬에 저장하여 재다운로드 시간 삭제
+    ox.settings.use_cache = True
+    ox.settings.log_console = False
 except Exception:  # 배포 환경에서 import 실패 대비
     ox = None
 
@@ -254,8 +257,10 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
     if ox is None:
         raise RuntimeError("osmnx가 설치되어 있지 않습니다.")
 
-    # API 부하와 커버리지를 고려한 반경 (meter)
-    radius_m = max(700.0, km * 500.0 + 700.0)
+    # [최적화 2] API 부하와 커버리지를 고려한 반경 축소
+    # 기존: max(700.0, km * 500.0 + 700.0) -> 약 2200m (3km 기준)
+    # 수정: max(500.0, km * 350.0 + 500.0) -> 약 1550m (3km 기준, 면적 약 50% 감소)
+    radius_m = max(500.0, km * 350.0 + 500.0)
 
     G = ox.graph_from_point(
         (lat, lng),
@@ -313,9 +318,6 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     """
     요청 좌표(lat, lng)와 목표 거리(km)를 기반으로
     '요청거리 정확도'와 '루프 모양'을 동시에 고려한 러닝 루프를 생성한다.
-
-    - 1202_3_v2: poisoning 기반 rod + detour 루프 (모양이 좋음)
-    - 251202  : 목표 거리 오차(±5%)를 강하게 제어 (길이 정확도 좋음)
     """
     start_time = time.time()
     target_m = max(200.0, km * 1000.0)
@@ -471,9 +473,10 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    # 너무 많으면 샘플링
+    # [최적화 3] 너무 많으면 샘플링 (120 -> 30으로 축소)
+    # 단일 CPU 환경에서 G.copy() 부하를 줄이기 위함
     random.shuffle(candidate_nodes)
-    candidate_nodes = candidate_nodes[:120]
+    candidate_nodes = candidate_nodes[:30]
 
     best_score = -1e18
     best_poly: Optional[Polyline] = None
@@ -503,6 +506,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
             continue
 
         # 4-2. forward poisoning 적용
+        # (이 부분이 가장 부하가 큰 작업이므로 반복 횟수를 줄이는 게 핵심)
         poisoned = _apply_route_poison(undirected, forward_nodes, factor=8.0)
 
         # 4-3. poisoned 그래프에서 backward
