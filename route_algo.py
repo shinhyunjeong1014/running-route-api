@@ -25,12 +25,19 @@ MAX_OSMNX_RADIUS_M = 2500.0 # OSM 그래프 조회 최대 반경
 MIN_OSMNX_RADIUS_M = 600.0  # OSM 그래프 조회 최소 반경
 
 LENGTH_TOL_FRAC = 0.05      # 목표 거리 허용 오차 비율 (±5%)
+
+# 옵션 A 튜닝값
 SECTOR_COUNT = 12           # via-node를 뽑을 각도 섹터 개수
-MAX_VIA_TOTAL = 6           # 전체 via-node 상한 (double-loop 대비)
-MAX_VIA_PAIRS = 15          # 평가할 via 쌍 최대 개수
+MAX_VIA_TOTAL = 4           # via-node 상한 (속도/품질 균형)
+MAX_VIA_PAIRS = 6           # 평가할 via 쌍 최대 개수
 
 POISON_FACTOR = 3.0         # 왕복 경로 억제를 위한 가중치 배수
-MAX_MICRO_LOOPS = 3         # 거리 보정 micro-loop 최대 삽입 횟수
+
+# micro-loop (옵션 B: 40~80m × 2~3회)
+MAX_MICRO_LOOPS = 3
+MICRO_MIN_EDGE = 20.0       # edge 길이 하한 (20m → loop 40m)
+MICRO_MAX_EDGE = 40.0       # edge 길이 상한 (40m → loop 80m)
+MAX_MICRO_CANDIDATES = 15   # micro-loop 후보 노드 최대 개수
 
 
 # ==========================
@@ -131,8 +138,7 @@ def _build_osm_graph(lat: float, lng: float, target_m: float) -> Tuple[nx.Graph,
     if ox is None:
         raise RuntimeError("osmnx 가 설치되어 있지 않습니다.")
 
-    # 요청 거리와 좌표가 항상 다르다는 점을 고려해,
-    # 목표 거리 기반으로 "적당한" 반경을 설정 (지형에 따라 조금 작은 그래프일 수는 있음)
+    # 좌표와 요청거리가 매번 달라도 적절한 그래프가 만들어지도록
     radius = max(MIN_OSMNX_RADIUS_M, min(MAX_OSMNX_RADIUS_M, target_m * 0.7))
 
     G_raw = ox.graph_from_point(
@@ -183,12 +189,12 @@ def _select_via_candidates(
     sy = G.nodes[start_node]["y"]
     sx = G.nodes[start_node]["x"]
 
-    # 원형 루프의 반지름 근사: L ≈ 2πR → R ≈ L / (2π)
+    # 원형 루프 반지름 근사: L ≈ 2πR → R ≈ L / (2π)
     rough_radius = target_m / (2 * math.pi)
 
-    # 요청 거리와 좌표가 매번 다르므로, 지형에 따라 조금 유연하게 링 폭을 설정
+    # 옵션 A: 루프 반경을 조금 넉넉하게 (지형 편향 보정)
     min_r = max(rough_radius * 0.8, 200.0)
-    max_r = rough_radius * 1.3  # 약간 더 여유를 줌
+    max_r = rough_radius * 1.6  # 이전 1.3 → 1.6으로 확장
 
     sector_best: Dict[int, Tuple[int, float]] = {}
 
@@ -221,6 +227,7 @@ def _select_via_candidates(
     candidates = [v for (v, _) in sector_best.values()]
     random.shuffle(candidates)
 
+    # 옵션 A: 최대 4개까지만 via-node 사용
     if len(candidates) > max_total:
         candidates = candidates[:max_total]
 
@@ -366,6 +373,36 @@ def _compute_curve_penalty(poly: Polyline) -> float:
 
 
 # ==========================
+# micro-loop 후보 노드 선택
+# ==========================
+
+def _select_microloop_indices(node_path: List[int]) -> List[int]:
+    """
+    전체 경로 중에서 micro-loop를 시도해 볼 대표 노드 인덱스 선택.
+    - 옵션 A: 최대 MAX_MICRO_CANDIDATES 개
+    - 시작/중간/끝 쪽으로 고르게 분산
+    """
+    n = len(node_path)
+    if n < 4:
+        return []
+
+    indices = []
+
+    # 내부 노드 구간만 사용 (0, n-1 제외)
+    inner = list(range(1, n - 1))
+    if len(inner) <= MAX_MICRO_CANDIDATES:
+        return inner
+
+    step = max(1, len(inner) // MAX_MICRO_CANDIDATES)
+    for i in range(0, len(inner), step):
+        indices.append(inner[i])
+        if len(indices) >= MAX_MICRO_CANDIDATES:
+            break
+
+    return indices
+
+
+# ==========================
 # 거리 보정용 micro-loop 삽입
 # ==========================
 
@@ -378,8 +415,9 @@ def _extend_with_micro_loops(
 ) -> Tuple[List[int], float]:
     """
     루프 길이가 목표보다 짧을 때,
-    경로 상의 교차로에서 옆 골목으로 들어갔다 나오는 micro-loop(u->w->u)를
-    최대 max_loops번까지 삽입해서 거리 보정.
+    경로 상의 대표 교차로들에서 옆 골목으로 들어갔다 나오는
+    micro-loop(u->w->u)를 최대 max_loops번까지 삽입해서 거리 보정.
+    - edge 길이 20~40m인 경우만 사용 (loop 40~80m, 옵션 B)
     - 실제 도로 그래프 위에서만 움직임.
     """
     if not node_path or len(node_path) < 2:
@@ -387,6 +425,8 @@ def _extend_with_micro_loops(
 
     new_node_path = list(node_path)
     total_len = current_len
+
+    candidate_indices = _select_microloop_indices(new_node_path)
 
     for _ in range(max_loops):
         missing = target_m - total_len
@@ -398,8 +438,7 @@ def _extend_with_micro_loops(
         best_new_len = None
         best_err = float("inf")
 
-        # 경로 중간 노드들에서 micro-loop 후보 탐색
-        for i in range(1, len(new_node_path) - 1):
+        for i in candidate_indices:
             u = new_node_path[i]
             # 교차로(연결이 여러 개) 위주로 시도
             if G.degree[u] < 3:
@@ -409,12 +448,19 @@ def _extend_with_micro_loops(
                 # 기존 경로의 직전/직후 노드는 제외 (이미 사용 중인 방향)
                 if w == new_node_path[i - 1] or w == new_node_path[i + 1]:
                     continue
+
                 base_len = G[u][w]["length"]
+                # 옵션 B: edge 20~40m만 사용 (loop 40~80m)
+                if base_len < MICRO_MIN_EDGE or base_len > MICRO_MAX_EDGE:
+                    continue
+
                 extra = 2.0 * base_len  # u->w->u
                 candidate_len = total_len + extra
+
                 # 너무 많이 overshoot 하면 skip
                 if candidate_len > target_m * (1.0 + LENGTH_TOL_FRAC):
                     continue
+
                 err = abs(candidate_len - target_m)
                 if err < best_err:
                     best_err = err
@@ -438,11 +484,11 @@ def _extend_with_micro_loops(
 
 
 # ==========================
-# 메인: 러닝 루프 생성 (double via + 거리보정)
+# 메인: 러닝 루프 생성 (double via + 거리보정, 옵션 A/B)
 # ==========================
 
 def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
-    """double-via 기반 러닝 루프 + 거리보정 micro-loop.
+    """double-via 기반 러닝 루프 + micro-loop 거리보정 (옵션 A/B).
 
     - via-node 2개(A,B)를 조합해 start→A→B→start 루프를 만든다.
     - PCD/goal-directed A*를 이용해 탐색을 줄이되,
@@ -452,10 +498,11 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
     start_time = time.time()
     target_m = max(MIN_LOOP_M, km * 1000.0)
 
-    ROUNDNESS_WEIGHT = 2.5
-    OVERLAP_PENALTY = 2.0
-    CURVE_PENALTY_WEIGHT = 0.4
-    ERROR_WEIGHT = 4.0  # 길이 오차 비중을 조금 더 강화
+    # 옵션 A: scoring 가중치 조정 (shape/겹침을 좀 더 중요하게)
+    ROUNDNESS_WEIGHT = 3.0
+    OVERLAP_PENALTY = 3.0
+    CURVE_PENALTY_WEIGHT = 0.6
+    ERROR_WEIGHT = 2.5
 
     meta: Dict[str, Any] = {
         "status": "init",
@@ -518,7 +565,7 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = float(time.time() - start_time)
         return safe_list(poly), safe_dict(meta)
 
-    # via-node가 1개뿐이면 기존 single-loop 방식으로라도 사용
+    # via-node가 1개뿐이면 single-loop + 거리보정
     if len(via_nodes) == 1:
         only_v = via_nodes[0]
         try:
