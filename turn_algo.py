@@ -26,12 +26,11 @@ RUNNING_SPEED_KMH = 8.0
 
 # POI 관련 (카카오만 사용)
 KAKAO_REST_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
-KAKAO_POI_RADIUS_M = 100.0        # 턴 주변 검색 반경 (직선 거리)
+KAKAO_POI_RADIUS_M = 150.0        # 턴 주변 검색 반경 (직선 거리)
 
-# [수정] 랜드마크 스캔 범위 및 수직 거리 제한 강화
-POI_SCAN_BEFORE_M = 40.0          # 턴 기준 경로 상 이전 구간
-POI_SCAN_AFTER_M = 50.0           # 턴 기준 경로 상 이후 구간
-POI_LATERAL_MAX_M = 10.0          # [변경] 경로와 수직거리 임계값 축소 (15m -> 10m)
+POI_SCAN_BEFORE_M = 60.0          # 턴 기준 경로 상 이전 구간(POI 허용 범위)
+POI_SCAN_AFTER_M = 80.0           # 턴 기준 경로 상 이후 구간(POI 허용 범위)
+POI_LATERAL_MAX_M = 25.0          # 경로와 수직거리 임계값(이상일 경우 "지나간다"라고 말하면 안 됨)
 
 KAKAO_TIMEOUT_SEC = 2.0
 KAKAO_CATEGORY_CODES = ["CS2", "CE7", "FD6"]  # 편의점, 카페, 음식점 위주
@@ -251,41 +250,19 @@ def classify_poi_relation_to_turn(
 def shorten_poi_name(name: str) -> str:
     name = name.strip()
 
-    # 1. [New] 유명 브랜드 필터링 (가장 강력한 단축)
-    # 목록에 있는 브랜드가 이름에 포함되면, 브랜드명만 반환
-    # 예: "CU 인하대후문점" -> "CU"
-    for brand, _ in BRAND_KEYWORDS:
-        if brand.lower() in name.lower():
-            # 브랜드명이 너무 짧은 경우(예: CU) 다른 단어 포함 방지
-            if len(brand) <= 2:
-                if name.lower().startswith(brand.lower()):
-                    return brand
-            else:
-                return brand
-
-    # 2. 괄호 및 특수문자 뒤 내용 제거 (기존 로직)
+    # 괄호 뒤, 하이픈 뒤 등 추가정보 제거
     for sep in ["|", "/", "·", "-", "—", "(", ","]:
         if sep in name:
             name = name.split(sep)[0].strip()
 
-    # 3. 지점명 제거 (공백 기준으로 분리 후 "점", "지점" 등으로 끝나는 단어 제거)
-    tokens = name.split()
-    if len(tokens) > 1:
-        last_token = tokens[-1]
-        if last_token.endswith("점") or last_token.endswith("지점") or last_token.endswith("호점"):
-            name = " ".join(tokens[:-1]).strip()
+    # "OO점", "OO지점", "OO호점" 등의 꼬리 제거
+    for suffix in ["지점", "점", "호점"]:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)].strip()
 
-    # 4. 띄어쓰기 없이 붙어있는 지점명 처리
-    if len(name) > 3 and (name.endswith("지점") or name.endswith("호점")):
-         if name.endswith("지점"):
-             name = name[:-2].strip()
-         elif name.endswith("호점"):
-             name = name[:-2].strip()
-
-    # 5. 너무 길면 자르기
+    # 너무 길면 15자 정도로 자르기
     if len(name) > 15:
         name = name[:15].rstrip()
-        
     return name
 
 
