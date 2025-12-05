@@ -466,3 +466,5 @@ def generate_area_loop(G: nx.MultiGraph, lat: float, lng: float, km: float) -> T
     meta["time_s"] = time.time() - start_time
 
     return safe_list(best_poly), safe_dict(meta)
+
+
