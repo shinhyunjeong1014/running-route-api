@@ -317,7 +317,25 @@ def _extend_with_micro_loops(
 
     return new_path, total_len
 
+def haversine_m(lat1, lon1, lat2, lon2):
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
+
+def polyline_length_m(polyline):
+    """[[lat,lng],...] polyline의 총 길이(m)를 계산"""
+    if not polyline or len(polyline) < 2:
+        return 0.0
+    total = 0.0
+    for (lat1, lng1), (lat2, lng2) in zip(polyline[:-1], polyline[1:]):
+        total += haversine_m(lat1, lng1, lat2, lng2)
+    return total
+    
 # ==========================
 # 메인: generate_area_loop
 # ==========================
