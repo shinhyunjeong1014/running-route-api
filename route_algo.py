@@ -549,26 +549,27 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         return safe_list(poly), safe_dict(meta)
 
     # 4) 최종 메타 정보 구성
-    success = best_err <= target_m * LENGTH_TOL_FRAC
+    success = bool(best_err <= target_m * LENGTH_TOL_FRAC)
     used_fallback = False
 
     meta.update(
         status="ok" if success else "approx",
-        len=best_len,
-        err=best_err,
-        roundness=best_roundness,
-        overlap=best_overlap,
-        curve_penalty=best_curve_penalty,
-        score=best_score,
+        len=float(best_len),
+        err=float(best_err),
+        roundness=float(best_roundness),
+        overlap=float(best_overlap),
+        curve_penalty=float(best_curve_penalty),
+        score=float(best_score),
         success=success,
         length_ok=success,
-        used_fallback=used_fallback,
+        used_fallback=bool(used_fallback),
         message=(
             "요청 거리와 모양을 모두 만족하는 러닝 루프를 생성했습니다."
             if success
             else f"요청 오차(±{int(target_m * LENGTH_TOL_FRAC)}m)를 일부 초과했지만, 가장 근접한 러닝 루프를 반환합니다."
         ),
     )
-    meta["time_s"] = time.time() - start_time
+
+    meta["time_s"] = float(time.time() - start_time)
 
     return safe_list(best_poly), safe_dict(meta)
