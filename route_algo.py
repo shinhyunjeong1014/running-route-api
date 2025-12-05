@@ -270,11 +270,30 @@ def _nodes_to_polyline(G: nx.MultiGraph, nodes: List[int]) -> Polyline:
             poly.append((float(node_v['y']), float(node_v['x'])))
             continue
 
-        # MultiGraph이므로 여러 엣지 중 최적(최단 거리) 엣지 선택
+        # MultiGraph이므로 u-v 사이에 여러 엣지가 있을 수 있음
         edges = G[u][v]
-        # length가 가장 짧은 키를 선택 (Dijkstra가 선택했을 가능성 높음)
-        best_key = min(edges, key=lambda k: edges[k].get('length', float('inf')))
-        data = edges[best_key]
+        
+        # [수정] geometry가 있는 엣지를 우선적으로 선택하도록 로직 강화
+        with_geom = []
+        without_geom = []
+        
+        for key, data in edges.items():
+            if 'geometry' in data:
+                with_geom.append(data)
+            else:
+                without_geom.append(data)
+        
+        # 1순위: geometry가 있는 엣지 중 가장 짧은 것
+        if with_geom:
+            data = min(with_geom, key=lambda d: d.get('length', float('inf')))
+        # 2순위: geometry가 없다면 그냥 가장 짧은 것
+        elif without_geom:
+            data = min(without_geom, key=lambda d: d.get('length', float('inf')))
+        else:
+            # Should not happen
+            node_v = G.nodes[v]
+            poly.append((float(node_v['y']), float(node_v['x'])))
+            continue
 
         if 'geometry' in data:
             # OSMnx는 geometry를 shapely.geometry.LineString으로 저장함 ((lng, lat) 순서)
