@@ -495,6 +495,9 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
+    # [수정] used_fallback 변수 초기화 추가 (경로 생성 성공 시 사용됨)
+    used_fallback = False
+
     if best_poly:
         first_lat, first_lng = best_poly[0]
         if haversine(lat, lng, first_lat, first_lng) > 1.0:
