@@ -7,7 +7,7 @@ import os
 import pickle
 import time
 
-# 수정된 모듈 import (route_algo, turn_algo는 이전 버전 유지)
+# 수정된 모듈 import
 from route_algo import generate_area_loop, polyline_length_m
 from turn_algo import build_turn_by_turn_async
 
@@ -18,7 +18,7 @@ logger.setLevel(logging.INFO)
 # Global Graph Storage
 # ============================
 global_graph = None
-MAP_FILE = "my_area.pickle"  # Pickle 파일 사용
+MAP_FILE = "my_area.pickle"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -111,21 +111,36 @@ async def recommend_route(
         }
 
     # 2) 루프 생성 (CPU 연산)
-    # route_algo.py는 이미 Graph 객체를 받도록 수정되었음
-    polyline_tuples, meta = generate_area_loop(global_graph, lat, lng, km)
+    try:
+        polyline_tuples, meta = generate_area_loop(global_graph, lat, lng, km)
+    except Exception as e:
+        print(f"🔥 알고리즘 에러 발생: {e}")
+        return {
+            "status": "error",
+            "message": f"경로 생성 중 내부 오류: {e}",
+            "start": start_point_dict,
+            "polyline": [start_point_dict],
+            "turns": [],
+            "summary": {"length_m": 0, "km_requested": km, "estimated_time_min": 0, "event_count": 0},
+            "meta": {"success": False}
+        }
     
     is_valid_route = polyline_tuples and polyline_length_m(polyline_tuples) > 0
 
     if is_valid_route:
         # 3) [Await] 비동기 턴바이턴 생성 (I/O 병렬 처리)
-        turns, summary = await build_turn_by_turn_async(polyline_tuples, km_requested=km)
-        
+        try:
+            turns, summary = await build_turn_by_turn_async(polyline_tuples, km_requested=km)
+        except Exception as e:
+            print(f"🔥 턴바이턴 에러 발생: {e}")
+            turns, summary = [], {"length_m": 0}
+
         # 메시지 처리
         final_message = meta.get("message", "")
         if meta.get("success", False):
             final_message = "최적의 정밀 경로가 도출되었습니다."
         elif not final_message:
-            final_message = f"요청 오차 범위를 초과하지만, 가장 인접한 경로({summary['length_m']}m)를 반환합니다."
+            final_message = f"요청 오차 범위를 초과하지만, 가장 인접한 경로({summary.get('length_m', 0)}m)를 반환합니다."
         
         meta["message"] = final_message
         
@@ -148,4 +163,5 @@ async def recommend_route(
             "summary": {"length_m": meta.get("len", 0.0), "km_requested": km, "estimated_time_min": 0.0, "event_count": 0},
             "meta": meta,
         }
+
 
