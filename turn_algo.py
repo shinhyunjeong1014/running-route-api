@@ -26,12 +26,12 @@ RUNNING_SPEED_KMH = 8.0
 
 # POI 관련 (카카오만 사용)
 KAKAO_REST_API_KEY = "dc3686309f8af498d7c62bed0321ee64"
-KAKAO_POI_RADIUS_M = 100.0        # 턴 주변 검색 반경 (직선 거리) - 기존 150m에서 축소
+KAKAO_POI_RADIUS_M = 100.0        # 턴 주변 검색 반경 (직선 거리)
 
-# [수정] 랜드마크 스캔 범위 축소 (너무 먼 시설물 배제)
-POI_SCAN_BEFORE_M = 40.0          # 턴 기준 경로 상 이전 구간 (기존 60m -> 40m)
-POI_SCAN_AFTER_M = 50.0           # 턴 기준 경로 상 이후 구간 (기존 80m -> 50m)
-POI_LATERAL_MAX_M = 15.0          # 경로와 수직거리 임계값 (기존 25m -> 15m, 길가에 붙은 곳만)
+# [수정] 랜드마크 스캔 범위 및 수직 거리 제한 강화
+POI_SCAN_BEFORE_M = 40.0          # 턴 기준 경로 상 이전 구간
+POI_SCAN_AFTER_M = 50.0           # 턴 기준 경로 상 이후 구간
+POI_LATERAL_MAX_M = 10.0          # [변경] 경로와 수직거리 임계값 축소 (15m -> 10m)
 
 KAKAO_TIMEOUT_SEC = 2.0
 KAKAO_CATEGORY_CODES = ["CS2", "CE7", "FD6"]  # 편의점, 카페, 음식점 위주
@@ -251,37 +251,38 @@ def classify_poi_relation_to_turn(
 def shorten_poi_name(name: str) -> str:
     name = name.strip()
 
-    # 1. 괄호 및 특수문자 뒤 내용 제거 (기존 로직)
-    # 예: "스타벅스 (강남점)" -> "스타벅스"
+    # 1. [New] 유명 브랜드 필터링 (가장 강력한 단축)
+    # 목록에 있는 브랜드가 이름에 포함되면, 브랜드명만 반환
+    # 예: "CU 인하대후문점" -> "CU"
+    for brand, _ in BRAND_KEYWORDS:
+        if brand.lower() in name.lower():
+            # 브랜드명이 너무 짧은 경우(예: CU) 다른 단어 포함 방지
+            if len(brand) <= 2:
+                if name.lower().startswith(brand.lower()):
+                    return brand
+            else:
+                return brand
+
+    # 2. 괄호 및 특수문자 뒤 내용 제거 (기존 로직)
     for sep in ["|", "/", "·", "-", "—", "(", ","]:
         if sep in name:
             name = name.split(sep)[0].strip()
 
-    # 2. [수정됨] 지점명 제거 (공백 기준으로 분리 후 "점", "지점" 등으로 끝나는 단어 제거)
-    # 예: "CU 인하대후문점" -> "CU"
-    # 예: "스타벅스 강남대로점" -> "스타벅스"
+    # 3. 지점명 제거 (공백 기준으로 분리 후 "점", "지점" 등으로 끝나는 단어 제거)
     tokens = name.split()
     if len(tokens) > 1:
-        # 마지막 단어가 지점명인 경우가 많으므로 확인
         last_token = tokens[-1]
         if last_token.endswith("점") or last_token.endswith("지점") or last_token.endswith("호점"):
-            # 지점명을 제외한 나머지 부분만 다시 합침
             name = " ".join(tokens[:-1]).strip()
 
-    # 3. [보완] 혹시 띄어쓰기가 안 되어 있는 경우 (예: "스타벅스강남점")
-    # 유명 브랜드 이름이 포함되어 있다면 그 브랜드 이름만 남기는 것도 방법이나,
-    # 오탐 가능성이 있어 보수적으로 "점"으로 끝나는 긴 이름은 뒤를 자름
-    # (단, "상점", "백화점" 같은 고유명사 제외를 위해 3글자 이상일 때만)
+    # 4. 띄어쓰기 없이 붙어있는 지점명 처리
     if len(name) > 3 and (name.endswith("지점") or name.endswith("호점")):
          if name.endswith("지점"):
              name = name[:-2].strip()
          elif name.endswith("호점"):
              name = name[:-2].strip()
-    
-    # "점"으로 끝나는 경우, 브랜드명일 수도 있으므로 주의 (예: "맥도날드점"은 없겠지만)
-    # 일반적으로 카카오맵 데이터는 "브랜드명 지점명" 형태가 많으므로 2번 로직이 핵심입니다.
 
-    # 4. 너무 길면 15자 정도로 자르기 (기존 로직)
+    # 5. 너무 길면 자르기
     if len(name) > 15:
         name = name[:15].rstrip()
         
