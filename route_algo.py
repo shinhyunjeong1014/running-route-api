@@ -8,55 +8,49 @@ from itertools import combinations
 from typing import List, Tuple, Dict, Any, Optional
 
 import networkx as nx
-import numpy as np
 
 try:
     import osmnx as ox
-except Exception:
+except Exception:  # 배포 환경에서 import 실패 대비
     ox = None
-
 
 LatLng = Tuple[float, float]
 Polyline = List[LatLng]
 
-
 # -----------------------------
 # 기본 상수
 # -----------------------------
-MIN_LOOP_M = 200.0
-MAX_OSMNX_RADIUS_M = 2500.0
-MIN_OSMNX_RADIUS_M = 600.0
+MIN_LOOP_M = 200.0          # 최소 루프 길이 (m)
+MAX_OSMNX_RADIUS_M = 2500.0 # OSM 그래프 조회 최대 반경
+MIN_OSMNX_RADIUS_M = 600.0  # OSM 그래프 조회 최소 반경
 
-LENGTH_TOL_FRAC = 0.05
+# 기존 비율 기반 오차 (지금은 사용하지 않지만 남겨둠)
+LENGTH_TOL_FRAC = 0.05      # 목표 거리 허용 오차 비율 (±5%)
 
-# 절대 오차 기준
-MAX_ABS_ERR_M = 45.0
+# 새 절대 오차 기준 (핵심)
+MAX_ABS_ERR_M = 45.0        # 목표 거리 허용 오차 (±45m)
 
-# Via-node 설정
-SECTOR_COUNT = 12
-MAX_VIA_TOTAL = 4
-MAX_VIA_PAIRS = 6
+# 옵션 A 튜닝값
+SECTOR_COUNT = 12           # (이제는 사용 X, 남겨둠)
+MAX_VIA_TOTAL = 4           # via-node 상한 (속도/품질 균형)
+MAX_VIA_PAIRS = 6           # 평가할 via 쌍 최대 개수
 
-POISON_FACTOR = 3.0
+POISON_FACTOR = 3.0         # 왕복 경로 억제를 위한 가중치 배수
 
-# micro-loop 설정
+# micro-loop (옵션 B: 40~80m × 2~3회)
 MAX_MICRO_LOOPS = 3
-MICRO_MIN_EDGE = 20.0
-MICRO_MAX_EDGE = 40.0
-MAX_MICRO_CANDIDATES = 15
+MICRO_MIN_EDGE = 20.0       # edge 길이 하한 (20m → loop 40m)
+MICRO_MAX_EDGE = 40.0       # edge 길이 상한 (40m → loop 80m)
+MAX_MICRO_CANDIDATES = 15   # micro-loop 후보 노드 최대 개수
+MAX_PCD_RAW_CANDIDATES = 80 # PCD용 raw 후보 최대 개수 (점수 상위 k개만 사용)
 
 
 # ==========================
 # JSON-safe 유틸
 # ==========================
-def safe_bool(x: Any) -> bool:
-    """numpy.bool_ → Python bool"""
-    return bool(x)
-
 
 def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
-    if isinstance(x, (np.floating, float)):
-        x = float(x)
+    if isinstance(x, float):
         if math.isinf(x) or math.isnan(x):
             return default
     return x
@@ -68,10 +62,8 @@ def safe_list(lst: Any) -> list:
     out = []
     for v in lst:
         if isinstance(v, (list, tuple)):
-            out.append([safe_float(x) for x in v])
+            out.append([safe_float(x, None) for x in v])
         else:
-            if isinstance(v, np.bool_):
-                v = bool(v)
             out.append(v)
     return out
 
@@ -81,49 +73,63 @@ def safe_dict(d: Any) -> dict:
         return {}
     out = {}
     for k, v in d.items():
-        if isinstance(v, (float, np.floating)):
-            out[k] = safe_float(v)
+        if isinstance(v, float):
+            out[k] = safe_float(v, None)
         elif isinstance(v, (list, tuple)):
             out[k] = safe_list(v)
         elif isinstance(v, dict):
             out[k] = safe_dict(v)
-        elif isinstance(v, np.bool_):
-            out[k] = bool(v)
         else:
             out[k] = v
     return out
 
 
 # ==========================
-# 거리 계산
+# 거리 계산 유틸
 # ==========================
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """두 위경도 좌표 사이의 대략적인 거리(m)."""
     R = 6371000.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
-    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
 
 def polyline_length_m(poly: Polyline) -> float:
-    if len(poly) < 2:
+    """단순 위경도 polyline 길이(m). (fallback 경로 등에서 사용)"""
+    if not poly or len(poly) < 2:
         return 0.0
-    dist = 0.0
+    total = 0.0
     for (la1, lo1), (la2, lo2) in zip(poly[:-1], poly[1:]):
-        dist += haversine_m(la1, lo1, la2, lo2)
-    return dist
+        total += haversine_m(la1, lo1, la2, lo2)
+    return total
 
 
 # ==========================
-# fallback 사각형 루프
+# fallback: 기하학적 사각형 루프
 # ==========================
-def _fallback_square_loop(lat: float, lng: float, km: float, target_m=None):
+
+def _fallback_square_loop(
+    lat: float,
+    lng: float,
+    km: float,
+    target_m: Optional[float] = None,
+) -> Tuple[Polyline, float, float]:
+    """
+    OSM/그래프를 전혀 쓰지 못할 때 사용하는 단순 정사각형 루프.
+    - target_m이 주어지면 그 값을 기준으로 길이를 맞추고
+    - 없으면 km * 1000.0을 기준으로 맞춘다.
+    """
     if target_m is None:
         target_m = max(MIN_LOOP_M, km * 1000.0)
 
     side = target_m / 4.0
+
     d_lat = side / 111111.0
     d_lng = side / (111111.0 * max(math.cos(math.radians(lat)), 1e-6))
 
@@ -134,274 +140,467 @@ def _fallback_square_loop(lat: float, lng: float, km: float, target_m=None):
     p5 = (lat, lng)
 
     poly = [p1, p2, p3, p4, p5]
-    length = polyline_length_m(poly)
-    err = abs(length - target_m)
-    return poly, length, err
+    length_m = polyline_length_m(poly)
+    err = abs(length_m - target_m)
+    return poly, length_m, err
 
 
 # ==========================
-# OSM 그래프 생성
+# OSM 그래프 생성 / 전처리
 # ==========================
-def _build_osm_graph(lat, lng, target_m):
+
+def _build_osm_graph(lat: float, lng: float, target_m: float) -> Tuple[nx.Graph, int]:
+    """OSMnx 보행자 그래프를 만들고 단순 무방향 그래프로 변환."""
     if ox is None:
-        raise RuntimeError("osmnx 미설치")
+        raise RuntimeError("osmnx 가 설치되어 있지 않습니다.")
 
+    # 좌표와 요청거리가 매번 달라도 적절한 그래프가 만들어지도록
     radius = max(MIN_OSMNX_RADIUS_M, min(MAX_OSMNX_RADIUS_M, target_m * 0.7))
 
-    G_raw = ox.graph_from_point((lat, lng), dist=radius, network_type="walk", simplify=True)
-    G_ud = ox.utils_graph.get_undirected(G_raw)
-    G_ud = ox.distance.add_edge_lengths(G_ud)
+    G_raw = ox.graph_from_point(
+        (lat, lng),
+        dist=radius,
+        network_type="walk",
+        simplify=True,
+    )
 
-    # 단일 그래프 구성
+    G_undirected = ox.utils_graph.get_undirected(G_raw)
+    G_undirected = ox.distance.add_edge_lengths(G_undirected)
+
+    # MultiGraph -> Graph (가장 짧은 edge 선택)
     G = nx.Graph()
-    for u, v, data in G_ud.edges(data=True):
-        l = data.get("length", 1.0)
+    for u, v, data in G_undirected.edges(data=True):
+        length = data.get("length", 1.0)
         if G.has_edge(u, v):
-            if l < G[u][v]["length"]:
-                G[u][v]["length"] = l
+            if length < G[u][v]["length"]:
+                G[u][v]["length"] = length
         else:
-            G.add_edge(u, v, length=l)
+            G.add_edge(u, v, length=length)
 
-    for n, d in G_ud.nodes(data=True):
+    for n, data in G_undirected.nodes(data=True):
         if n not in G:
             G.add_node(n)
-        G.nodes[n]["y"] = d.get("y")
-        G.nodes[n]["x"] = d.get("x")
+        G.nodes[n]["y"] = data.get("y")
+        G.nodes[n]["x"] = data.get("x")
 
-    start_node = ox.distance.nearest_nodes(G_ud, lng, lat)
+    start_node = ox.distance.nearest_nodes(G_undirected, lng, lat)
+    if start_node not in G:
+        raise RuntimeError("시작 노드를 그래프에서 찾을 수 없습니다.")
+
     return G, start_node
 
 
 # ==========================
-# via-node 후보
+# via-node 후보 선택 (PCD-full)
 # ==========================
-def _select_via_candidates(G, start, target_m, sectors=SECTOR_COUNT, max_total=MAX_VIA_TOTAL):
-    sy = G.nodes[start]["y"]
-    sx = G.nodes[start]["x"]
 
-    rough_r = target_m / (2 * math.pi)
-    min_r = max(rough_r * 0.8, 200.0)
-    max_r = rough_r * 1.6
+def _select_via_candidates(
+    G: nx.Graph,
+    start_node: int,
+    target_m: float,
+    sectors: int = SECTOR_COUNT,   # (unused, 유지만)
+    max_total: int = MAX_VIA_TOTAL,
+) -> List[int]:
+    """
+    PCD-full 스타일 via-node 선택:
+    1) start에서 거리, degree 기반으로 raw 후보를 만든 뒤
+    2) 점수 상위 k개에서
+    3) '품질(score) + 다양성(closest-distance)'를 동시에 극대화하는 greedy selection.
 
-    sector_best = {}
+    - 품질(score): 목표 반경에 얼마나 잘 맞는지 + 교차로(degree) 선호
+    - 다양성(diversity): 이미 선택된 via들과의 최소거리(maximize)
+    """
 
-    for n, d in G.nodes(data=True):
-        if n == start:
+    sy = G.nodes[start_node]["y"]
+    sx = G.nodes[start_node]["x"]
+
+    # 원형 루프 반지름 근사: L ≈ 2πR → R ≈ L / (2π)
+    rough_radius = target_m / (2 * math.pi)
+
+    # 루프 반경 범위
+    min_r = max(rough_radius * 0.8, 200.0)
+    max_r = rough_radius * 1.6  # 넉넉하게
+
+    raw_candidates: List[Dict[str, Any]] = []
+
+    # 1) raw 후보 수집
+    for n, data in G.nodes(data=True):
+        if n == start_node:
             continue
-        lat, lng = d["y"], d["x"]
-        dist = haversine_m(sy, sx, lat, lng)
-        if dist < min_r or dist > max_r:
+        lat = data.get("y")
+        lng = data.get("x")
+        if lat is None or lng is None:
             continue
 
-        ang = math.atan2(lat - sy, lng - sx)
-        if ang < 0:
-            ang += 2 * math.pi
-        sec = int(sectors * ang / (2 * math.pi))
+        d = haversine_m(sy, sx, lat, lng)
+        if d < min_r or d > max_r:
+            continue
 
-        deg = G.degree[n]
-        score = (dist / max_r) + 0.3 * (deg / max(1, G.degree[start]))
+        degree = G.degree[n]
 
-        if sec not in sector_best or score > sector_best[sec][1]:
-            sector_best[sec] = (n, score)
+        # (1) 반경 품질: rough_radius 근처일수록 점수 ↑
+        #   d == rough_radius → 1 근처, 멀어질수록 감소
+        radius_dev = abs(d - rough_radius)
+        radius_score = max(0.0, 1.0 - radius_dev / max_r)
 
-    cands = [v for (v, _) in sector_best.values()]
-    random.shuffle(cands)
+        # (2) 교차로 품질: degree가 높을수록 선호 (최대 6 이상은 동일 취급)
+        deg_norm = min(float(degree), 6.0) / 6.0  # 0~1
 
-    return cands[:max_total]
+        # 최종 품질 점수 (반경:degree = 0.7:0.3)
+        base_score = 0.7 * radius_score + 0.3 * deg_norm
+
+        raw_candidates.append(
+            {
+                "id": n,
+                "lat": lat,
+                "lng": lng,
+                "d": d,
+                "degree": degree,
+                "score": base_score,
+            }
+        )
+
+    if not raw_candidates:
+        return []
+
+    # 2) 품질 점수 상위 일부만 사용 (속도/안정성용)
+    raw_candidates.sort(key=lambda c: c["score"], reverse=True)
+    k = max(max_total, min(MAX_PCD_RAW_CANDIDATES, len(raw_candidates)))
+    raw_candidates = raw_candidates[:k]
+
+    # 3) PCD-style greedy selection
+    chosen: List[Dict[str, Any]] = []
+    chosen_ids: List[int] = []
+
+    # 첫 번째는 품질이 가장 높은 노드 선택
+    first = raw_candidates[0]
+    chosen.append(first)
+    chosen_ids.append(first["id"])
+
+    if len(raw_candidates) == 1 or max_total == 1:
+        return [first["id"]]
+
+    # 품질-다양성 trade-off 계수 (λ)
+    LAMBDA_QUALITY = 0.5  # 품질 비중
+    # 1 - LAMBDA_QUALITY = 0.5 → 다양성 비중
+
+    while len(chosen_ids) < max_total and len(chosen_ids) < len(raw_candidates):
+        best_cand = None
+        best_value = -float("inf")
+
+        for cand in raw_candidates:
+            if cand["id"] in chosen_ids:
+                continue
+
+            # 다양성: 이미 선택된 via들과의 최소 거리
+            min_dist = float("inf")
+            for c in chosen:
+                d = haversine_m(cand["lat"], cand["lng"], c["lat"], c["lng"])
+                if d < min_dist:
+                    min_dist = d
+
+            # 거리를 max_r로 정규화 (0~1 클램핑)
+            diversity = min(1.0, max(0.0, min_dist / max_r))
+
+            quality = cand["score"]  # 이미 0~1 근사
+
+            value = LAMBDA_QUALITY * quality + (1.0 - LAMBDA_QUALITY) * diversity
+
+            if value > best_value:
+                best_value = value
+                best_cand = cand
+
+        if best_cand is None:
+            break
+
+        chosen.append(best_cand)
+        chosen_ids.append(best_cand["id"])
+
+    return chosen_ids
 
 
 # ==========================
-# A* 경로 탐색
+# A* 기반 최단 경로 (실거리 + poison 지원)
 # ==========================
-def _astar_path(G, src, dst, poison_edges=None):
+
+def _astar_path(
+    G: nx.Graph,
+    src: int,
+    dst: int,
+    poison_edges: Optional[set] = None,
+) -> Tuple[float, List[int]]:
+    """직선거리 heuristic + poison edge 가중치가 들어간 A*.
+    반환 거리는 '실제 거리(미터)' 기준.
+    """
     if src == dst:
         return 0.0, [src]
 
     poison_edges = poison_edges or set()
 
-    def h(n):
-        return haversine_m(G.nodes[n]["y"], G.nodes[n]["x"], G.nodes[dst]["y"], G.nodes[dst]["x"])
+    def heuristic(n: int) -> float:
+        ny = G.nodes[n]["y"]
+        nx_ = G.nodes[n]["x"]
+        dy = G.nodes[dst]["y"]
+        dx_ = G.nodes[dst]["x"]
+        return haversine_m(ny, nx_, dy, dx_)
 
-    openh = [(h(src), src)]
-    g_cost = {src: 0.0}
-    g_dist = {src: 0.0}
-    came = {}
+    open_heap: List[Tuple[float, int]] = []
+    heapq.heappush(open_heap, (heuristic(src), src))
+
+    # g_cost: 탐색 비용(포이즌 가중치 포함), g_dist: 실제 거리
+    g_cost: Dict[int, float] = {src: 0.0}
+    g_dist: Dict[int, float] = {src: 0.0}
+    came_from: Dict[int, int] = {}
+
     visited = set()
 
-    while openh:
-        _, cur = heapq.heappop(openh)
-        if cur in visited:
+    while open_heap:
+        f, current = heapq.heappop(open_heap)
+        if current in visited:
             continue
-        visited.add(cur)
+        visited.add(current)
 
-        if cur == dst:
-            path = [cur]
-            while cur in came:
-                cur = came[cur]
-                path.append(cur)
-            return g_dist[dst], list(reversed(path))
+        if current == dst:
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            path.reverse()
+            return g_dist[dst], path
 
-        for nb in G.neighbors(cur):
-            base = G[cur][nb]["length"]
-            e = (min(cur, nb), max(cur, nb))
-            w = base * (POISON_FACTOR if e in poison_edges else 1.0)
+        for neighbor in G.neighbors(current):
+            base_len = G[current][neighbor]["length"]
+            e = (min(current, neighbor), max(current, neighbor))
+            w = base_len * (POISON_FACTOR if e in poison_edges else 1.0)
 
-            tcost = g_cost[cur] + w
-            if tcost >= g_cost.get(nb, float("inf")):
+            tentative_cost = g_cost[current] + w
+            if tentative_cost >= g_cost.get(neighbor, float("inf")):
                 continue
 
-            came[nb] = cur
-            g_cost[nb] = tcost
-            g_dist[nb] = g_dist[cur] + base
-            heapq.heappush(openh, (tcost + h(nb), nb))
+            came_from[neighbor] = current
+            g_cost[neighbor] = tentative_cost
+            g_dist[neighbor] = g_dist[current] + base_len
+            f_score = tentative_cost + heuristic(neighbor)
+            heapq.heappush(open_heap, (f_score, neighbor))
 
-    raise nx.NetworkXNoPath(f"{src}->{dst} 경로 없음")
+    raise nx.NetworkXNoPath(f"A* 경로를 찾지 못했습니다: {src} -> {dst}")
 
 
 # ==========================
-# 품질 평가
+# 루프 경로 품질 평가
 # ==========================
-def _compute_roundness(poly):
+
+def _compute_roundness(poly: Polyline) -> float:
+    """루프의 '둥근 정도'를 0~1로 평가."""
     if len(poly) < 3:
         return 0.0
     ys = [p[0] for p in poly]
     xs = [p[1] for p in poly]
-    cy = sum(ys)/len(ys)
-    cx = sum(xs)/len(xs)
+    cy = sum(ys) / len(ys)
+    cx = sum(xs) / len(xs)
 
-    ds = [haversine_m(cy, cx, y, x) for y, x in poly]
-    mean = sum(ds)/len(ds)
+    dists = [haversine_m(cy, cx, y, x) for y, x in poly]
+    mean = sum(dists) / len(dists)
     if mean <= 0:
         return 0.0
-    var = sum((d-mean)**2 for d in ds)/len(ds)
+    var = sum((d - mean) ** 2 for d in dists) / len(dists)
     std = math.sqrt(var)
-    return max(0.0, min(1.0, 1 - std/(mean+1e-6)))
+    score = max(0.0, 1.0 - std / (mean + 1e-6))
+    return min(score, 1.0)
 
 
-def _compute_overlap_ratio(path):
-    edges = {}
-    for u, v in zip(path[:-1], path[1:]):
+def _compute_overlap_ratio(node_path: List[int]) -> float:
+    """같은 간선을 여러 번 쓰는 비율 (0에 가까울수록 좋음)."""
+    if not node_path or len(node_path) < 2:
+        return 0.0
+    edge_counts: Dict[Tuple[int, int], int] = {}
+    for u, v in zip(node_path[:-1], node_path[1:]):
         if u == v:
             continue
         e = (u, v) if u <= v else (v, u)
-        edges[e] = edges.get(e, 0) + 1
-    if not edges:
+        edge_counts[e] = edge_counts.get(e, 0) + 1
+    if not edge_counts:
         return 0.0
-    rep = sum(1 for c in edges.values() if c > 1)
-    return rep / len(edges)
+    overlap_edges = sum(1 for c in edge_counts.values() if c > 1)
+    return overlap_edges / len(edge_counts)
 
 
-def _compute_curve_penalty(poly):
+def _compute_curve_penalty(poly: Polyline) -> float:
+    """급커브가 많을수록 penalty 증가."""
     if len(poly) < 3:
         return 0.0
 
-    def bearing(a, b):
-        la1, lo1 = map(math.radians, a)
-        la2, lo2 = map(math.radians, b)
-        dlon = lo2 - lo1
-        y = math.sin(dlon)*math.cos(la2)
-        x = math.cos(la1)*math.sin(la2) - math.sin(la1)*math.cos(la2)*math.cos(dlon)
-        ang = math.degrees(math.atan2(y, x))
-        return (ang + 360) % 360
+    def bearing(p1: LatLng, p2: LatLng) -> float:
+        lat1, lon1 = map(math.radians, p1)
+        lat2, lon2 = map(math.radians, p2)
+        dlon = lon2 - lon1
+        y = math.sin(dlon) * math.cos(lat2)
+        x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+        brng = math.degrees(math.atan2(y, x))
+        return (brng + 360.0) % 360.0
 
     turns = 0
     sharp = 0
     for a, b, c in zip(poly[:-2], poly[1:-1], poly[2:]):
-        d1 = bearing(a, b)
-        d2 = bearing(b, c)
-        diff = abs(d2 - d1)
-        if diff > 180:
-            diff = 360 - diff
-        if diff < 10:
+        br1 = bearing(a, b)
+        br2 = bearing(b, c)
+        diff = abs(br2 - br1)
+        if diff > 180.0:
+            diff = 360.0 - diff
+        if diff < 10.0:
             continue
         turns += 1
-        if diff >= 60:
+        if diff >= 60.0:
             sharp += 1
-
-    return sharp/turns if turns else 0.0
+    if turns == 0:
+        return 0.0
+    return sharp / turns
 
 
 # ==========================
-# micro-loop 후보 선택
+# micro-loop 후보 노드 선택
 # ==========================
-def _select_microloop_indices(path):
-    n = len(path)
+
+def _select_microloop_indices(node_path: List[int]) -> List[int]:
+    """
+    전체 경로 중에서 micro-loop를 시도해 볼 대표 노드 인덱스 선택.
+    - 최대 MAX_MICRO_CANDIDATES 개
+    - 시작/중간/끝 쪽으로 고르게 분산
+    """
+    n = len(node_path)
     if n < 4:
         return []
-    inner = list(range(1, n-1))
+
+    indices = []
+
+    # 내부 노드 구간만 사용 (0, n-1 제외)
+    inner = list(range(1, n - 1))
     if len(inner) <= MAX_MICRO_CANDIDATES:
         return inner
-    step = max(1, len(inner)//MAX_MICRO_CANDIDATES)
-    return inner[::step]
+
+    step = max(1, len(inner) // MAX_MICRO_CANDIDATES)
+    for i in range(0, len(inner), step):
+        indices.append(inner[i])
+        if len(indices) >= MAX_MICRO_CANDIDATES:
+            break
+
+    return indices
 
 
 # ==========================
-# micro-loop 삽입
+# 거리 보정용 micro-loop 삽입
 # ==========================
-def _extend_with_micro_loops(G, path, length, target_m, max_loops=MAX_MICRO_LOOPS):
-    new_path = list(path)
-    total = length
-    idxs = _select_microloop_indices(new_path)
+
+def _extend_with_micro_loops(
+    G: nx.Graph,
+    node_path: List[int],
+    current_len: float,
+    target_m: float,
+    max_loops: int = MAX_MICRO_LOOPS,
+) -> Tuple[List[int], float]:
+    """
+    루프 길이가 목표보다 짧을 때,
+    경로 상의 대표 교차로들에서 옆 골목으로 들어갔다 나오는
+    micro-loop(u->w->u)를 최대 max_loops번까지 삽입해서 거리 보정.
+    - edge 길이 20~40m인 경우만 사용 (loop 40~80m)
+    - 실제 도로 그래프 위에서만 움직임.
+    - overshoot: target_m + MAX_ABS_ERR_M 를 넘는 보정은 금지.
+    """
+    if not node_path or len(node_path) < 2:
+        return node_path, current_len
+
+    new_node_path = list(node_path)
+    total_len = current_len
+
+    candidate_indices = _select_microloop_indices(new_node_path)
 
     for _ in range(max_loops):
-        missing = target_m - total
+        # 이미 절대 오차 45m 이내면 더 이상 보정하지 않음
+        missing = target_m - total_len
         if abs(missing) <= MAX_ABS_ERR_M:
             break
+        # 이미 target_m 이상인데, 부족한 정도가 크지 않으면(<=45m)도 위에서 break됨.
+        # missing <= 0 이면 더 이상 길이를 늘릴 필요가 없으니 종료
         if missing <= 0:
             break
 
-        best = None
+        best_idx = None
+        best_neighbor = None
+        best_new_len = None
         best_err = float("inf")
 
-        for i in idxs:
-            u = new_path[i]
+        for i in candidate_indices:
+            u = new_node_path[i]
+            # 교차로(연결이 여러 개) 위주로 시도
             if G.degree[u] < 3:
                 continue
 
             for w in G.neighbors(u):
-                if w == new_path[i-1] or w == new_path[i+1]:
+                # 기존 경로의 직전/직후 노드는 제외 (이미 사용 중인 방향)
+                if w == new_node_path[i - 1] or w == new_node_path[i + 1]:
                     continue
 
-                b = G[u][w]["length"]
-                if b < MICRO_MIN_EDGE or b > MICRO_MAX_EDGE:
+                base_len = G[u][w]["length"]
+                # edge 20~40m만 사용 (loop 40~80m)
+                if base_len < MICRO_MIN_EDGE or base_len > MICRO_MAX_EDGE:
                     continue
 
-                new_len = total + 2*b
-                if new_len - target_m > MAX_ABS_ERR_M:
+                extra = 2.0 * base_len  # u->w->u
+                candidate_len = total_len + extra
+
+                # overshoot: target_m + MAX_ABS_ERR_M 를 넘으면 금지
+                if candidate_len - target_m > MAX_ABS_ERR_M:
                     continue
 
-                err = abs(new_len - target_m)
+                err = abs(candidate_len - target_m)
                 if err < best_err:
                     best_err = err
-                    best = (i, w, new_len)
+                    best_idx = i
+                    best_neighbor = w
+                    best_new_len = candidate_len
 
-        if best is None:
+        if best_idx is None or best_neighbor is None or best_new_len is None:
+            # 더 이상 쓸만한 micro-loop 없음
             break
 
-        i, w, new_len = best
-        u = new_path[i]
-        insert = i+1
-        new_path = new_path[:insert] + [w, u] + new_path[insert:]
-        total = new_len
+        # 실제로 node_path에 micro-loop 삽입: ... u, w, u, next ...
+        insert_pos = best_idx + 1
+        u = new_node_path[best_idx]
+        new_node_path = (
+            new_node_path[:insert_pos] + [best_neighbor, u] + new_node_path[insert_pos:]
+        )
+        total_len = best_new_len
 
-    return new_path, total
+    return new_node_path, total_len
 
 
 # ==========================
-# 메인 함수
+# 메인: 러닝 루프 생성 (double via + 거리보정, PCD-full)
 # ==========================
-def generate_area_loop(lat: float, lng: float, km: float):
+
+def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dict[str, Any]]:
+    """double-via 기반 러닝 루프 + micro-loop 거리보정 (PCD-full via 선택).
+
+    - via-node 2개(A,B)를 조합해 start→A→B→start 루프를 만든다.
+    - PCD-style via 선택으로 '품질 + 다양성'을 극대화한다.
+    - 루프가 목표 거리보다 짧으면 실제 도로 위에서 micro-loop를 삽입해 거리 보정.
+    - 거리 허용 오차는 '절대 45m 이내' 이며,
+      target_m = 요청거리 + 45m 이므로
+      실제 길이는 [요청, 요청+90]m 범위 안을 노리게 된다.
+    """
     start_time = time.time()
 
-    # 핵심: target_m = 요청거리 + 45m
+    # 핵심: target_m 을 요청거리 + 45m 로 설정
+    # 실제 성공 범위는 [target_m - 45, target_m + 45] = [km*1000, km*1000 + 90]
     target_m = max(MIN_LOOP_M, km * 1000.0 + MAX_ABS_ERR_M)
 
+    # scoring 가중치 (shape/겹침/커브/길이 오차)
     ROUNDNESS_WEIGHT = 3.0
     OVERLAP_PENALTY = 3.0
     CURVE_PENALTY_WEIGHT = 0.6
     ERROR_WEIGHT = 2.5
 
-    meta = {
+    meta: Dict[str, Any] = {
         "status": "init",
         "len": 0.0,
         "err": None,
@@ -423,185 +622,268 @@ def generate_area_loop(lat: float, lng: float, km: float):
     try:
         G, start_node = _build_osm_graph(lat, lng, target_m)
     except Exception as e:
-        poly, l, err = _fallback_square_loop(lat, lng, km, target_m)
-        success = err <= MAX_ABS_ERR_M
+        poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
         meta.update(
             status="fallback",
-            len=float(l),
+            len=float(length_m),
             err=float(err),
-            roundness=_compute_roundness(poly),
+            roundness=float(_compute_roundness(poly)),
             overlap=0.0,
-            curve_penalty=_compute_curve_penalty(poly),
+            curve_penalty=float(_compute_curve_penalty(poly)),
             score=None,
-            success=safe_bool(success),
-            length_ok=safe_bool(success),
+            success=bool(err <= MAX_ABS_ERR_M),
+            length_ok=bool(err <= MAX_ABS_ERR_M),
             used_fallback=True,
-            message=f"OSM 그래프 실패: {e}",
+            message=f"OSM 그래프 생성 실패로 사각형 루프를 사용했습니다: {e}",
         )
-        meta["time_s"] = time.time() - start_time
+        meta["time_s"] = float(time.time() - start_time)
         return safe_list(poly), safe_dict(meta)
 
-    # 2) via-node 선택
-    vias = _select_via_candidates(G, start_node, target_m)
-    meta["via_candidates"] = list(vias)
+    # 2) via-node 후보 선택 (PCD-full)
+    via_nodes = _select_via_candidates(G, start_node, target_m)
+    meta["via_candidates"] = via_nodes
 
-    if not vias:
-        poly, l, err = _fallback_square_loop(lat, lng, km, target_m)
-        success = err <= MAX_ABS_ERR_M
+    if len(via_nodes) == 0:
+        poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
         meta.update(
-            status="no_via",
-            len=float(l),
+            status="no_via_fallback",
+            len=float(length_m),
             err=float(err),
-            roundness=_compute_roundness(poly),
+            roundness=float(_compute_roundness(poly)),
             overlap=0.0,
-            curve_penalty=_compute_curve_penalty(poly),
-            success=safe_bool(success),
-            length_ok=safe_bool(success),
+            curve_penalty=float(_compute_curve_penalty(poly)),
+            score=None,
+            success=bool(err <= MAX_ABS_ERR_M),
+            length_ok=bool(err <= MAX_ABS_ERR_M),
             used_fallback=True,
-            message="via-node 없음",
+            message="via-node 후보를 찾지 못해 사각형 루프를 사용했습니다.",
         )
-        meta["time_s"] = time.time() - start_time
+        meta["time_s"] = float(time.time() - start_time)
         return safe_list(poly), safe_dict(meta)
 
-    # 3) start→via 계산
-    start_via = {}
-    for v in vias:
+    # via-node가 1개뿐이면 single-loop + 거리보정
+    if len(via_nodes) == 1:
+        only_v = via_nodes[0]
         try:
-            l, p = _astar_path(G, start_node, v)
-            start_via[v] = (l, p)
-        except Exception:
-            pass
+            out_len, out_nodes = _astar_path(G, start_node, only_v)
+            poison_edges = set()
+            for u, v in zip(out_nodes[:-1], out_nodes[1:]):
+                if u == v:
+                    continue
+                e = (min(u, v), max(u, v))
+                poison_edges.add(e)
+            back_len, back_nodes = _astar_path(G, only_v, start_node, poison_edges=poison_edges)
+            node_path = out_nodes + back_nodes[1:]
+            loop_len = out_len + back_len
 
-    if not start_via:
-        poly, l, err = _fallback_square_loop(lat, lng, km, target_m)
-        success = err <= MAX_ABS_ERR_M
+            # 거리 보정 micro-loop 시도
+            node_path, loop_len = _extend_with_micro_loops(G, node_path, loop_len, target_m)
+
+            poly: Polyline = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in node_path]
+            err = abs(loop_len - target_m)
+
+            r = _compute_roundness(poly)
+            overlap = _compute_overlap_ratio(node_path)
+            curve_pen = _compute_curve_penalty(poly)
+
+            success = err <= MAX_ABS_ERR_M
+
+            meta.update(
+                status="ok" if success else "approx",
+                len=float(loop_len),
+                err=float(err),
+                roundness=float(r),
+                overlap=float(overlap),
+                curve_penalty=float(curve_pen),
+                score=None,
+                success=success,
+                length_ok=success,
+                used_fallback=False,
+                message="via-node가 1개뿐이라 single-loop + 거리보정으로 생성했습니다."
+                        if success
+                        else f"요청 오차(±{int(MAX_ABS_ERR_M)}m)를 일부 초과했지만, "
+                             f"single-loop 거리 보정을 포함한 가장 근접한 루프를 반환합니다.",
+            )
+            meta["time_s"] = float(time.time() - start_time)
+            return safe_list(poly), safe_dict(meta)
+        except Exception as e:
+            poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
+            meta.update(
+                status="single_via_failed",
+                len=float(length_m),
+                err=float(err),
+                roundness=float(_compute_roundness(poly)),
+                overlap=0.0,
+                curve_penalty=float(_compute_curve_penalty(poly)),
+                score=None,
+                success=bool(err <= MAX_ABS_ERR_M),
+                length_ok=bool(err <= MAX_ABS_ERR_M),
+                used_fallback=True,
+                message=f"single-loop 생성 실패로 사각형 루프를 사용했습니다: {e}",
+            )
+            meta["time_s"] = float(time.time() - start_time)
+            return safe_list(poly), safe_dict(meta)
+
+    # 3) start→via 경로를 모두 캐싱 (속도 최적화)
+    start_to_via_paths: Dict[int, Tuple[float, List[int]]] = {}
+    for v in via_nodes:
+        try:
+            length, nodes = _astar_path(G, start_node, v)
+            start_to_via_paths[v] = (length, nodes)
+        except Exception:
+            continue
+
+    if not start_to_via_paths:
+        poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
         meta.update(
-            status="no_start_via",
-            len=float(l),
+            status="no_start_via_fallback",
+            len=float(length_m),
             err=float(err),
-            roundness=_compute_roundness(poly),
+            roundness=float(_compute_roundness(poly)),
             overlap=0.0,
-            curve_penalty=_compute_curve_penalty(poly),
-            success=safe_bool(success),
-            length_ok=safe_bool(success),
+            curve_penalty=float(_compute_curve_penalty(poly)),
+            score=None,
+            success=bool(err <= MAX_ABS_ERR_M),
+            length_ok=bool(err <= MAX_ABS_ERR_M),
             used_fallback=True,
-            message="start→via 불가",
+            message="start→via 경로를 하나도 찾지 못해 사각형 루프를 사용했습니다.",
         )
-        meta["time_s"] = time.time() - start_time
+        meta["time_s"] = float(time.time() - start_time)
         return safe_list(poly), safe_dict(meta)
 
-    usable = list(start_via.keys())
-    pairs = list(combinations(usable, 2))
-    random.shuffle(pairs)
-    pairs = pairs[:MAX_VIA_PAIRS]
-    meta["via_pairs"] = pairs
+    usable_vias = list(start_to_via_paths.keys())
 
-    best_score = -1e15
-    best_path = None
-    best_len = None
-    best_err = None
-    best_r = 0
-    best_over = 0
-    best_curve = 0
+    # 4) via 쌍 조합 생성 (A,B), 개수 제한
+    all_pairs = list(combinations(usable_vias, 2))
+    random.shuffle(all_pairs)
+    if len(all_pairs) > MAX_VIA_PAIRS:
+        all_pairs = all_pairs[:MAX_VIA_PAIRS]
+    meta["via_pairs"] = all_pairs
 
-    # 4) via 쌍 평가
-    for a, b in pairs:
+    best_score = -float("inf")
+    best_node_path: List[int] = []
+    best_len = 0.0
+    best_err = float("inf")
+    best_roundness = 0.0
+    best_overlap = 1.0
+    best_curve_penalty = 1.0
+
+    # 5) 각 via 쌍(A,B)에 대해 start→A→B→start 루프 생성
+    for a, b in all_pairs:
         meta["routes_checked"] += 1
         try:
-            len1, p1 = start_via[a]
-            poison = {(min(u, v), max(u, v)) for u, v in zip(p1[:-1], p1[1:])}
+            # start → A
+            len1, path1 = start_to_via_paths[a]
+            poison_edges = set()
+            for u, v in zip(path1[:-1], path1[1:]):
+                if u == v:
+                    continue
+                e = (min(u, v), max(u, v))
+                poison_edges.add(e)
 
-            len2, p2 = _astar_path(G, a, b, poison_edges=poison)
-            for u, v in zip(p2[:-1], p2[1:]):
-                poison.add((min(u, v), max(u, v)))
+            # A → B
+            len2, path2 = _astar_path(G, a, b, poison_edges=poison_edges)
+            for u, v in zip(path2[:-1], path2[1:]):
+                if u == v:
+                    continue
+                e = (min(u, v), max(u, v))
+                poison_edges.add(e)
 
-            len3, p3 = _astar_path(G, b, start_node, poison_edges=poison)
+            # B → start
+            len3, path3 = _astar_path(G, b, start_node, poison_edges=poison_edges)
 
-            full = p1 + p2[1:] + p3[1:]
+            node_path = path1 + path2[1:] + path3[1:]
             loop_len = len1 + len2 + len3
             err = abs(loop_len - target_m)
 
-            poly = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in full]
+            poly: Polyline = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in node_path]
             r = _compute_roundness(poly)
-            over = _compute_overlap_ratio(full)
-            curve = _compute_curve_penalty(poly)
+            overlap = _compute_overlap_ratio(node_path)
+            curve_pen = _compute_curve_penalty(poly)
 
             meta["routes_validated"] += 1
 
+            length_term = -ERROR_WEIGHT * (err / target_m)
             score = (
-                -ERROR_WEIGHT * (err / target_m)
-                + 3.0 * r
-                - 3.0 * over
-                - 0.6 * curve
+                length_term
+                + ROUNDNESS_WEIGHT * r
+                - OVERLAP_PENALTY * overlap
+                - CURVE_PENALTY_WEIGHT * curve_pen
             )
 
             if score > best_score:
                 best_score = score
-                best_path = full
+                best_node_path = node_path
                 best_len = loop_len
                 best_err = err
-                best_r = r
-                best_over = over
-                best_curve = curve
+                best_roundness = r
+                best_overlap = overlap
+                best_curve_penalty = curve_pen
 
         except Exception:
             continue
 
-    if best_path is None:
-        poly, l, err = _fallback_square_loop(lat, lng, km, target_m)
-        success = err <= MAX_ABS_ERR_M
+    if not best_node_path:
+        poly, length_m, err = _fallback_square_loop(lat, lng, km, target_m=target_m)
         meta.update(
-            status="no_loop",
-            len=float(l),
+            status="no_loop_fallback",
+            len=float(length_m),
             err=float(err),
-            roundness=_compute_roundness(poly),
+            roundness=float(_compute_roundness(poly)),
             overlap=0.0,
-            curve_penalty=_compute_curve_penalty(poly),
-            success=safe_bool(success),
-            length_ok=safe_bool(success),
+            curve_penalty=float(_compute_curve_penalty(poly)),
+            score=None,
+            success=bool(err <= MAX_ABS_ERR_M),
+            length_ok=bool(err <= MAX_ABS_ERR_M),
             used_fallback=True,
-            message="double-via 실패",
+            message="via 쌍들로 유효한 루프를 찾지 못해 사각형 루프를 사용했습니다.",
         )
-        meta["time_s"] = time.time() - start_time
+        meta["time_s"] = float(time.time() - start_time)
         return safe_list(poly), safe_dict(meta)
 
-    # 5) micro-loop 보정
-    adj_path, adj_len = _extend_with_micro_loops(G, best_path, best_len, target_m)
+    # 6) 거리 보정 micro-loop 삽입 (부족한 경우에만)
+    adjusted_node_path = list(best_node_path)
+    adjusted_len = best_len
+    if adjusted_len < target_m:
+        adjusted_node_path, adjusted_len = _extend_with_micro_loops(
+            G, adjusted_node_path, adjusted_len, target_m
+        )
 
-    adj_err = abs(adj_len - target_m)
-    adj_poly = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in adj_path]
+    adjusted_err = abs(adjusted_len - target_m)
+    adjusted_poly: Polyline = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in adjusted_node_path]
+    adjusted_roundness = _compute_roundness(adjusted_poly)
+    adjusted_overlap = _compute_overlap_ratio(adjusted_node_path)
+    adjusted_curve_penalty = _compute_curve_penalty(adjusted_poly)
 
-    adj_r = _compute_roundness(adj_poly)
-    adj_over = _compute_overlap_ratio(adj_path)
-    adj_curve = _compute_curve_penalty(adj_poly)
-
-    adj_score = (
-        -ERROR_WEIGHT * (adj_err / target_m)
-        + 3.0 * adj_r
-        - 3.0 * adj_over
-        - 0.6 * adj_curve
+    length_term = -ERROR_WEIGHT * (adjusted_err / target_m)
+    adjusted_score = (
+        length_term
+        + ROUNDNESS_WEIGHT * adjusted_roundness
+        - OVERLAP_PENALTY * adjusted_overlap
+        - CURVE_PENALTY_WEIGHT * adjusted_curve_penalty
     )
 
-    success = adj_err <= MAX_ABS_ERR_M
+    success = adjusted_err <= MAX_ABS_ERR_M
+    used_fallback = False
 
     meta.update(
         status="ok" if success else "approx",
-        len=float(adj_len),
-        err=float(adj_err),
-        roundness=float(adj_r),
-        overlap=float(adj_over),
-        curve_penalty=float(adj_curve),
-        score=float(adj_score),
-        success=safe_bool(success),
-        length_ok=safe_bool(success),
-        used_fallback=False,
+        len=float(adjusted_len),
+        err=float(adjusted_err),
+        roundness=float(adjusted_roundness),
+        overlap=float(adjusted_overlap),
+        curve_penalty=float(adjusted_curve_penalty),
+        score=float(adjusted_score),
+        success=bool(success),
+        length_ok=bool(success),
+        used_fallback=bool(used_fallback),
         message=(
-            "요청 정확도에 맞춘 double-loop 경로 생성 성공!"
-            if success else
-            f"±{MAX_ABS_ERR_M}m 허용 오차 내에 못 맞춰 가장 근접 경로 반환"
+            "요청 거리와 모양을 모두 만족하는 double-loop 러닝 코스를 생성했습니다."
+            if success
+            else f"요청 오차(±{int(MAX_ABS_ERR_M)}m)를 일부 초과했지만, "
+                 f"거리 보정을 포함한 가장 근접한 루프를 반환합니다."
         ),
     )
+    meta["time_s"] = float(time.time() - start_time)
 
-    meta["time_s"] = time.time() - start_time
-
-    return safe_list(adj_poly), safe_dict(meta)
+    return safe_list(adjusted_poly), safe_dict(meta)
