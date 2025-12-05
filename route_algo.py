@@ -242,8 +242,9 @@ def _build_pedestrian_graph(lat: float, lng: float, km: float) -> nx.MultiDiGrap
         raise RuntimeError("osmnx가 설치되어 있지 않습니다.")
 
     # [최적화 2] 반경 추가 축소: 불필요한 노드 로딩 최소화
-    # 3km 기준 -> 약 1300m 반경 (충분히 안전한 범위)
-    radius_m = max(400.0, km * 300.0 + 400.0)
+    # 기존: max(400.0, km * 300.0 + 400.0) -> 3km 시 1300m
+    # 수정: max(350.0, km * 250.0 + 350.0) -> 3km 시 1100m (면적 약 30% 감소로 속도 향상)
+    radius_m = max(350.0, km * 250.0 + 350.0)
 
     G = ox.graph_from_point(
         (lat, lng),
@@ -399,9 +400,10 @@ def generate_area_loop(lat: float, lng: float, km: float) -> Tuple[Polyline, Dic
         meta["time_s"] = time.time() - start_time
         return safe_list(poly), safe_dict(meta)
 
-    # [최적화 3] 반복 횟수 20으로 축소 (복사가 없어졌으므로 20번도 충분히 빠름)
+    # [최적화 3] 반복 횟수 20 -> 15로 축소
+    # In-place 최적화가 되어있어 빠르지만, 횟수를 조금 더 줄여 전체 응답 시간 단축 (성능 저하 미미)
     random.shuffle(candidate_nodes)
-    candidate_nodes = candidate_nodes[:20]
+    candidate_nodes = candidate_nodes[:15]
 
     best_score = -1e18
     best_poly: Optional[Polyline] = None
